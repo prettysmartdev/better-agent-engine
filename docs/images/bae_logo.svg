@@ -1,0 +1,233 @@
+<svg width="100%" viewBox="0 0 1500 500" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bgGrad" cx="45%" cy="45%" r="70%">
+      <stop offset="0%" stop-color="#081525"/>
+      <stop offset="100%" stop-color="#040b15"/>
+    </radialGradient>
+    <radialGradient id="glowCenter" cx="40%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="eyeGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="35%" stop-color="#80ffff"/>
+      <stop offset="100%" stop-color="#00aadd" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="neonGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00e5ff"/>
+      <stop offset="50%" stop-color="#4060dd"/>
+      <stop offset="100%" stop-color="#00b4d8"/>
+    </linearGradient>
+    <filter id="neonBlur" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="textGlowOuter" x="-25%" y="-120%" width="150%" height="340%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="textGlowInner" x="-10%" y="-60%" width="120%" height="220%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1500" height="500" fill="url(#bgGrad)"/>
+
+  <!-- Blueprint grid: major lines -->
+  <g stroke="#1e4d78" stroke-width="0.6" opacity="0.6">
+    <line x1="0" y1="62" x2="1500" y2="62"/>
+    <line x1="0" y1="124" x2="1500" y2="124"/>
+    <line x1="0" y1="186" x2="1500" y2="186"/>
+    <line x1="0" y1="248" x2="1500" y2="248"/>
+    <line x1="0" y1="310" x2="1500" y2="310"/>
+    <line x1="0" y1="372" x2="1500" y2="372"/>
+    <line x1="0" y1="434" x2="1500" y2="434"/>
+    <line x1="62" y1="0" x2="62" y2="500"/>
+    <line x1="124" y1="0" x2="124" y2="500"/>
+    <line x1="186" y1="0" x2="186" y2="500"/>
+    <line x1="248" y1="0" x2="248" y2="500"/>
+    <line x1="310" y1="0" x2="310" y2="500"/>
+    <line x1="372" y1="0" x2="372" y2="500"/>
+    <line x1="434" y1="0" x2="434" y2="500"/>
+    <line x1="496" y1="0" x2="496" y2="500"/>
+    <line x1="558" y1="0" x2="558" y2="500"/>
+    <line x1="620" y1="0" x2="620" y2="500"/>
+    <line x1="682" y1="0" x2="682" y2="500"/>
+    <line x1="744" y1="0" x2="744" y2="500"/>
+    <line x1="806" y1="0" x2="806" y2="500"/>
+    <line x1="868" y1="0" x2="868" y2="500"/>
+    <line x1="930" y1="0" x2="930" y2="500"/>
+    <line x1="992" y1="0" x2="992" y2="500"/>
+    <line x1="1054" y1="0" x2="1054" y2="500"/>
+    <line x1="1116" y1="0" x2="1116" y2="500"/>
+    <line x1="1178" y1="0" x2="1178" y2="500"/>
+    <line x1="1240" y1="0" x2="1240" y2="500"/>
+    <line x1="1302" y1="0" x2="1302" y2="500"/>
+    <line x1="1364" y1="0" x2="1364" y2="500"/>
+    <line x1="1426" y1="0" x2="1426" y2="500"/>
+    <line x1="1488" y1="0" x2="1488" y2="500"/>
+  </g>
+  <!-- Fine sub-grid -->
+  <g stroke="#163a5e" stroke-width="0.35" opacity="0.4">
+    <line x1="0" y1="31" x2="1500" y2="31"/>
+    <line x1="0" y1="93" x2="1500" y2="93"/>
+    <line x1="0" y1="155" x2="1500" y2="155"/>
+    <line x1="0" y1="217" x2="1500" y2="217"/>
+    <line x1="0" y1="279" x2="1500" y2="279"/>
+    <line x1="0" y1="341" x2="1500" y2="341"/>
+    <line x1="0" y1="403" x2="1500" y2="403"/>
+    <line x1="0" y1="465" x2="1500" y2="465"/>
+    <line x1="31" y1="0" x2="31" y2="500"/>
+    <line x1="93" y1="0" x2="93" y2="500"/>
+    <line x1="155" y1="0" x2="155" y2="500"/>
+    <line x1="217" y1="0" x2="217" y2="500"/>
+    <line x1="279" y1="0" x2="279" y2="500"/>
+    <line x1="341" y1="0" x2="341" y2="500"/>
+    <line x1="403" y1="0" x2="403" y2="500"/>
+    <line x1="465" y1="0" x2="465" y2="500"/>
+    <line x1="527" y1="0" x2="527" y2="500"/>
+    <line x1="1147" y1="0" x2="1147" y2="500"/>
+    <line x1="1209" y1="0" x2="1209" y2="500"/>
+    <line x1="1271" y1="0" x2="1271" y2="500"/>
+    <line x1="1333" y1="0" x2="1333" y2="500"/>
+    <line x1="1395" y1="0" x2="1395" y2="500"/>
+    <line x1="1457" y1="0" x2="1457" y2="500"/>
+  </g>
+
+  <!-- Center glow -->
+  <rect width="1500" height="500" fill="url(#glowCenter)"/>
+
+  <!-- Random blueprint-y features (subtle) -->
+  <g stroke="#2a5d8a" fill="none" opacity="0.28">
+    <!-- dashed construction circle, top-right -->
+    <circle cx="1330" cy="95" r="52" stroke-width="1" stroke-dasharray="6 6"/>
+    <line x1="1265" y1="95" x2="1395" y2="95" stroke-width="0.8"/>
+    <line x1="1330" y1="30" x2="1330" y2="160" stroke-width="0.8"/>
+    <!-- dimension line, bottom-left -->
+    <line x1="70" y1="470" x2="330" y2="470" stroke-width="1"/>
+    <line x1="70" y1="462" x2="70" y2="478" stroke-width="1"/>
+    <line x1="330" y1="462" x2="330" y2="478" stroke-width="1"/>
+    <!-- small schematic block, top-left -->
+    <rect x="530" y="46" width="70" height="40" rx="3" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="600" y1="66" x2="660" y2="66" stroke-width="0.8"/>
+    <circle cx="668" cy="66" r="7" stroke-width="1"/>
+    <!-- crosshair target, bottom-right -->
+    <circle cx="1420" cy="420" r="26" stroke-width="1"/>
+    <circle cx="1420" cy="420" r="10" stroke-width="0.8"/>
+    <line x1="1384" y1="420" x2="1456" y2="420" stroke-width="0.8"/>
+    <line x1="1420" y1="384" x2="1420" y2="456" stroke-width="0.8"/>
+    <!-- angled construction lines, mid-right -->
+    <line x1="1180" y1="440" x2="1290" y2="380" stroke-width="0.8" stroke-dasharray="8 6"/>
+    <line x1="560" y1="430" x2="640" y2="470" stroke-width="0.8" stroke-dasharray="8 6"/>
+  </g>
+  <g fill="#3a6d9a" opacity="0.35" font-family="'Courier New', monospace" font-size="13">
+    <text x="76" y="460">SCALE 1:1</text>
+    <text x="1268" y="176">REF BAE-001</text>
+  </g>
+
+  <!-- Floating data dots -->
+  <g fill="#4080cc">
+    <circle cx="540" cy="130" r="2" opacity="0.4"/>
+    <circle cx="1240" cy="300" r="2.2" opacity="0.35"/>
+    <circle cx="700" cy="90" r="1.8" opacity="0.4"/>
+    <circle cx="120" cy="70" r="1.8" opacity="0.35"/>
+    <circle cx="1440" cy="250" r="2" opacity="0.3"/>
+    <circle cx="480" cy="380" r="1.6" opacity="0.35"/>
+  </g>
+
+  <!-- ===================== TEDDY BEAR — NORMAL TEDDY BODY, ROBOT FACEPLATE ===================== -->
+  <g fill="none" stroke="#00ccff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonBlur)">
+    <!-- Head -->
+    <circle cx="260" cy="158" r="86"/>
+    <!-- Ears (drawn after head, filled to occlude head outline) -->
+    <circle cx="188" cy="86" r="33" fill="#050e1a"/>
+    <circle cx="332" cy="86" r="33" fill="#050e1a"/>
+    <circle cx="188" cy="88" r="15" stroke-width="2"/>
+    <circle cx="332" cy="88" r="15" stroke-width="2"/>
+    <!-- Head seam stitching (classic teddy) -->
+    <path d="M 226 94 C 240 88, 280 88, 294 94" stroke-width="1.8" stroke-dasharray="6 7" opacity="0.75"/>
+    <!-- Plump body -->
+    <path d="M 196 224
+             C 152 254, 132 312, 132 356
+             C 132 424, 190 464, 260 464
+             C 330 464, 388 424, 388 356
+             C 388 312, 368 254, 324 224"/>
+    <!-- Belly patch (fabric oval) with stitch seam -->
+    <ellipse cx="260" cy="354" rx="62" ry="66" stroke-width="2.2"/>
+    <path d="M 260 292 L 260 330" stroke-width="1.8" stroke-dasharray="6 7" opacity="0.75"/>
+    <!-- Stubby hugging arms (closed + filled to occlude body line) -->
+    <path d="M 184 260
+             C 128 266, 98 318, 110 362
+             C 119 391, 154 396, 166 372
+             C 176 352, 170 306, 186 282
+             C 192 273, 190 262, 184 260 Z" fill="#050e1a" stroke-width="2.8"/>
+    <path d="M 336 260
+             C 392 266, 422 318, 410 362
+             C 401 391, 366 396, 354 372
+             C 344 352, 350 306, 334 282
+             C 328 273, 330 262, 336 260 Z" fill="#050e1a" stroke-width="2.8"/>
+    <!-- Mitten paw stitches -->
+    <path d="M 128 350 C 134 356, 142 358, 150 356" stroke-width="1.8" opacity="0.8"/>
+    <path d="M 392 350 C 386 356, 378 358, 370 356" stroke-width="1.8" opacity="0.8"/>
+    <!-- Feet with paw pads (filled to occlude body line) -->
+    <ellipse cx="192" cy="444" rx="36" ry="26" fill="#050e1a" stroke-width="2.8"/>
+    <ellipse cx="328" cy="444" rx="36" ry="26" fill="#050e1a" stroke-width="2.8"/>
+    <ellipse cx="192" cy="447" rx="16" ry="11" stroke-width="2"/>
+    <ellipse cx="328" cy="447" rx="16" ry="11" stroke-width="2"/>
+    <!-- Toe pads -->
+    <circle cx="178" cy="430" r="3.5" stroke-width="1.8"/>
+    <circle cx="192" cy="427" r="3.5" stroke-width="1.8"/>
+    <circle cx="206" cy="430" r="3.5" stroke-width="1.8"/>
+    <circle cx="314" cy="430" r="3.5" stroke-width="1.8"/>
+    <circle cx="328" cy="427" r="3.5" stroke-width="1.8"/>
+    <circle cx="342" cy="430" r="3.5" stroke-width="1.8"/>
+  </g>
+
+  <!-- Robot faceplate (the only robotic part) -->
+  <g filter="url(#neonBlur)">
+    <!-- Rounded faceplate panel set into the head -->
+    <rect x="206" y="120" width="108" height="100" rx="22" fill="#040e1c" fill-opacity="0.55" stroke="#00ccff" stroke-width="2.6"/>
+    <!-- Corner screws -->
+    <circle cx="221" cy="135" r="2.8" fill="none" stroke="#0099cc" stroke-width="1.6"/>
+    <circle cx="299" cy="135" r="2.8" fill="none" stroke="#0099cc" stroke-width="1.6"/>
+    <circle cx="221" cy="205" r="2.8" fill="none" stroke="#0099cc" stroke-width="1.6"/>
+    <circle cx="299" cy="205" r="2.8" fill="none" stroke="#0099cc" stroke-width="1.6"/>
+    <!-- Eyes: concentric lens rings with glow cores -->
+    <circle cx="237" cy="158" r="15.5" fill="#040e1c" stroke="#00ccee" stroke-width="2.4"/>
+    <circle cx="237" cy="158" r="10" fill="#071828" stroke="#00aadd" stroke-width="1.7"/>
+    <circle cx="237" cy="158" r="6" fill="url(#eyeGlow)" filter="url(#softGlow)"/>
+    <circle cx="237" cy="158" r="3" fill="#ffffff" opacity="0.92"/>
+    <circle cx="283" cy="158" r="15.5" fill="#040e1c" stroke="#00ccee" stroke-width="2.4"/>
+    <circle cx="283" cy="158" r="10" fill="#071828" stroke="#00aadd" stroke-width="1.7"/>
+    <circle cx="283" cy="158" r="6" fill="url(#eyeGlow)" filter="url(#softGlow)"/>
+    <circle cx="283" cy="158" r="3" fill="#ffffff" opacity="0.92"/>
+    <!-- Speaker-grille mouth -->
+    <g stroke="#0099cc" stroke-width="2.3" stroke-linecap="round">
+      <line x1="242" y1="191" x2="242" y2="204"/>
+      <line x1="251" y1="191" x2="251" y2="204"/>
+      <line x1="260" y1="191" x2="260" y2="204"/>
+      <line x1="269" y1="191" x2="269" y2="204"/>
+      <line x1="278" y1="191" x2="278" y2="204"/>
+    </g>
+  </g>
+
+  <!-- ===================== TEXT: BAE ===================== -->
+  <!-- Wide blue outer glow -->
+  <text x="950" y="310" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="240" font-weight="900" letter-spacing="24" fill="none" stroke="#2050ff" stroke-width="20" stroke-linejoin="round" filter="url(#textGlowOuter)" opacity="0.5">BAE</text>
+  <!-- Dark fill -->
+  <text x="950" y="310" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="240" font-weight="900" letter-spacing="24" fill="#07111f" stroke="#07111f" stroke-width="2">BAE</text>
+  <!-- Blue outline -->
+  <text x="950" y="310" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="240" font-weight="900" letter-spacing="24" fill="none" stroke="#0055cc" stroke-width="10" stroke-linejoin="round">BAE</text>
+  <!-- Neon cyan inner outline -->
+  <text x="950" y="310" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="240" font-weight="900" letter-spacing="24" fill="none" stroke="#00ddee" stroke-width="4" stroke-linejoin="round" filter="url(#textGlowInner)">BAE</text>
+
+  <!-- ===================== TEXT: better-agent-engine ===================== -->
+  <line x1="620" y1="376" x2="1280" y2="376" stroke="#0b6e8c" stroke-width="1.5" opacity="0.7"/>
+  <text x="950" y="418" text-anchor="middle" font-family="'Courier New', monospace" font-size="40" letter-spacing="8" fill="#7fdcff" filter="url(#textGlowInner)" opacity="0.95">better-agent-engine</text>
+</svg>

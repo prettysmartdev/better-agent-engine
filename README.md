@@ -1,27 +1,24 @@
 # Better Agent Engine (BAE)
 
-A stateful server and customizable client libraries/harnesses for building
-useful AI agents. The server owns all durable state (agents, sessions,
-events) in SQLite; the client libraries — Rust, TypeScript, and Python —
-give agent developers an idiomatic harness in their language of choice while
-staying thin, stateless, and interchangeable.
+<p align="center">
+  <strong>Stateful agent server with ultra customizable client harnesses.</strong> <br>
+  Build agents with TypeScript, Python, or Rust to fit your exact needs.<br>
+  <br>
+  <img src="./docs/images/bae_logo.svg" width="620" alt="bae logo">
+</p>
 
-> Status: bootstrapped, pre-functional. The codebases, tooling, and project
-> specification are in place; the first feature work items live in
-> [`aspec/work-items/`](aspec/work-items/).
+<p align="center">
+  <img src="https://github.com/prettysmartdev/better-agent-engine/actions/workflows/test.yml/badge.svg">
+</p>
 
-## Repository layout
+BAE gives you the best of cloud and local agents. The server persists all
+durable state (authentication, sessions, providers, events, etc.)
+in SQLite. The client harness libraries — Rust, TypeScript, and Python —
+give agent developers an idiomatic agent SDK in their language of choice while
+staying thin, stateless, and ultra customizable with tools, loop hooks, and more.
 
-| Path | Component | Language | Published as |
-|------|-----------|----------|--------------|
-| [`server/`](server/) | Stateful agent server (HTTP + SQLite) | Rust | Docker image / `baesrv` binary |
-| [`client-rust/`](client-rust/) | Client library & harness | Rust | `bae-rs` (crates.io) |
-| [`client-typescript/`](client-typescript/) | Client library & harness | TypeScript | `@prettysmartdev/bae-ts` (npm) |
-| [`client-python/`](client-python/) | Client library & harness | Python | `bae-py` (PyPI) |
-| [`aspec/`](aspec/) | Project specification: architecture, devops, UX, agents, work items | — | — |
-
-Each component is independently buildable, testable, versioned, and
-publishable: every one has its own manifest, `Makefile`, and README.
+> Status: alpha. The codebase, tooling, and project
+> specification are in place; APIs and SDKs will likely change.
 
 ## Local development
 
