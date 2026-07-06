@@ -1,4 +1,4 @@
-# Better Agent Server Engine (BASE) — root orchestration.
+# Better Agent Engine (BAE) — root orchestration.
 #
 # All local development runs inside the Docker dev image (Dockerfile.dev),
 # with the repository bind-mounted at /workspace. Component Makefiles
@@ -11,7 +11,7 @@
 #   make test-server      # run one component's tests
 #   make shell            # interactive shell in the dev container
 
-PROJECT    := better-agent-server-engine
+PROJECT    := better-agent-engine
 DEV_IMAGE  ?= awman-$(PROJECT):latest
 IMAGE      ?= $(PROJECT):latest
 COMPONENTS := server client-rust client-typescript client-python

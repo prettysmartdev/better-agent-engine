@@ -31,7 +31,7 @@ graph TD
         PC[client-python harness]
     end
 
-    subgraph "BASE Server (Docker container)"
+    subgraph "BAE Server (Docker container)"
         API["REST API /api/v1 (axum)"]
         ENG[Agent/session/run engine]
         DB[(SQLite)]
@@ -47,28 +47,28 @@ graph TD
 ## Major Components
 
 ### Component 1:
-Name: base-server (server/)
+Name: baesrv (server/)
 Purpose: Stateful HTTP service owning all durable agent state.
 Description and Scope:
 - Rust binary exposing the versioned REST API; persists agents, sessions, events, and runs in SQLite; runs embedded, forward-only migrations at startup.
 - Scope: API surface, persistence, authentication/RBAC, run lifecycle. Out of scope: agent loop logic, prompting strategies, tool implementations (those live in client harnesses).
 
 ### Component 2:
-Name: base-client (client-rust/)
+Name: bae-rs (client-rust/)
 Purpose: Idiomatic Rust client library and harness.
 Description and Scope:
 - Typed HTTP client over /api/v1 plus a composable agent-loop harness; published to crates.io.
 - Scope: protocol types, transport, harness traits and default loop. Stateless by design.
 
 ### Component 3:
-Name: @base-engine/client (client-typescript/)
+Name: @prettysmartdev/bae-ts (client-typescript/)
 Purpose: Idiomatic TypeScript client library and harness.
 Description and Scope:
 - Same surface as the Rust client, built on Node's fetch with zero runtime dependencies; published to npm.
 - Scope: mirrors client-rust feature-for-feature with idiomatic TypeScript naming.
 
 ### Component 4:
-Name: base-client (client-python/)
+Name: bae-py (client-python/)
 Purpose: Idiomatic Python client library and harness.
 Description and Scope:
 - Same surface as the other clients, built on httpx/pydantic; published to PyPI.

@@ -1,6 +1,6 @@
-# base-server
+# baesrv
 
-The Better Agent Server Engine server: a stateful HTTP service (Rust) that
+The Better Agent Engine server: a stateful HTTP service (Rust) that
 owns all durable agent state — agents, sessions, events, runs — in SQLite.
 Clients ([`client-rust`](../client-rust/),
 [`client-typescript`](../client-typescript/),
@@ -24,5 +24,5 @@ make run     # run the server
 
 Built and shipped as a Docker image via the root [`Dockerfile`](../Dockerfile):
 `make image` from the repo root. Configuration is via environment variables
-(`BASE_ADDR`, `BASE_DB_PATH`, `BASE_LOG`); see
+(`BAE_ADDR`, `BAE_DB_PATH`, `BAE_LOG`); see
 [`aspec/devops/operations.md`](../aspec/devops/operations.md).

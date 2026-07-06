@@ -1,7 +1,7 @@
 import re
 
-import base_client
+import bae_py
 
 
 def test_version_is_semver():
-    assert re.fullmatch(r"\d+\.\d+\.\d+", base_client.__version__)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", bae_py.__version__)

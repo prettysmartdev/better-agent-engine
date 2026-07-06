@@ -1,6 +1,6 @@
 # Project Foundation
 
-Name: better-agent-server-engine (BASE)
+Name: better-agent-engine (BAE)
 Type: agent
 Purpose: Provide a stateful server and customizable client libraries/harnesses for building useful AI agents. The server owns all durable agent state (agents, sessions, events, runs) in SQLite; thin, stateless client libraries in Rust, TypeScript, and Python let developers build and drive agents idiomatically in their language of choice.
 
@@ -12,9 +12,9 @@ Purpose: Provide a stateful server and customizable client libraries/harnesses f
 Language: Rust (stable, edition 2021)
 Frameworks: axum + tokio (HTTP/async), rusqlite (SQLite storage), serde (serialization), tracing (logging)
 Guidance:
-- Ship as a single binary (`base-server`) and Docker image; SQLite is the only datastore.
+- Ship as a single binary (`baesrv`) and Docker image; SQLite is the only datastore.
 - Keep all server logic in the library crate (`src/lib.rs` modules: api, store, engine); `main.rs` is a thin entrypoint.
-- All configuration comes from environment variables (`BASE_*`); no config files required to run.
+- All configuration comes from environment variables (`BAE_*`); no config files required to run.
 
 ### Clients (client-rust/, client-typescript/, client-python/)
 Language: Rust (edition 2021), TypeScript (Node ≥ 20), Python (≥ 3.10)
@@ -36,17 +36,17 @@ Guidance:
 
 ### Persona 1:
 Name: Agent Developer
-Purpose: Builds AI agents using one of the client libraries/harnesses against a BASE server.
+Purpose: Builds AI agents using one of the client libraries/harnesses against a BAE server.
 Use-cases:
 - Define an agent, open sessions, exchange messages/events, and run custom harness loops from Rust, TypeScript, or Python.
-- Run a local BASE server in Docker to develop and test agents end to end.
+- Run a local BAE server in Docker to develop and test agents end to end.
 RBAC:
 - allowed: full CRUD on agents, sessions, and runs owned by their API key
 - disallowed: server administration, other principals' data, direct database access
 
 ### Persona 2:
 Name: Platform Operator
-Purpose: Deploys, configures, and operates a BASE server instance for a team.
+Purpose: Deploys, configures, and operates a BAE server instance for a team.
 Use-cases:
 - Run the server Docker image with a persistent volume; configure it via environment variables.
 - Issue and revoke API keys, take backups of the SQLite database, and upgrade versions.
@@ -56,9 +56,9 @@ RBAC:
 
 ### Persona 3:
 Name: End User
-Purpose: Interacts with agents that developers have built on BASE.
+Purpose: Interacts with agents that developers have built on BAE.
 Use-cases:
 - Converse with or delegate tasks to a deployed agent through whatever surface the agent developer ships.
 RBAC:
 - allowed: only the interactions the hosting agent exposes
-- disallowed: any direct access to the BASE API or server
+- disallowed: any direct access to the BAE API or server

@@ -22,7 +22,7 @@ Versioning:
 
 Publishing:
 - server → Docker image (GHCR) tagged `<semver>` and `latest`, built from the root Dockerfile.
-- client-rust → crates.io (`base-client`); client-typescript → npm (`@base-engine/client`); client-python → PyPI (`base-client`, via uv build/publish).
+- client-rust → crates.io (`bae-rs`); client-typescript → npm (`@prettysmartdev/bae-ts`); client-python → PyPI (`bae-py`, via uv build/publish).
 - Registry credentials live in GitHub Actions secrets; publish jobs run only on tags. Each package manifest keeps its private/no-publish marker until its first release is cut.
 
 Deployment:

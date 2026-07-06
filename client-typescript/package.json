@@ -1,7 +1,7 @@
 {
-  "name": "@base-engine/client",
+  "name": "@prettysmartdev/bae-ts",
   "version": "0.1.0",
-  "description": "TypeScript client library and agent harness for the Better Agent Server Engine (BASE)",
+  "description": "TypeScript client library and agent harness for the Better Agent Engine (BAE)",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",

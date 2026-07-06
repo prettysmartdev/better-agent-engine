@@ -1,4 +1,4 @@
-# Better Agent Server Engine (BASE)
+# Better Agent Engine (BAE)
 
 A stateful server and customizable client libraries/harnesses for building
 useful AI agents. The server owns all durable state (agents, sessions,
@@ -14,10 +14,10 @@ staying thin, stateless, and interchangeable.
 
 | Path | Component | Language | Published as |
 |------|-----------|----------|--------------|
-| [`server/`](server/) | Stateful agent server (HTTP + SQLite) | Rust | Docker image / `base-server` binary |
-| [`client-rust/`](client-rust/) | Client library & harness | Rust | `base-client` (crates.io) |
-| [`client-typescript/`](client-typescript/) | Client library & harness | TypeScript | `@base-engine/client` (npm) |
-| [`client-python/`](client-python/) | Client library & harness | Python | `base-client` (PyPI) |
+| [`server/`](server/) | Stateful agent server (HTTP + SQLite) | Rust | Docker image / `baesrv` binary |
+| [`client-rust/`](client-rust/) | Client library & harness | Rust | `bae-rs` (crates.io) |
+| [`client-typescript/`](client-typescript/) | Client library & harness | TypeScript | `@prettysmartdev/bae-ts` (npm) |
+| [`client-python/`](client-python/) | Client library & harness | Python | `bae-py` (PyPI) |
 | [`aspec/`](aspec/) | Project specification: architecture, devops, UX, agents, work items | — | — |
 
 Each component is independently buildable, testable, versioned, and
@@ -56,12 +56,12 @@ Build the production image and run it with a persistent data volume:
 
 ```sh
 make image
-docker run -p 8080:8080 -v base-data:/var/lib/base better-agent-server-engine
+docker run -p 8080:8080 -v bae-data:/var/lib/bae better-agent-engine
 ```
 
 Configuration is environment-driven (see
-[`aspec/devops/operations.md`](aspec/devops/operations.md)): `BASE_ADDR`,
-`BASE_DB_PATH`, `BASE_LOG`, and provider credentials such as
+[`aspec/devops/operations.md`](aspec/devops/operations.md)): `BAE_ADDR`,
+`BAE_DB_PATH`, `BAE_LOG`, and provider credentials such as
 `ANTHROPIC_API_KEY` are passed through the environment, never stored in the
 database.
 

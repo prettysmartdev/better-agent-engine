@@ -1,6 +1,6 @@
 # Agents
 
-BASE is an engine for hosting agents, not a collection of agents: end-user
+BAE is an engine for hosting agents, not a collection of agents: end-user
 agents are defined by agent developers through the client harnesses, and the
 engine is provider-agnostic (provider credentials come from the environment;
 model and provider are per-agent configuration, never hardcoded in the

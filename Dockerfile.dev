@@ -1,4 +1,4 @@
-# Better Agent Server Engine (BASE) — local development toolchain image.
+# Better Agent Engine (BAE) — local development toolchain image.
 #
 # One image with every toolchain needed to build, test, and lint all four
 # components (server, client-rust, client-typescript, client-python).

@@ -1,4 +1,4 @@
-//! Better Agent Server Engine (BASE) — server library.
+//! Better Agent Engine (BAE) — server library.
 //!
 //! The binary in `main.rs` is a thin entrypoint; all server logic lives here
 //! so it stays unit-testable. Planned modules (see `aspec/architecture/design.md`):

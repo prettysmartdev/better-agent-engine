@@ -2,8 +2,8 @@
 
 (use cli.md if solely designing a CLI-based UX)
 
-BASE currently has no graphical interface: the product surface is the REST
-API, the `base-server` CLI (see uxui/cli.md), and the three client
+BAE currently has no graphical interface: the product surface is the REST
+API, the `baesrv` CLI (see uxui/cli.md), and the three client
 libraries. This file records the constraints an eventual admin/debug web
 dashboard must follow, and the machine-use guidance that applies today.
 

@@ -1,4 +1,4 @@
-# base-server — component Makefile.
+# baesrv — component Makefile.
 # Runs the toolchain directly; use the root Makefile to run this in Docker.
 
 .PHONY: help build test lint fmt fmt-check clean run

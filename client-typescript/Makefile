@@ -1,4 +1,4 @@
-# @base-engine/client (TypeScript) — component Makefile.
+# @prettysmartdev/bae-ts (TypeScript) — component Makefile.
 # Runs the toolchain directly; use the root Makefile to run this in Docker.
 
 .PHONY: help install build test lint fmt clean publish

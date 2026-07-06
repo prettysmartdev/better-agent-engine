@@ -6,7 +6,7 @@ Issue: (none yet)
 > **Merged into [0002-session-and-auth.md](0002-session-and-auth.md).** All content from this work item is fully incorporated there. Do not implement from this file.
 
 ## Summary:
-- Turn the bootstrapped `server/` crate into a running service: an axum HTTP server with `GET /healthz` and `GET /api/v1/meta`, environment-driven configuration (`BASE_ADDR`, `BASE_DB_PATH`, `BASE_LOG`), and SQLite initialization with an embedded, forward-only migration runner (migration 0001 creating the schema-version table).
+- Turn the bootstrapped `server/` crate into a running service: an axum HTTP server with `GET /healthz` and `GET /api/v1/meta`, environment-driven configuration (`BAE_ADDR`, `BAE_DB_PATH`, `BAE_LOG`), and SQLite initialization with an embedded, forward-only migration runner (migration 0001 creating the schema-version table).
 
 ## User Stories
 
@@ -31,12 +31,12 @@ have my client library check compatibility at connect time.
 ## Implementation Details:
 - Add `axum`, `tokio`, `rusqlite`, `serde`, `tracing`, `tracing-subscriber` to `server/Cargo.toml`.
 - Structure per aspec/architecture/design.md: `api` (router, handlers), `store` (SQLite open + migration runner), `engine` (empty for now); `main.rs` stays a thin entrypoint that loads config from env and calls into the library.
-- On startup: open/create the database at `BASE_DB_PATH`, apply pending migrations transactionally, refuse to start if the database is newer than the binary.
+- On startup: open/create the database at `BAE_DB_PATH`, apply pending migrations transactionally, refuse to start if the database is newer than the binary.
 - `/healthz` returns 200 with no auth; `/api/v1/meta` returns `{version, api_versions}` (auth comes in a later work item).
 
 ## Edge Case Considerations:
-- Missing or unwritable `BASE_DB_PATH` directory → clear startup error, non-zero exit.
-- Invalid `BASE_ADDR` → usage error (exit code 2) per aspec/uxui/cli.md.
+- Missing or unwritable `BAE_DB_PATH` directory → clear startup error, non-zero exit.
+- Invalid `BAE_ADDR` → usage error (exit code 2) per aspec/uxui/cli.md.
 - Concurrent startup against the same database must not double-apply migrations (transactional migration runner).
 
 ## Test Considerations:

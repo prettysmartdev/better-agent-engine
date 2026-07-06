@@ -1,6 +1,6 @@
 # Experience
 
-BASE is self-hosted developer infrastructure: there is no hosted signup, web
+BAE is self-hosted developer infrastructure: there is no hosted signup, web
 account, or billing. "Accounts" are API keys managed by the operator of each
 server instance.
 
@@ -25,7 +25,7 @@ Billing, subscriptions, plans:
 ## Regular usage
 
 Login flow:
-- No interactive login: clients send their bearer key on every request. Client libraries read the server URL and key from constructor arguments or the `BASE_URL`/`BASE_API_KEY` environment variables.
+- No interactive login: clients send their bearer key on every request. Client libraries read the server URL and key from constructor arguments or the `BAE_URL`/`BAE_API_KEY` environment variables.
 
 Emails, notifications, texts:
-- None sent by the platform. Anything user-facing (an agent notifying a human) is agent behavior implemented by the agent developer, not a BASE feature; run status is available by polling or SSE streaming on the API.
+- None sent by the platform. Anything user-facing (an agent notifying a human) is agent behavior implemented by the agent developer, not a BAE feature; run status is available by polling or SSE streaming on the API.

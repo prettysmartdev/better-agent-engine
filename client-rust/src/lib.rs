@@ -1,7 +1,7 @@
-//! # base-client
+//! # bae-rs
 //!
-//! Rust client library and customizable harness for the Better Agent Server
-//! Engine (BASE). The client is thin and stateless: all durable agent state
+//! Rust client library and customizable harness for the Better Agent
+//! Engine (BAE). The client is thin and stateless: all durable agent state
 //! lives on the server, and this crate provides an idiomatic way to drive it.
 //!
 //! Planned modules (see `aspec/architecture/design.md`):

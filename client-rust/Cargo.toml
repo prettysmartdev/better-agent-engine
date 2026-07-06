@@ -1,8 +1,8 @@
 [package]
-name = "base-client"
+name = "bae-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Rust client library and agent harness for the Better Agent Server Engine (BASE)"
+description = "Rust client library and agent harness for the Better Agent Engine (BAE)"
 license = "Apache-2.0"
 # Flip to allow publishing to crates.io once the first release is cut.
 publish = false

@@ -1,6 +1,6 @@
 /**
- * @base-engine/client — TypeScript client library and customizable harness
- * for the Better Agent Server Engine (BASE).
+ * @prettysmartdev/bae-ts — TypeScript client library and customizable harness
+ * for the Better Agent Engine (BAE).
  *
  * The client is thin and stateless: all durable agent state lives on the
  * server, and this package provides an idiomatic way to drive it. Planned

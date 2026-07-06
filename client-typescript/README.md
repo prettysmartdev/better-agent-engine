@@ -1,7 +1,7 @@
-# @base-engine/client (TypeScript)
+# @prettysmartdev/bae-ts (TypeScript)
 
 TypeScript client library and customizable agent harness for the
-[Better Agent Server Engine](../README.md). Thin and stateless by design:
+[Better Agent Engine](../README.md). Thin and stateless by design:
 durable agent state lives on the [server](../server/), and this package gives
 Node.js/TypeScript programs an idiomatic way to drive it. Feature-parity is
 maintained with the [Rust](../client-rust/) and [Python](../client-python/)
@@ -23,6 +23,6 @@ make lint    # tsc --noEmit + prettier --check
 
 ## Publish
 
-Released independently to npm as `@base-engine/client` (see
+Released independently to npm as `@prettysmartdev/bae-ts` (see
 [`aspec/devops/cicd.md`](../aspec/devops/cicd.md)). `package.json` is marked
 `"private": true` until the first release is cut.

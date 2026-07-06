@@ -1,7 +1,7 @@
 [project]
-name = "base-client"
+name = "bae-py"
 version = "0.1.0"
-description = "Python client library and agent harness for the Better Agent Server Engine (BASE)"
+description = "Python client library and agent harness for the Better Agent Engine (BAE)"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -24,7 +24,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/base_client"]
+packages = ["src/bae_py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,4 +1,4 @@
-# base-client (Rust) — component Makefile.
+# bae-rs (Rust) — component Makefile.
 # Runs the toolchain directly; use the root Makefile to run this in Docker.
 
 .PHONY: help build test lint fmt clean publish

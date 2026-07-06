@@ -4,9 +4,9 @@ Title: Server skeleton, authentication, session management, and client SDKs
 Issue: issuelink
 
 ## Summary:
-- Stand up the `server/` crate as a running service: an axum HTTP server with `GET /healthz` and `GET /api/v1/meta`, environment-driven configuration (`BASE_ADDR`, `BASE_DB_PATH`, `BASE_LOG`), and SQLite initialization with an embedded, forward-only migration runner (migration 0001 creating the schema-version table).
+- Stand up the `server/` crate as a running service: an axum HTTP server with `GET /healthz` and `GET /api/v1/meta`, environment-driven configuration (`BAE_ADDR`, `BAE_DB_PATH`, `BAE_LOG`), and SQLite initialization with an embedded, forward-only migration runner (migration 0001 creating the schema-version table).
 
-- authentication and session creation for client/server: base-server exposes two ports. The first (443 if TLS enabled, 8080 if not) for client interactions, serving JSON-RPC over HTTP/2. The second for admin-only interactions, and ONLY binds to localhost.
+- authentication and session creation for client/server: baesrv exposes two ports. The first (443 if TLS enabled, 8080 if not) for client interactions, serving JSON-RPC over HTTP/2. The second for admin-only interactions, and ONLY binds to localhost.
 
 - admin port exposes a simple HTTP REST API for managing the server. First endpoint(s) to implement are: create client key, list client keys, delete client key. localhost client (via curl) can hit create client key endpoint to create a new key, hashed key stored in sqlite alongside client name provided by request. list endpoint lists clients with active keys, created date, last used date. hashed key value is not returned ever. delete endpoint deletes the indicated client key
 
@@ -62,11 +62,11 @@ audit behavior, debug agent failures, satisfy compliance requirements with a com
 - `/healthz` returns 200 with no auth. `/api/v1/meta` returns `{version, api_versions}`.
 
 ### Server — dual-port listener
-- On startup, bind two TCP listeners: `BASE_ADDR` (default `0.0.0.0:8080`) for the client-facing axum router, and `BASE_ADMIN_ADDR` (default `127.0.0.1:8081`) for the admin-only axum router. Both are started before the runtime hands off to axum. The admin and client routers are separate `Router` instances — never shared.
+- On startup, bind two TCP listeners: `BAE_ADDR` (default `0.0.0.0:8080`) for the client-facing axum router, and `BAE_ADMIN_ADDR` (default `127.0.0.1:8081`) for the admin-only axum router. Both are started before the runtime hands off to axum. The admin and client routers are separate `Router` instances — never shared.
 - TLS termination is upstream (nginx/caddy/cloud LB); the container always speaks plain HTTP internally. Document this clearly.
 
 ### SQLite — migration runner and schema
-- On startup: open or create the database at `BASE_DB_PATH`, apply pending migrations transactionally, refuse to start if the schema version is newer than the binary knows about.
+- On startup: open or create the database at `BAE_DB_PATH`, apply pending migrations transactionally, refuse to start if the schema version is newer than the binary knows about.
 - **Migration 0001 — schema_version table**: `schema_version(version INTEGER PK, applied_at TEXT)`. The migration runner inserts a row per applied migration inside a single transaction.
 - **Migration 0002 — keys table**: `keys(id TEXT PK, name TEXT, key_hash TEXT, key_prefix TEXT, role TEXT CHECK(role IN ('client','session')), profile_id TEXT REFERENCES profiles(id), client_id TEXT REFERENCES keys(id), created_at TEXT, last_used_at TEXT, deleted_at TEXT)`. `key_prefix` stores the first 8 chars for display; `key_hash` is Argon2id. `key_hash` is never returned in any API response.
 - **Migration 0003 — profiles table**: `profiles(id TEXT PK, name TEXT UNIQUE, provider_config TEXT, fallback_configs TEXT, mcp_servers TEXT, allowed_tools TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT)`. Complex fields stored as JSON blobs.
@@ -100,13 +100,13 @@ Use an exhaustive match / discriminated union in each language so adding a new t
 - `DELETE /admin/v1/profiles/:id` — soft-delete (`deleted_at`); reject if any active (non-deleted) client keys reference it.
 
 **Client Keys**
-- `POST /admin/v1/keys` — body: `{name, profile_id}`. Validates profile exists and is not deleted. Returns `{id, name, key, prefix, profile_id, created_at}` — `key` is the plaintext `base_<random>` shown exactly once.
+- `POST /admin/v1/keys` — body: `{name, profile_id}`. Validates profile exists and is not deleted. Returns `{id, name, key, prefix, profile_id, created_at}` — `key` is the plaintext `bae_<random>` shown exactly once.
 - `GET /admin/v1/keys` — list active keys (no `key_hash`). Returns `{id, name, prefix, profile_id, created_at, last_used_at}` per item.
 - `DELETE /admin/v1/keys/:id` — revoke key (sets `deleted_at`; all open sessions for this key are invalidated).
 
 ### Client API (client port)
 
-- `POST /api/v1/sessions` — auth: `Authorization: Bearer <client_key>`. Body: `{client_version, tools: [{name, description, input_schema}]}`. Validates client key (Argon2id, constant-time, `deleted_at IS NULL`). Validates declared tools against profile's `allowed_tools`. Creates session row, generates `ses_…` session ID and `base_ses_…` session key (hash immediately; return plaintext once). Inserts `session.open` event. Returns `{session_id, session_key, profile}`.
+- `POST /api/v1/sessions` — auth: `Authorization: Bearer <client_key>`. Body: `{client_version, tools: [{name, description, input_schema}]}`. Validates client key (Argon2id, constant-time, `deleted_at IS NULL`). Validates declared tools against profile's `allowed_tools`. Creates session row, generates `ses_…` session ID and `bae_ses_…` session key (hash immediately; return plaintext once). Inserts `session.open` event. Returns `{session_id, session_key, profile}`.
 - `POST /api/v1/sessions/:id/messages` — auth: `Authorization: Bearer <session_key>`. Body: `{message: {role, content}}`. Inserts `client.message.send` event. Runs the session message loop. Returns `{message: {role, content}, events: [...]}`.
 - `GET /api/v1/sessions/:id/events` — cursor-paginated replay. Auth: session key. Returns full `session_events` rows for the session.
 - `DELETE /api/v1/sessions/:id` — close session. Auth: session key. Inserts `session.close` event.
@@ -155,8 +155,8 @@ Each client includes `examples/reference-assistant/` implementing the `reference
 
 ## Edge Case Considerations:
 
-- **Startup — missing/unwritable `BASE_DB_PATH`**: clear error message, non-zero exit before attempting to bind ports.
-- **Startup — invalid `BASE_ADDR` or `BASE_ADMIN_ADDR`**: usage error (exit code 2) per `aspec/uxui/cli.md`; if `BASE_ADMIN_ADDR` port is already in use, refuse to start rather than silently skipping the admin port.
+- **Startup — missing/unwritable `BAE_DB_PATH`**: clear error message, non-zero exit before attempting to bind ports.
+- **Startup — invalid `BAE_ADDR` or `BAE_ADMIN_ADDR`**: usage error (exit code 2) per `aspec/uxui/cli.md`; if `BAE_ADMIN_ADDR` port is already in use, refuse to start rather than silently skipping the admin port.
 - **Startup — database newer than binary**: if `schema_version` is ahead of the highest known migration, refuse to start with a clear message rather than silently ignoring unknown migrations.
 - **Concurrent startup**: transactional migration runner prevents double-applying migrations if two processes start against the same database simultaneously.
 - **Graceful shutdown**: on SIGTERM, stop accepting new connections on both ports, drain in-flight requests (configurable timeout), then close the database.
@@ -175,7 +175,7 @@ Each client includes `examples/reference-assistant/` implementing the `reference
 
 ## Test Considerations:
 
-- **Unit — config parsing**: env var loading for `BASE_ADDR`, `BASE_ADMIN_ADDR`, `BASE_DB_PATH`, `BASE_LOG`; invalid values produce the correct error type.
+- **Unit — config parsing**: env var loading for `BAE_ADDR`, `BAE_ADMIN_ADDR`, `BAE_DB_PATH`, `BAE_LOG`; invalid values produce the correct error type.
 - **Unit — migration runner**: fresh DB applies all migrations in order; already-up-to-date DB is a no-op; future-versioned DB refuses to start.
 - **Unit — key generation and hashing**: byte length meets entropy requirement; hash round-trip passes; wrong key fails; constant-time comparison rejects mismatched input without early-return.
 - **Unit — env var substitution**: `${VAR}` present → substituted; `${VAR}` absent → error; literal `$` without braces → passed through unchanged.
@@ -184,7 +184,7 @@ Each client includes `examples/reference-assistant/` implementing the `reference
 - **Integration — server bootstrap**: start server on ephemeral port pair with a temp DB; assert `/healthz` 200 and `/api/v1/meta` response shape; assert admin port refuses connections from non-loopback (if testable in CI).
 - **Integration — admin API**: full CRUD lifecycle for profiles and keys; `key_hash` never returned in any response; deleting a profile blocked while active keys reference it; list pagination returns correct cursor.
 - **Integration — session lifecycle**: create key → open session (exchange key for session ID + session key) → send message via mock provider → assert all event types inserted in order → close session → assert `session.close` event → replay via `GET /api/v1/sessions/:id/events` and assert history matches.
-- **Integration — auth rejection**: deleted client key → 401; wrong session key → 401; session key on wrong session → 401; `base_admin_addr` inaccessible from client port path.
+- **Integration — auth rejection**: deleted client key → 401; wrong session key → 401; session key on wrong session → 401; `bae_admin_addr` inaccessible from client port path.
 - **Integration — provider fallback**: profile with broken primary and working fallback; assert fallback used; assert both `provider.response` events (failure + success) are in the log.
 - **Integration — tool dispatch (harness)**: register a tool in the harness; mock provider returns a tool-call response; assert harness calls handler and sends result; assert `tool.call` and `tool.result` events in the log.
 - **Cross-SDK parity**: run the `harness-smoke` agent (per `aspec/genai/agents.md`) from all three client implementations against a real server; assert identical event type sequences for the same scripted inputs.
@@ -197,6 +197,6 @@ Each client includes `examples/reference-assistant/` implementing the `reference
 - All SQLite migrations are embedded via `include_str!` macros and applied by the migration runner; migrations are forward-only and check `schema_version` before applying to be safe against concurrent starts.
 - Module layout: key generation/hashing/comparison in `server/src/store/keys.rs`; admin handlers in `server/src/api/admin/`; client API handlers in `server/src/api/client/`; session engine loop in `server/src/engine/session.rs`.
 - Client SDK harness logic lives in `src/harness.{rs,ts,py}` (or idiomatic equivalent) and re-exports a clean top-level API. Each SDK's `examples/reference-assistant/` exercises every hook point at least once, serving as living documentation.
-- All new `BASE_*` env vars (`BASE_ADMIN_ADDR`, `BASE_TLS_ENABLED`) must be documented in the existing env-var reference and validated at startup per `aspec/uxui/cli.md`.
+- All new `BAE_*` env vars (`BAE_ADMIN_ADDR`, `BAE_TLS_ENABLED`) must be documented in the existing env-var reference and validated at startup per `aspec/uxui/cli.md`.
 - Never persist or log resolved env var token values; resolve `${ENV_VAR_NAME}` immediately before the provider HTTP call and discard after.
 - Verify the production image still builds (`make image`) after this work item since it introduces the first real binary behavior and dual-port listener.

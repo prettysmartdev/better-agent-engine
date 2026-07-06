@@ -1,5 +1,5 @@
-"""base-client — Python client library and customizable harness for the
-Better Agent Server Engine (BASE).
+"""bae-py — Python client library and customizable harness for the
+Better Agent Engine (BAE).
 
 The client is thin and stateless: all durable agent state lives on the
 server, and this package provides an idiomatic way to drive it. Planned

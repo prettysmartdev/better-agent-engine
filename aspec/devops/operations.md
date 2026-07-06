@@ -3,16 +3,16 @@
 ## Installing and running
 Installation:
 - Pull the published Docker image (or build locally with `make image`). No other artifacts are needed to run a server.
-- Client libraries install from their registries: `cargo add base-client`, `npm install @base-engine/client`, `uv add base-client`.
+- Client libraries install from their registries: `cargo add bae-rs`, `npm install @prettysmartdev/bae-ts`, `uv add bae-py`.
 
 Setup and run:
-- `docker run -p 8080:8080 -v base-data:/var/lib/base better-agent-server-engine`
+- `docker run -p 8080:8080 -v bae-data:/var/lib/bae better-agent-engine`
 - First run creates the SQLite database, applies migrations, and prints a bootstrap admin API key (see uxui/setup.md). Health is at `GET /healthz`.
 
 Environment variables:
-- `BASE_ADDR` — listen address (default `0.0.0.0:8080`)
-- `BASE_DB_PATH` — SQLite database path (default `/var/lib/base/base.db` in the image)
-- `BASE_LOG` — tracing filter (default `info`)
+- `BAE_ADDR` — listen address (default `0.0.0.0:8080`)
+- `BAE_DB_PATH` — SQLite database path (default `/var/lib/bae/bae.db` in the image)
+- `BAE_LOG` — tracing filter (default `info`)
 - Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the environment of whichever process calls the provider.
 
 Secrets:

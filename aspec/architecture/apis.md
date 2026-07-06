@@ -15,7 +15,7 @@ Objects:
 - Events are append-only; history is never mutated, only added to.
 
 Authentication:
-- Bearer API keys: `Authorization: Bearer base_…` on every request; no anonymous endpoints except health.
+- Bearer API keys: `Authorization: Bearer bae_…` on every request; no anonymous endpoints except health.
 - Keys are created/revoked via admin endpoints and hashed at rest (see architecture/security.md).
 
 Conventions:
