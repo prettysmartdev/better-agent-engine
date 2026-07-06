@@ -1,5 +1,3 @@
-# Better Agent Engine (BAE)
-
 <p align="center">
   <strong>Stateful agent server with ultra customizable client harnesses.</strong> <br>
   Build agents with TypeScript, Python, or Rust to fit your exact needs.<br>
@@ -11,14 +9,14 @@
   <img src="https://github.com/prettysmartdev/better-agent-engine/actions/workflows/test.yml/badge.svg">
 </p>
 
-BAE gives you the best of cloud and local agents. The server persists all
-durable state (authentication, sessions, providers, events, etc.)
+Better Agent Engine (BAE) gives you the best of cloud and local agents. The server 
+persists all durable state (authentication, sessions, providers, events, etc.)
 in SQLite. The client harness libraries — Rust, TypeScript, and Python —
 give agent developers an idiomatic agent SDK in their language of choice while
 staying thin, stateless, and ultra customizable with tools, loop hooks, and more.
+Incorporate client-side tools with simple tool handlers and server-side MCP servers.
 
-> Status: alpha. The codebase, tooling, and project
-> specification are in place; APIs and SDKs will likely change.
+> Status: alpha. The codebase, tooling, and project specification are in place; APIs and SDKs will likely change.
 
 ## Local development
 
