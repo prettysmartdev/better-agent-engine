@@ -1,0 +1,16 @@
+[package]
+name = "base-server"
+version = "0.1.0"
+edition = "2021"
+description = "Better Agent Server Engine — stateful server for building useful AI agents"
+license = "Apache-2.0"
+publish = false
+
+# Planned dependencies (added as functionality lands — see aspec/foundation.md):
+#   axum, tokio       — HTTP server and async runtime
+#   rusqlite          — SQLite storage (bundled)
+#   serde, serde_json — API (de)serialization
+#   tracing, tracing-subscriber — structured logging
+[dependencies]
+
+[dev-dependencies]

@@ -1,0 +1,22 @@
+# Rust
+target/
+
+# Node / TypeScript
+node_modules/
+dist/
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local data / secrets
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+data/

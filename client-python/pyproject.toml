@@ -1,0 +1,34 @@
+[project]
+name = "base-client"
+version = "0.1.0"
+description = "Python client library and agent harness for the Better Agent Server Engine (BASE)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# Planned dependencies (added as functionality lands — see aspec/foundation.md):
+#   httpx    — HTTP transport (sync + async)
+#   pydantic — API request/response models
+dependencies = []
+
+# Marked private until the first release is cut; remove to allow uploads.
+classifiers = ["Private :: Do Not Upload"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/base_client"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100

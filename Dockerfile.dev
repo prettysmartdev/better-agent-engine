@@ -1,0 +1,53 @@
+# Better Agent Server Engine (BASE) — local development toolchain image.
+#
+# One image with every toolchain needed to build, test, and lint all four
+# components (server, client-rust, client-typescript, client-python).
+# Build it with `make dev-image`; the root Makefile runs all component
+# targets inside a container of this image with the repo mounted at
+# /workspace. Also serves as the base image for .awman/Dockerfile.claude.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System packages required for building, testing, and running this project.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    make \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    sqlite3 \
+    libsqlite3-dev \
+    python3 \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain (server, client-rust). Installed system-wide (not under a
+# user HOME) so the image works for any container user; world-writable so
+# non-root users can update caches and components.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL --retry 5 https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain stable --profile default --no-modify-path \
+    && rustc --version && cargo --version && cargo clippy --version && cargo fmt --version \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+
+# Node.js 22 LTS (client-typescript).
+RUN curl -fsSL --retry 5 https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+# uv (client-python): package/venv manager; also provisions Python versions.
+RUN curl -fsSL --retry 5 https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
+# Copy instead of hardlinking into venvs: the workspace is a bind mount on a
+# different filesystem than uv's cache.
+ENV UV_LINK_MODE=copy
+
+WORKDIR /workspace
+CMD ["bash"]

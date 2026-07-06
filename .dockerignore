@@ -1,0 +1,15 @@
+.git/
+.awman/
+aspec/
+
+# Build outputs and local state (rebuilt inside the image or irrelevant to it)
+**/target/
+**/node_modules/
+**/dist/
+**/.venv/
+**/__pycache__/
+*.db
+*.db-*
+.env
+.env.*
+data/

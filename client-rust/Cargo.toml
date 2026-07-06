@@ -1,0 +1,16 @@
+[package]
+name = "base-client"
+version = "0.1.0"
+edition = "2021"
+description = "Rust client library and agent harness for the Better Agent Server Engine (BASE)"
+license = "Apache-2.0"
+# Flip to allow publishing to crates.io once the first release is cut.
+publish = false
+
+# Planned dependencies (added as functionality lands — see aspec/foundation.md):
+#   reqwest, tokio    — HTTP transport and async runtime
+#   serde, serde_json — API (de)serialization
+#   thiserror         — error types
+[dependencies]
+
+[dev-dependencies]

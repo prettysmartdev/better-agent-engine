@@ -1,0 +1,75 @@
+FROM awman-better-agent-server-engine:latest
+
+# Force root for user/workspace setup: a base image may have switched to a
+# non-root user, and useradd/mkdir/chown need root.
+USER root
+
+# Reset env vars so behavior does not depend on what the base set:
+#   - DEBIAN_FRONTEND avoids interactive apt prompts.
+#   - PATH prepends the agent baseline to whatever the base image set,
+#     so installer-resolved binaries cannot be shadowed by the base while
+#     useful base PATH additions (e.g. /usr/local/cargo/bin from
+#     Dockerfile.dev) stay visible inside the agent container.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+
+# Strict shell for every RUN: -e fails fast, -o pipefail catches errors in
+# `curl | bash` pipelines so a partial download cannot silently succeed.
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+# Override any inherited ENTRYPOINT/CMD so `docker run image <command> ...`
+# behaves predictably regardless of how the base evolves.
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+# ── awman user + workspace (idempotent against a base that already created it) ─
+# Created BEFORE the agent install so the installer below can run as the
+# runtime user and land in its default location under /home/awman.
+# Outer braces keep the && chain associated with the user-creation block,
+# avoiding the `A || B && C && D` precedence trap that would otherwise skip
+# `mkdir`/`chown` whenever the user already exists.
+RUN { id -u awman >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/awman awman 2>/dev/null \
+       || useradd -s /bin/bash -d /home/awman awman ; } \
+    && mkdir -p /workspace /home/awman \
+    && chown -R awman:awman /workspace /home/awman
+
+# Run everything from here as the runtime user. /home/awman/.local/bin leads
+# PATH so the claude launcher installed below is reachable from any container
+# entrypoint (docker run/exec inherit image ENV regardless of command).
+USER awman
+ENV HOME=/home/awman \
+    PATH=/home/awman/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+WORKDIR /workspace
+
+# ── Install agent binary ──────────────────────────────────────────────────────
+# Claude Code's "native" installer drops a launcher at $HOME/.local/bin/claude
+# pointing to the real binary under $HOME/.local/share/claude/versions/<ver>.
+# Claude validates this layout at runtime and errors if the binary has been
+# relocated (e.g. copied to /usr/local/bin), so we run the installer as the
+# awman user, keep the install tree intact at its default location
+# /home/awman/.local/bin/claude, and rely on PATH (set above) instead of
+# copying the binary anywhere. The script is saved to disk first so `--retry`
+# can recover from transient curl failures without `curl ... | bash` muddling
+# pipefail semantics. If the installer ever places the launcher elsewhere, we
+# fall back to locating it and symlinking it into $HOME/.local/bin.
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 \
+        https://claude.ai/install.sh -o /tmp/claude-install.sh \
+    && bash /tmp/claude-install.sh \
+    && rm -f /tmp/claude-install.sh \
+    && if [ ! -e "$HOME/.local/bin/claude" ]; then \
+           BIN="$(command -v claude 2>/dev/null || true)"; \
+           if [ -z "$BIN" ]; then \
+               BIN="$(find "$HOME" -maxdepth 8 \( -type f -o -type l \) -name claude -print -quit 2>/dev/null || true)"; \
+           fi; \
+           if [ -z "$BIN" ]; then \
+               echo "ERROR: claude binary not found after installation" >&2; exit 1; \
+           fi; \
+           mkdir -p "$HOME/.local/bin" && ln -s "$BIN" "$HOME/.local/bin/claude"; \
+       fi \
+    && test -x "$HOME/.local/bin/claude"
+
+# ── Smoke test: verify the launcher resolves on PATH at its default location,
+# from the same user/env context container entrypoints will use. ──────────────
+RUN test -x "$(command -v claude)" \
+    && [ "$(command -v claude)" = "/home/awman/.local/bin/claude" ]
