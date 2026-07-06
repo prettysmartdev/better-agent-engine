@@ -5,10 +5,11 @@ description = "Python client library and agent harness for the Better Agent Engi
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-# Planned dependencies (added as functionality lands — see aspec/foundation.md):
-#   httpx    — HTTP transport (sync + async)
-#   pydantic — API request/response models
-dependencies = []
+# httpx backs the default async transport; the harness is otherwise
+# dependency-free (tests inject a mock transport and run fully offline).
+dependencies = [
+    "httpx>=0.28.1",
+]
 
 # Marked private until the first release is cut; remove to allow uploads.
 classifiers = ["Private :: Do Not Upload"]
@@ -16,6 +17,7 @@ classifiers = ["Private :: Do Not Upload"]
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-asyncio>=0.24",
     "ruff>=0.8",
 ]
 
@@ -28,6 +30,7 @@ packages = ["src/bae_py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 src = ["src", "tests"]

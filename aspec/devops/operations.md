@@ -10,13 +10,18 @@ Setup and run:
 - First run creates the SQLite database, applies migrations, and prints a bootstrap admin API key (see uxui/setup.md). Health is at `GET /healthz`.
 
 Environment variables:
-- `BAE_ADDR` — listen address (default `0.0.0.0:8080`)
+- `BAE_ADDR` — client-facing listen address (default `0.0.0.0:8080`). Plain HTTP; TLS terminates at an upstream proxy.
+- `BAE_ADMIN_ADDR` — admin-only listen address (default `127.0.0.1:8081`). Must be a loopback address — the server refuses to start otherwise, so the admin surface is never reachable off-host.
 - `BAE_DB_PATH` — SQLite database path (default `/var/lib/bae/bae.db` in the image)
 - `BAE_LOG` — tracing filter (default `info`)
+- `BAE_TLS_ENABLED` — whether an upstream proxy terminates TLS (default `false`). Informational only: the container always speaks plain HTTP internally.
+- `BAE_SHUTDOWN_TIMEOUT` — seconds to drain in-flight requests on SIGTERM before forcing shutdown (default `30`).
+- Invalid values are usage errors (exit code 2); an unwritable `BAE_DB_PATH` or an in-use admin port is a runtime error (exit code 1) reported before the server begins serving.
 - Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the environment of whichever process calls the provider.
 
 Secrets:
-- API keys are stored only as salted hashes in SQLite; plaintext is shown once at creation.
+- API keys are stored only as Argon2id salted hashes in SQLite; plaintext is shown once at creation and then discarded.
+- Argon2id parameters: memory 64 MiB, iterations (time cost) 3, parallelism 1, output 32 bytes. These are embedded in the stored PHC string, so existing hashes remain verifiable after a parameter change. To tune for your hardware: raise memory cost first (more GPU-resistant), then iterations; parallelism can be increased on multi-core verifiers.
 - Provider keys and the bootstrap admin key come from the environment / operator, are never written to the database or logs, and should be rotated on any suspicion of exposure.
 
 ## Ongoing operations

@@ -1,8 +1,10 @@
-fn main() {
-    // Placeholder entrypoint: the HTTP server and SQLite bootstrap arrive
-    // with aspec/work-items/0001-server-skeleton.md.
-    println!(
-        "baesrv {} — not yet implemented; see aspec/ for the project plan",
-        baesrv::VERSION
-    );
+//! Thin entrypoint for the `baesrv` binary.
+//!
+//! All logic lives in the library ([`baesrv`]); this just delegates to the CLI
+//! runner and returns its process exit code.
+
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    baesrv::cli::run()
 }

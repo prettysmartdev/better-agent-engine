@@ -24,5 +24,11 @@ make run     # run the server
 
 Built and shipped as a Docker image via the root [`Dockerfile`](../Dockerfile):
 `make image` from the repo root. Configuration is via environment variables
-(`BAE_ADDR`, `BAE_DB_PATH`, `BAE_LOG`); see
+(`BAE_ADDR`, `BAE_ADMIN_ADDR`, `BAE_DB_PATH`, `BAE_LOG`, `BAE_TLS_ENABLED`,
+`BAE_SHUTDOWN_TIMEOUT`); see
 [`aspec/devops/operations.md`](../aspec/devops/operations.md).
+
+The server listens on **two ports**: the client-facing port (`BAE_ADDR`) and an
+admin-only port (`BAE_ADMIN_ADDR`) that binds strictly to loopback. Both speak
+plain HTTP — TLS terminates at an upstream proxy. Subcommands: `serve` (default),
+`migrate` (apply migrations and exit), `version`.

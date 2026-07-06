@@ -22,10 +22,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "lint": "tsc -p tsconfig.json --noEmit",
-    "clean": "rm -rf dist"
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p examples/tsconfig.json --noEmit",
+    "clean": "rm -rf dist",
+    "example": "tsx examples/reference-assistant/main.ts"
   },
   "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
     "prettier": "^3.4.0"

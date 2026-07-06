@@ -25,6 +25,10 @@ COPY --from=build /build/target/release/baesrv /usr/local/bin/baesrv
 USER bae
 ENV BAE_ADDR=0.0.0.0:8080 \
     BAE_DB_PATH=/var/lib/bae/bae.db
+# Only the client port is exposed. The admin port (BAE_ADMIN_ADDR, default
+# 127.0.0.1:8081) binds to loopback inside the container and is intentionally
+# NOT exposed — reach it via `docker exec` / an SSH tunnel, never the network.
+# TLS terminates upstream; the container speaks plain HTTP.
 EXPOSE 8080
 VOLUME ["/var/lib/bae"]
 ENTRYPOINT ["baesrv"]

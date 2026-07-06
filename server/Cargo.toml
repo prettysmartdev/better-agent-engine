@@ -6,11 +6,37 @@ description = "Better Agent Engine — stateful server for building useful AI ag
 license = "Apache-2.0"
 publish = false
 
-# Planned dependencies (added as functionality lands — see aspec/foundation.md):
-#   axum, tokio       — HTTP server and async runtime
-#   rusqlite          — SQLite storage (bundled)
-#   serde, serde_json — API (de)serialization
-#   tracing, tracing-subscriber — structured logging
 [dependencies]
+# HTTP server and async runtime.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+# SQLite storage. `bundled` compiles SQLite into the binary so the production
+# image needs no system libsqlite3 (keeps the slim runtime base dependency-free).
+rusqlite = { version = "0.32", features = ["bundled"] }
+# API (de)serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Structured logging to stderr.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Key hashing (Argon2id) and CSPRNG. argon2 0.5 / rand 0.8 share rand_core 0.6,
+# which keeps `rand::rngs::OsRng` available as the spec requires.
+argon2 = "0.5"
+rand = "0.8"
+# Constant-time comparison for key verification (timing-oracle resistant).
+subtle = "2"
+# Outbound HTTP client for provider (LLM) calls made by the session engine.
+# `rustls-tls` keeps the TLS stack pure-Rust so the slim runtime image needs no
+# OpenSSL; `json` gives typed request/response bodies. Points at whatever
+# `base_url` a profile declares, so tests can target a local mock HTTP server.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
+# Integration tests boot the real routers on ephemeral ports and drive them over
+# HTTP against an in-process mock provider. Every crate below is already in the
+# main dependency graph (and thus in Cargo.lock), so the test build needs no
+# extra downloads and runs fully offline.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+axum = "0.8"
+serde_json = "1"
