@@ -1,0 +1,10 @@
+[2m2026-07-06T18:23:09.171253Z[0m [32m INFO[0m [2mbaesrv::store::migrations[0m[2m:[0m applied migration [3mversion[0m[2m=[0m1 [3mname[0m[2m=[0m"schema_version"
+[2m2026-07-06T18:23:09.171503Z[0m [32m INFO[0m [2mbaesrv::store::migrations[0m[2m:[0m applied migration [3mversion[0m[2m=[0m2 [3mname[0m[2m=[0m"keys"
+[2m2026-07-06T18:23:09.171676Z[0m [32m INFO[0m [2mbaesrv::store::migrations[0m[2m:[0m applied migration [3mversion[0m[2m=[0m3 [3mname[0m[2m=[0m"profiles"
+[2m2026-07-06T18:23:09.171836Z[0m [32m INFO[0m [2mbaesrv::store::migrations[0m[2m:[0m applied migration [3mversion[0m[2m=[0m4 [3mname[0m[2m=[0m"sessions"
+[2m2026-07-06T18:23:09.171989Z[0m [32m INFO[0m [2mbaesrv::store::migrations[0m[2m:[0m applied migration [3mversion[0m[2m=[0m5 [3mname[0m[2m=[0m"session_events"
+[2m2026-07-06T18:23:09.173137Z[0m [32m INFO[0m [2mbaesrv[0m[2m:[0m client listener bound (plain HTTP; TLS terminates upstream) [3maddr[0m[2m=[0m127.0.0.1:18080
+[2m2026-07-06T18:23:09.173232Z[0m [32m INFO[0m [2mbaesrv[0m[2m:[0m admin listener bound (loopback only; plain HTTP) [3maddr[0m[2m=[0m127.0.0.1:18081
+[2m2026-07-06T18:23:10.208200Z[0m [32m INFO[0m [2mbaesrv[0m[2m:[0m shutdown signal received; draining in-flight requests [3mtimeout[0m[2m=[0m30s
+[2m2026-07-06T18:23:10.208640Z[0m [32m INFO[0m [2mbaesrv[0m[2m:[0m both listeners drained cleanly
+[2m2026-07-06T18:23:10.209591Z[0m [32m INFO[0m [2mbaesrv[0m[2m:[0m database closed; shutdown complete
