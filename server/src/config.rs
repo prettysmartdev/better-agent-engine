@@ -1,9 +1,16 @@
-//! Environment-driven configuration.
+//! Environment-driven server configuration.
 //!
-//! The server is configured entirely through `BAE_*` environment variables (see
-//! `aspec/uxui/cli.md` and `aspec/devops/operations.md`); there is no config
-//! file. Every value has a sensible default so `baesrv` with no environment set
-//! still starts a working server.
+//! The server's own runtime settings (listen addresses, DB path, log filter,
+//! shutdown timeout) are configured entirely through `BAE_*` environment
+//! variables (see `aspec/uxui/cli.md` and `aspec/devops/operations.md`). Every
+//! value has a sensible default so `baesrv` with no environment set still starts
+//! a working server.
+//!
+//! There is one optional *file*-based input, kept deliberately separate from
+//! this module because it has different failure semantics: the MCP server
+//! registry in `bae-config.toml`, loaded via `--config <path>` or `BAE_CONFIG`
+//! (see [`crate::config_file`]). A missing config file is not an error; a
+//! malformed `BAE_*` value here is.
 //!
 //! Validation happens at startup. A malformed value is a **usage error**
 //! (process exit code 2 per `aspec/uxui/cli.md`); see [`ConfigError::exit_code`].

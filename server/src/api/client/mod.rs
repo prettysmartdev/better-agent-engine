@@ -6,9 +6,12 @@
 //! port directly to the internet.
 //!
 //! Implemented here: `GET /healthz` (unauthenticated liveness), `GET
-//! /api/v1/meta` (version + supported API versions), and the authenticated
-//! `/api/v1/sessions` family (see [`sessions`]).
+//! /api/v1/meta` (version + supported API versions), the authenticated
+//! `/api/v1/sessions` REST family (see [`sessions`]), and the one JSON-RPC 2.0
+//! endpoint `POST /api/v1/sessions/{id}/rpc` carrying the session message/event
+//! loop (see [`rpc`]).
 
+pub mod rpc;
 pub mod sessions;
 
 use axum::http::StatusCode;
@@ -29,10 +32,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}",
             axum::routing::delete(sessions::close),
         )
-        .route(
-            "/api/v1/sessions/{id}/messages",
-            post(sessions::post_message),
-        )
+        .route("/api/v1/sessions/{id}/rpc", post(rpc::rpc))
         .route("/api/v1/sessions/{id}/events", get(sessions::get_events))
         .with_state(state)
 }

@@ -36,9 +36,13 @@ export class ApiError extends BaeError {
 }
 
 /**
- * A `502` providers-failed outcome. Per the contract the body is the normal
- * `{message, events}` shape (not a problem doc); the session is now `error`.
- * Typically means a provider key was missing or the provider was unreachable.
+ * A providers-failed outcome: every provider (primary + fallbacks) failed
+ * server-side during a `session.sendMessage` turn, and the session is now
+ * `error`. The `/rpc` loop delivers this as a normal terminal `{message,
+ * events}` result (not a 502 or a JSON-RPC error); the harness recognises the
+ * `session.error`/`all_providers_failed` event in the turn and surfaces it here
+ * for continuity. Typically a provider key was missing or the provider was
+ * unreachable.
  */
 export class ProvidersFailedError extends BaeError {
   constructor(
@@ -46,8 +50,24 @@ export class ProvidersFailedError extends BaeError {
     readonly events: SessionEvent[],
   ) {
     super(
-      "all providers failed (502) — check the profile's provider config / key",
+      "all providers failed — check the profile's provider config / key",
     );
+  }
+}
+
+/**
+ * The `/rpc` stream carried a JSON-RPC 2.0 error object (HTTP was still `200`).
+ * Reserved for parse / invalid-request / method-not-found / invalid-params /
+ * internal errors and `-32000` application errors (session-not-open,
+ * profile-unavailable-mid-session, `lagged`). Distinct from {@link ApiError},
+ * which is a pre-stream HTTP/RFC-7807 failure (e.g. auth).
+ */
+export class RpcError extends BaeError {
+  constructor(
+    readonly code: number,
+    readonly rpcMessage: string,
+  ) {
+    super(`JSON-RPC error ${code}: ${rpcMessage}`);
   }
 }
 

@@ -176,9 +176,10 @@ pub struct ToolResult {
     pub content: Value,
 }
 
-/// An event row as returned in `POST …/messages` responses and the events
-/// replay endpoint. `event_type` is one of the closed set documented in
-/// `api-contract.md` §8; `payload` is freeform JSON.
+/// An event row as returned in the `session.sendMessage` terminal result, in
+/// live `session.event` notifications, and by the events replay endpoint.
+/// `event_type` is one of the closed set documented in `api-contract.md` §8;
+/// `payload` is freeform JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventView {
     /// Event id (`evt_…`).
@@ -248,4 +249,145 @@ impl std::fmt::Display for ApiError {
             }
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 envelopes for the session loop (`POST …/rpc`)
+//
+// The management routes (session open/close, events replay) stay plain REST;
+// only the message loop is JSON-RPC. A request is POSTed to
+// `POST /api/v1/sessions/{id}/rpc` and the reply is an `application/x-ndjson`
+// stream of these envelopes: frames with no `id` are notifications
+// (`session.event`), and the frame carrying the request `id` is the terminal
+// response (`result` on success, `error` on failure).
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC 2.0 request envelope. `method` is one of `session.sendMessage`,
+/// `session.subscribe`, or `session.unsubscribe`.
+#[derive(Clone, Debug, Serialize)]
+pub struct JsonRpcRequest<P> {
+    /// Protocol tag; always `"2.0"`.
+    pub jsonrpc: &'static str,
+    /// Correlation id echoed back on the terminal response.
+    pub id: u64,
+    /// The method to invoke.
+    pub method: String,
+    /// Method parameters.
+    pub params: P,
+}
+
+impl<P> JsonRpcRequest<P> {
+    /// Build a `"2.0"` request with the given id, method, and params.
+    pub fn new(id: u64, method: impl Into<String>, params: P) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+/// A single JSON-RPC 2.0 frame decoded from the NDJSON response stream.
+///
+/// Branch on [`id`](Self::id): a frame with no `id` is a **notification** (its
+/// `method`/`params` carry a `session.event`, or an `error` for a mid-stream
+/// notice such as `lagged`); the frame carrying the request `id` is the
+/// **terminal response** (`result` on success, `error` on failure).
+#[derive(Clone, Debug, Deserialize)]
+pub struct JsonRpcFrame {
+    /// Present only on the terminal response.
+    #[serde(default)]
+    pub id: Option<Value>,
+    /// Notification method (e.g. `session.event`).
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Notification params (e.g. the [`EventView`] for a `session.event`).
+    #[serde(default)]
+    pub params: Option<Value>,
+    /// Terminal success payload.
+    #[serde(default)]
+    pub result: Option<Value>,
+    /// A JSON-RPC error object (terminal, or a mid-stream notice).
+    #[serde(default)]
+    pub error: Option<JsonRpcError>,
+}
+
+/// A JSON-RPC 2.0 error object. `code` follows the spec's reserved ranges plus
+/// the server's `-32000` application errors (session-not-open,
+/// profile-unavailable-mid-session, lagged).
+#[derive(Clone, Debug, Deserialize)]
+pub struct JsonRpcError {
+    /// Numeric error code.
+    pub code: i64,
+    /// Human-readable message.
+    pub message: String,
+    /// Optional structured detail.
+    #[serde(default)]
+    pub data: Option<Value>,
+}
+
+/// Params for the `session.sendMessage` method.
+#[derive(Clone, Debug, Serialize)]
+pub struct SendMessageParams {
+    /// The user (or tool-result) turn to send.
+    pub message: Message,
+}
+
+/// Params for the `session.subscribe` method. An absent `since_event_id`
+/// subscribes from the live tip; a known id replays persisted events after it
+/// before going live.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SubscribeParams {
+    /// Replay persisted events strictly after this event id, then go live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_event_id: Option<String>,
+}
+
+/// The terminal `result` of a `session.sendMessage` call — the same
+/// `{message, events}` body the legacy synchronous message route returned.
+/// `events` is the full turn event list; the live `session.event`
+/// notifications are an additive, filtered subset of it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SendMessageResult {
+    /// The assistant turn produced by this exchange.
+    pub message: Message,
+    /// The full ordered list of events appended during the turn.
+    #[serde(default)]
+    pub events: Vec<EventView>,
+}
+
+/// Payload of an `mcp.request` session event: the engine dispatching a tool
+/// call to a configured MCP server. Carried in the `payload` of an
+/// [`EventView`] whose `event_type` is `"mcp.request"`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpRequestPayload {
+    /// The MCP method invoked (currently always `"tools/call"`).
+    pub method: String,
+    /// The server the call was routed to, or `null` if the tool was unroutable.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// The requested tool name.
+    pub tool: String,
+    /// The JSON arguments passed to the tool.
+    pub input: Value,
+}
+
+/// Payload of an `mcp.response` session event. `ok` discriminates success
+/// (carrying the MCP `result` object) from failure (carrying an `error`
+/// string). Carried in the `payload` of an [`EventView`] whose `event_type`
+/// is `"mcp.response"`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpResponsePayload {
+    /// The server that handled (or failed) the call.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Whether the MCP call succeeded.
+    pub ok: bool,
+    /// The MCP `result` object (`{content, isError?}`) on success.
+    #[serde(default)]
+    pub result: Option<Value>,
+    /// The error description on failure.
+    #[serde(default)]
+    pub error: Option<String>,
 }

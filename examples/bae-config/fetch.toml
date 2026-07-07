@@ -1,0 +1,21 @@
+# bae-config.toml — fetch / web-access MCP server (stdio)
+#
+# Prerequisite: Python with `uvx` (from the `uv` toolchain) on PATH.
+# Upstream package: mcp-server-fetch
+#   https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
+#
+# Point the server at this file with either:
+#   baesrv --config examples/bae-config/fetch.toml
+#   BAE_CONFIG=examples/bae-config/fetch.toml baesrv
+#
+# Then opt a profile into it with:  mcp_servers = ["fetch"]
+#
+# Gives the agent an outbound HTTP fetch tool for retrieving web pages.
+
+[mcp]
+
+[[mcp.servers]]
+name = "fetch"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch"]

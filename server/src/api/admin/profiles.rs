@@ -1,9 +1,10 @@
 //! Admin profile endpoints (`/admin/v1/profiles`).
 //!
 //! Profiles are the admin-managed binding target for client keys: the primary
-//! provider config, ordered fallbacks, MCP servers (stubbed), and the client
-//! tool allowlist. This router is served only on the loopback admin listener,
-//! so there is no auth here initially.
+//! provider config, ordered fallbacks, the opt-in list of MCP server *names*
+//! (each matching a `bae-config.toml` registry entry), and the client tool
+//! allowlist. This router is served only on the loopback admin listener, so
+//! there is no auth here initially.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -43,7 +44,12 @@ impl CreateProfile {
         let fallback_configs = self.fallback_configs.unwrap_or_else(|| json!([]));
         validate_fallbacks(&fallback_configs)?;
         let mcp_servers = self.mcp_servers.unwrap_or_else(|| json!([]));
-        require_array(&mcp_servers, "mcp_servers")?;
+        // `mcp_servers` is now an array of MCP server *names* (strings) that must
+        // match `bae-config.toml` registry entries, not an opaque JSON blob.
+        // Registry resolution happens at session-creation time (a later step);
+        // here we only enforce the shape. Non-string elements are rejected at
+        // admin-write time rather than silently ignored later.
+        require_string_array(&mcp_servers, "mcp_servers")?;
         let allowed_tools = self.allowed_tools.unwrap_or_else(|| json!([]));
         require_array(&allowed_tools, "allowed_tools")?;
 
@@ -81,6 +87,22 @@ fn require_array(v: &Value, field: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::bad_request(format!("{field} must be an array")))
     }
+}
+
+/// Like [`require_array`], but additionally requires every element to be a
+/// string. Used for `mcp_servers`, which is an array of registry names.
+fn require_string_array(v: &Value, field: &str) -> Result<(), ApiError> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request(format!("{field} must be an array")))?;
+    for (i, el) in arr.iter().enumerate() {
+        if !el.is_string() {
+            return Err(ApiError::bad_request(format!(
+                "{field}[{i}] must be a string (an MCP server name)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Full JSON view of a profile (all fields). Used by GET/PUT responses.

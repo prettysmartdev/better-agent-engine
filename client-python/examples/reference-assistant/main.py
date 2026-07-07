@@ -15,8 +15,8 @@ Configuration (all via environment):
 
 The provider key is a *server-side* concern: the SDK never sends it. But we
 fail fast with a clear message if it is unset locally, and we also catch the
-server's 502 "all providers failed" outcome (surfaced as ProvidersFailedError)
-and explain the likely cause.
+server's "all providers failed" outcome (surfaced as ProvidersFailedError) and
+explain the likely cause.
 
 Run:  uv run python examples/reference-assistant/main.py "What time is it?"
 """
@@ -35,6 +35,7 @@ from bae_py import (
     Hooks,
     Message,
     ProvidersFailedError,
+    SessionEvent,
     Tool,
     ToolResultBlock,
     ToolUseBlock,
@@ -58,7 +59,13 @@ def get_current_time(inp: dict) -> str:
 def build_hooks() -> tuple[Hooks, dict[str, int]]:
     """Wire up all four hook points; each just logs to stderr and bumps a
     counter so we can assert on exit that every point fired."""
-    counts = {"before_send": 0, "after_receive": 0, "before_tool_call": 0, "after_tool_call": 0}
+    counts = {
+        "before_send": 0,
+        "after_receive": 0,
+        "before_tool_call": 0,
+        "after_tool_call": 0,
+        "on_event": 0,
+    }
 
     def before_send(message: Message) -> None:
         counts["before_send"] += 1
@@ -77,12 +84,20 @@ def build_hooks() -> tuple[Hooks, dict[str, int]]:
         counts["after_tool_call"] += 1
         print(f"[hook after_tool_call] {result.tool_use_id} -> {result.content}", file=sys.stderr)
 
+    def on_event(event: SessionEvent) -> None:
+        # Observes the live `session.event` stream carried by the `/rpc` NDJSON
+        # notifications. describe_event knows the real (non-stub) mcp.request /
+        # mcp.response payload shapes.
+        counts["on_event"] += 1
+        print(f"[hook on_event] {describe_event(event)}", file=sys.stderr)
+
     return (
         Hooks(
             before_send=before_send,
             after_receive=after_receive,
             before_tool_call=before_tool_call,
             after_tool_call=after_tool_call,
+            on_event=on_event,
         ),
         counts,
     )
@@ -150,9 +165,22 @@ async def run() -> int:
             print(reply.text())
             for event in session.last_events:
                 print(f"[event] {describe_event(event)}", file=sys.stderr)
+
+            # Optional: tap the live event feed via session.subscribe. Opt-in
+            # (set BAE_SUBSCRIBE_DEMO) so the example stays a quick one-shot. A
+            # bogus since_event_id forces a replay from the start; we stop after
+            # the first event (returning False) so the demo terminates.
+            if os.environ.get("BAE_SUBSCRIBE_DEMO"):
+                print("[subscribe] replaying session events (stopping after first)…", file=sys.stderr)
+
+                def _stop_after_first(event: SessionEvent) -> bool:
+                    print(f"[subscribe] {describe_event(event)}", file=sys.stderr)
+                    return False
+
+                await session.subscribe(_stop_after_first, since_event_id="evt_replay_from_start")
     except ProvidersFailedError as exc:
         print(
-            "error: the server could not reach any provider (HTTP 502). The most "
+            "error: the server could not reach any provider. The most "
             f"likely cause is that {provider_key_env} is unset or invalid on the "
             "server. Provider events:",
             file=sys.stderr,

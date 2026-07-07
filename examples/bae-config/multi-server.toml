@@ -1,0 +1,52 @@
+# bae-config.toml — multiple MCP servers, mixed transports
+#
+# Prerequisites:
+#   - Node.js with `npx` on PATH        (filesystem server)
+#   - Python with `uvx` on PATH         (fetch and git servers)
+#
+# Upstream packages:
+#   filesystem — @modelcontextprotocol/server-filesystem
+#                https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+#   fetch      — mcp-server-fetch
+#                https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
+#   git        — mcp-server-git
+#                https://github.com/modelcontextprotocol/servers/tree/main/src/git
+#
+# Point the server at this file with either:
+#   baesrv --config examples/bae-config/multi-server.toml
+#   BAE_CONFIG=examples/bae-config/multi-server.toml baesrv
+#
+# A profile opts into any subset by name, e.g.:
+#   mcp_servers = ["filesystem", "fetch"]
+#
+# All server entries live under one top-level [mcp] table. Multiple
+# [[mcp.servers]] entries and mixed transports (stdio + sse) coexist freely.
+
+[mcp]
+
+[[mcp.servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+
+[[mcp.servers]]
+name = "fetch"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch"]
+
+[[mcp.servers]]
+name = "git"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-git", "--repository", "/data/repo"]
+
+# A placeholder SSE entry showing the remote-transport shape. Replace the URL
+# (and token) with a real endpoint before use; header values may reference
+# environment variables with ${VAR} — resolved at connect time, never persisted.
+[[mcp.servers]]
+name = "remote-search"
+transport = "sse"
+url = "https://mcp.example.com/sse"
+headers = { Authorization = "Bearer ${SEARCH_MCP_TOKEN}" }

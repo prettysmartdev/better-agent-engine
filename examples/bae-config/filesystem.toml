@@ -1,0 +1,22 @@
+# bae-config.toml — filesystem MCP server (stdio)
+#
+# Prerequisite: Node.js with `npx` on PATH.
+# Upstream package: @modelcontextprotocol/server-filesystem
+#   https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+#
+# Point the server at this file with either:
+#   baesrv --config examples/bae-config/filesystem.toml
+#   BAE_CONFIG=examples/bae-config/filesystem.toml baesrv
+#
+# Then opt a profile into it with:  mcp_servers = ["filesystem"]
+#
+# The trailing `/data` argument is the directory the server is allowed to read
+# and write. Change it to a path you actually want the agent to access.
+
+[mcp]
+
+[[mcp.servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]

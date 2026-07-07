@@ -6,7 +6,7 @@ non-loopback admin address. Reach it via `docker exec`, a local process, or
 an SSH tunnel. **No authentication is required on the admin port.**
 
 All requests and responses use `Content-Type: application/json`. Field names
-are `snake_case`.
+are `snake_case`. The admin port is **REST/HTTP throughout** — no JSON-RPC.
 
 ---
 
@@ -71,16 +71,18 @@ List endpoints accept `?cursor=<opaque>&limit=<n>` and return:
     "max_tokens": 8096
   },
   "fallback_configs": [],
-  "mcp_servers": [],
+  "mcp_servers": ["filesystem"],
   "allowed_tools": ["get_current_time"]
 }
 ```
 
 - `name` — required, must be unique.
-- `provider_config` — required. See [profiles.md](profiles.md) for the schema.
+- `provider_config` — required. See [profiles.md](../profiles.md) for the schema.
 - `fallback_configs` — optional, default `[]`. Array of provider configs tried
   in order if the primary fails.
-- `mcp_servers` — optional, default `[]`. Array of MCP server stubs.
+- `mcp_servers` — optional, default `[]`. **Array of MCP server name strings**
+  matching entries in `bae-config.toml`. Every element must be a string; a
+  non-string element returns `400 bad_request`.
 - `allowed_tools` — optional, default `[]`. Names of client-side tools agents
   may declare. **An empty list permits no client-side tools.**
 
@@ -95,7 +97,7 @@ List endpoints accept `?cursor=<opaque>&limit=<n>` and return:
 ```
 
 **Errors:** `400 bad_request` (blank name, malformed `provider_config`,
-non-array list fields), `409 duplicate_name`.
+non-array or non-string list fields), `409 duplicate_name`.
 
 ---
 
@@ -121,7 +123,7 @@ GET /admin/v1/profiles?limit=20&cursor=
         "max_tokens": 8096
       },
       "fallback_configs": [],
-      "mcp_servers": [],
+      "mcp_servers": ["filesystem"],
       "allowed_tools": ["get_current_time"],
       "created_at": "2026-07-06T18:26:01.123Z",
       "updated_at": "2026-07-06T18:26:01.123Z"
@@ -257,6 +259,38 @@ existing open sessions return `401` on subsequent requests.
 **Response `204 No Content`**
 
 **Errors:** `404 not_found`.
+
+---
+
+## MCP Servers
+
+### `GET /admin/v1/mcp-servers`
+
+Returns the currently loaded MCP server registry — the set of servers parsed
+from `bae-config.toml` at startup (or reloaded on restart). Useful to confirm
+what a running server has available without reading the config file on disk.
+
+```sh
+curl http://127.0.0.1:8081/admin/v1/mcp-servers
+```
+
+**Response `200 OK`:**
+
+```json
+{
+  "items": [
+    {"name": "fetch",      "transport": "stdio"},
+    {"name": "filesystem", "transport": "stdio"}
+  ]
+}
+```
+
+Items are sorted by name. Only `name` and `transport` are returned — no
+`command`, `args`, `url`, or `headers` (secrets are never exposed).
+
+The registry is rebuilt on restart; this endpoint reflects the current in-memory
+state. An empty `items` array means the server started without a config file,
+or the config file had no `[[mcp.servers]]` entries.
 
 ---
 

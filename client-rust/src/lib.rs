@@ -39,7 +39,12 @@
 //! 3. [`Harness`] — config + tool registry + hooks; `connect()` opens a session.
 //! 4. [`Session`] — `send(message)` drives the round-trip; `close()` ends it.
 //! 5. [`Hooks`] — optional `before_send` / `after_receive` / `before_tool_call`
-//!    / `after_tool_call` callbacks; an error from any aborts the loop.
+//!    / `after_tool_call` / `on_event` callbacks; an error from any aborts the
+//!    loop.
+//!
+//! The message loop rides JSON-RPC 2.0 over `POST …/rpc` (session open, events
+//! replay, and close stay plain REST); [`Session::subscribe`] taps the same
+//! live `session.event` stream out-of-band.
 
 mod config;
 mod error;
@@ -54,7 +59,9 @@ pub use harness::{Harness, Session};
 pub use hooks::{HookResult, Hooks};
 pub use tool::{BoxError, Tool, ToolHandler};
 pub use types::{
-    ApiError, Content, ContentBlock, EventView, Message, Profile, ToolResult, ToolUse,
+    ApiError, Content, ContentBlock, EventView, JsonRpcError, JsonRpcFrame, JsonRpcRequest,
+    McpRequestPayload, McpResponsePayload, Message, Profile, SendMessageParams, SendMessageResult,
+    SubscribeParams, ToolResult, ToolUse,
 };
 
 /// Client library version, from the crate manifest.

@@ -8,8 +8,10 @@
 //! Endpoints (all under `/admin/v1`):
 //! - `profiles` — create, list (cursor-paginated), get, replace, soft-delete.
 //! - `keys` — issue (plaintext once), list (never `key_hash`), revoke.
+//! - `mcp-servers` — read-only list of the configured MCP registry (no secrets).
 
 pub mod keys;
+pub mod mcp;
 pub mod profiles;
 
 use axum::routing::{get, post};
@@ -34,5 +36,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/v1/keys", post(keys::create).get(keys::list))
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
+        .route("/admin/v1/mcp-servers", get(mcp::list))
         .with_state(state)
 }

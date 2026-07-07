@@ -3,39 +3,46 @@
 //! [`Harness`] holds the [`Config`], the tool registry, and the [`Hooks`]. Its
 //! async [`Harness::connect`] opens a session on the server and hands back a
 //! [`Session`], whose [`Session::send`] drives the full round-trip described in
-//! `api-contract.md` §6:
+//! `docs/client-api.md`'s harness loop:
 //!
-//! 1. POST the user turn.
+//! 1. Send the user turn via the `session.sendMessage` JSON-RPC method.
 //! 2. If the assistant response has no `tool_use` block, it is final — return it.
 //! 3. Otherwise dispatch each `tool_use` to its registered handler, collect the
-//!    `tool_result` blocks, POST them back, and go to step 2.
+//!    `tool_result` blocks, send them back, and go to step 2.
+//!
+//! Session open, events replay, and close stay plain REST (`POST`/`GET`/`DELETE`
+//! against `/api/v1/sessions…`); only the message loop is JSON-RPC. A
+//! `session.sendMessage` request is POSTed to `…/rpc` and the reply is an
+//! `application/x-ndjson` stream of JSON-RPC frames: notifications (no `id`)
+//! carry live `session.event`s and are handed to [`Hooks::on_event`]; the frame
+//! carrying the request `id` is the terminal `{message, events}` result.
 //!
 //! The transport is abstracted behind a small crate-private [`Transport`] trait
 //! so the loop can be unit-tested offline against a mock — the loop logic never
 //! touches HTTP directly.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::config::Config;
 use crate::error::Error;
 use crate::hooks::Hooks;
 use crate::tool::Tool;
-use crate::types::{Content, ContentBlock, EventView, Message, Profile, ToolResult};
+use crate::types::{
+    Content, ContentBlock, EventView, JsonRpcFrame, JsonRpcRequest, Message, Profile,
+    SendMessageParams, SendMessageResult, SubscribeParams, ToolResult,
+};
 
-/// `POST /api/v1/sessions/{id}/messages` request body.
-#[derive(Debug, Serialize)]
-pub(crate) struct MessagesRequest {
-    pub message: Message,
-}
-
-/// `POST /api/v1/sessions/{id}/messages` success body.
-#[derive(Debug, Deserialize)]
-pub(crate) struct MessagesResponse {
-    pub message: Message,
-    #[serde(default)]
-    pub events: Vec<EventView>,
+/// The outcome of one `session.sendMessage` turn: the terminal `{message,
+/// events}` result plus the live `session.event` notifications observed on the
+/// stream (a filtered subset of `result.events` — client-origin events are not
+/// broadcast).
+pub(crate) struct SendOutcome {
+    pub result: SendMessageResult,
+    pub notifications: Vec<EventView>,
 }
 
 /// The transport the loop drives. Abstracted so tests can mock the server.
@@ -44,9 +51,24 @@ pub(crate) struct MessagesResponse {
 /// trait object) is fine; the allow silences the public-API lint pre-emptively.
 #[allow(async_fn_in_trait)]
 pub(crate) trait Transport {
-    /// Send one message turn and return the assistant response. A `502`
-    /// providers-failed outcome must surface as [`Error::ProvidersFailed`].
-    async fn post_message(&self, req: &MessagesRequest) -> Result<MessagesResponse, Error>;
+    /// Drive one `session.sendMessage` turn: POST the JSON-RPC request to
+    /// `…/rpc`, stream the NDJSON reply, collect `session.event` notifications,
+    /// and return the terminal result. An all-providers-failed turn surfaces as
+    /// [`Error::ProvidersFailed`]; a JSON-RPC error object as [`Error::Rpc`].
+    async fn send_message(&self, params: &SendMessageParams) -> Result<SendOutcome, Error>;
+
+    /// Drive `session.subscribe`: stream `session.event` notifications to
+    /// `on_event` until it returns `false`, the server ends the stream, or an
+    /// error frame arrives.
+    async fn subscribe(
+        &self,
+        params: &SubscribeParams,
+        on_event: &mut dyn FnMut(&EventView) -> bool,
+    ) -> Result<(), Error>;
+
+    /// Drive `session.unsubscribe`: end any active `subscribe` streams for this
+    /// session. Returns once the terminal `{unsubscribed:true}` result arrives.
+    async fn unsubscribe(&self) -> Result<(), Error>;
 
     /// Close the session (`DELETE /api/v1/sessions/{id}`).
     async fn close(&self) -> Result<(), Error>;
@@ -64,10 +86,17 @@ pub(crate) async fn run_loop<T: Transport>(
     loop {
         hooks.run_before_send(&mut current).map_err(Error::Hook)?;
 
-        let resp = transport
-            .post_message(&MessagesRequest { message: current })
+        let outcome = transport
+            .send_message(&SendMessageParams { message: current })
             .await?;
-        let mut assistant = resp.message;
+
+        // Distribute the live notification stream to the observer hook, in
+        // arrival order, before surfacing the terminal turn.
+        for event in &outcome.notifications {
+            hooks.run_on_event(event).map_err(Error::Hook)?;
+        }
+
+        let mut assistant = outcome.result.message;
 
         hooks
             .run_after_receive(&mut assistant)
@@ -119,45 +148,142 @@ struct HttpTransport {
     base: String,
     session_id: String,
     session_key: String,
+    /// Monotonic JSON-RPC request id, unique per session.
+    next_id: AtomicU64,
 }
 
 impl HttpTransport {
-    fn messages_url(&self) -> String {
-        format!("{}/api/v1/sessions/{}/messages", self.base, self.session_id)
+    fn rpc_url(&self) -> String {
+        format!("{}/api/v1/sessions/{}/rpc", self.base, self.session_id)
     }
 
     fn session_url(&self) -> String {
         format!("{}/api/v1/sessions/{}", self.base, self.session_id)
     }
-}
 
-impl Transport for HttpTransport {
-    async fn post_message(&self, req: &MessagesRequest) -> Result<MessagesResponse, Error> {
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// POST a JSON-RPC request to `…/rpc` and, on a `2xx`, hand back the NDJSON
+    /// body reader. A non-2xx status is a pre-stream RFC 7807 error (e.g. `401`).
+    async fn open_rpc<P: Serialize>(
+        &self,
+        req: &JsonRpcRequest<P>,
+    ) -> Result<NdjsonReader, Error> {
         let resp = self
             .http
-            .post(self.messages_url())
+            .post(self.rpc_url())
             .bearer_auth(&self.session_key)
             .json(req)
             .send()
             .await?;
 
         let status = resp.status();
-        let bytes = resp.bytes().await?;
+        if !status.is_success() {
+            let bytes = resp.bytes().await?;
+            return Err(Error::Api(parse_problem(status.as_u16(), &bytes)));
+        }
+        Ok(NdjsonReader::new(resp))
+    }
+}
 
-        if status.is_success() {
-            return Ok(serde_json::from_slice(&bytes)?);
+impl Transport for HttpTransport {
+    async fn send_message(&self, params: &SendMessageParams) -> Result<SendOutcome, Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.sendMessage", params);
+        let mut reader = self.open_rpc(&req).await?;
+
+        let mut notifications = Vec::new();
+        let mut terminal: Option<SendMessageResult> = None;
+        while let Some(frame) = reader.next_frame().await? {
+            if frame.id.is_some() {
+                // The terminal response: `result` on success, `error` on failure.
+                if let Some(err) = frame.error {
+                    return Err(Error::Rpc {
+                        code: err.code,
+                        message: err.message,
+                    });
+                }
+                let result = frame
+                    .result
+                    .ok_or_else(|| rpc_protocol_error("terminal frame missing `result`"))?;
+                terminal = Some(serde_json::from_value(result)?);
+                break;
+            }
+            // A notification (no `id`): a `session.event`, or a mid-stream
+            // error notice such as `lagged`.
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if let Some(event) = frame.into_event()? {
+                notifications.push(event);
+            }
         }
 
-        // 502 keeps the {message, events} shape, not a problem doc: providers
-        // all failed. Surface the events so the caller can inspect the cause.
-        if status.as_u16() == 502 {
-            let body: MessagesResponse = serde_json::from_slice(&bytes)?;
+        let result = terminal
+            .ok_or_else(|| rpc_protocol_error("stream ended without a terminal response"))?;
+
+        // The server delivers an all-providers-failed turn as a normal terminal
+        // result; recognise it and surface it as ProvidersFailed for continuity.
+        if providers_failed(&result.events) {
             return Err(Error::ProvidersFailed {
-                events: body.events,
+                events: result.events,
             });
         }
 
-        Err(Error::Api(parse_problem(status.as_u16(), &bytes)))
+        Ok(SendOutcome {
+            result,
+            notifications,
+        })
+    }
+
+    async fn subscribe(
+        &self,
+        params: &SubscribeParams,
+        on_event: &mut dyn FnMut(&EventView) -> bool,
+    ) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.subscribe", params);
+        let mut reader = self.open_rpc(&req).await?;
+
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            // A terminal `result` (e.g. cancellation) ends the stream.
+            if frame.id.is_some() {
+                break;
+            }
+            if let Some(event) = frame.into_event()? {
+                if !on_event(&event) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(&self) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.unsubscribe", json!({}));
+        let mut reader = self.open_rpc(&req).await?;
+
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if frame.id.is_some() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -174,6 +300,82 @@ impl Transport for HttpTransport {
         }
         let bytes = resp.bytes().await?;
         Err(Error::Api(parse_problem(status.as_u16(), &bytes)))
+    }
+}
+
+/// Does this turn's event list mark an all-providers-failed outcome? The server
+/// no longer returns a `502`: the failure turn arrives as a normal terminal
+/// result, distinguished only by a `session.error`/`all_providers_failed` event.
+fn providers_failed(events: &[EventView]) -> bool {
+    events.iter().any(|e| {
+        e.event_type == "session.error"
+            && e.payload.get("reason").and_then(|r| r.as_str()) == Some("all_providers_failed")
+    })
+}
+
+/// A synthetic [`Error::Rpc`] for a well-formed-HTTP-but-malformed-stream case.
+fn rpc_protocol_error(message: &str) -> Error {
+    Error::Rpc {
+        code: -32603,
+        message: message.to_string(),
+    }
+}
+
+impl JsonRpcFrame {
+    /// Decode a `session.event` notification's `params` into an [`EventView`].
+    /// Returns `Ok(None)` for any other (ignorable) notification.
+    fn into_event(self) -> Result<Option<EventView>, Error> {
+        if self.method.as_deref() != Some("session.event") {
+            return Ok(None);
+        }
+        match self.params {
+            Some(params) => Ok(Some(serde_json::from_value(params)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Reads newline-delimited JSON-RPC frames from a streaming response body,
+/// using `chunk()` (no extra reqwest features) and buffering partial lines.
+struct NdjsonReader {
+    resp: reqwest::Response,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+impl NdjsonReader {
+    fn new(resp: reqwest::Response) -> Self {
+        Self {
+            resp,
+            buf: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Yield the next frame, or `None` at end of stream. Blank lines are skipped.
+    async fn next_frame(&mut self) -> Result<Option<JsonRpcFrame>, Error> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                let line = &line[..line.len() - 1];
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                return Ok(Some(serde_json::from_slice(line)?));
+            }
+            if self.done {
+                if self.buf.iter().all(u8::is_ascii_whitespace) {
+                    self.buf.clear();
+                    return Ok(None);
+                }
+                let line = std::mem::take(&mut self.buf);
+                return Ok(Some(serde_json::from_slice(&line)?));
+            }
+            match self.resp.chunk().await? {
+                Some(bytes) => self.buf.extend_from_slice(&bytes),
+                None => self.done = true,
+            }
+        }
     }
 }
 
@@ -300,6 +502,7 @@ impl Harness {
                 base: self.config.base().to_string(),
                 session_id: open.session_id.clone(),
                 session_key: open.session_key,
+                next_id: AtomicU64::new(1),
             },
             session_id: open.session_id,
             profile: open.profile,
@@ -347,6 +550,35 @@ impl Session {
         .await
     }
 
+    /// Subscribe to this session's live `session.event` feed via the
+    /// `session.subscribe` JSON-RPC method, invoking `on_event` for each event
+    /// in order. With a `since_event_id`, the server first replays persisted
+    /// events after that id, then streams live ones **indefinitely**.
+    ///
+    /// The stream is open-ended: return `false` from `on_event` to stop reading
+    /// (dropping the connection ends the subscription server-side), or call
+    /// [`unsubscribe`](Session::unsubscribe) from another task. Returns once the
+    /// stream ends.
+    pub async fn subscribe<F>(
+        &self,
+        since_event_id: Option<&str>,
+        mut on_event: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&EventView) -> bool,
+    {
+        let params = SubscribeParams {
+            since_event_id: since_event_id.map(str::to_string),
+        };
+        self.transport.subscribe(&params, &mut on_event).await
+    }
+
+    /// End any active [`subscribe`](Session::subscribe) streams for this session
+    /// via `session.unsubscribe`.
+    pub async fn unsubscribe(&self) -> Result<(), Error> {
+        self.transport.unsubscribe().await
+    }
+
     /// Close the session on the server (idempotent from the caller's view; a
     /// second close returns a `session_closed` [`Error::Api`]).
     pub async fn close(&mut self) -> Result<(), Error> {
@@ -374,17 +606,17 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
 
-    /// A scripted transport: returns queued responses in order, records each
+    /// A scripted transport: returns queued outcomes in order, records each
     /// request it received, and never touches the network.
     struct MockTransport {
         // RefCell is fine: the loop awaits sequentially on one task/thread.
-        responses: RefCell<Vec<Result<MessagesResponse, Error>>>,
-        sent: RefCell<Vec<MessagesRequest>>,
+        responses: RefCell<Vec<Result<SendOutcome, Error>>>,
+        sent: RefCell<Vec<SendMessageParams>>,
         closed: RefCell<bool>,
     }
 
     impl MockTransport {
-        fn new(responses: Vec<Result<MessagesResponse, Error>>) -> Self {
+        fn new(responses: Vec<Result<SendOutcome, Error>>) -> Self {
             Self {
                 responses: RefCell::new(responses),
                 sent: RefCell::new(Vec::new()),
@@ -394,14 +626,26 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        async fn post_message(&self, req: &MessagesRequest) -> Result<MessagesResponse, Error> {
-            self.sent.borrow_mut().push(MessagesRequest {
-                message: req.message.clone(),
+        async fn send_message(&self, params: &SendMessageParams) -> Result<SendOutcome, Error> {
+            self.sent.borrow_mut().push(SendMessageParams {
+                message: params.message.clone(),
             });
             if self.responses.borrow().is_empty() {
                 panic!("mock transport ran out of scripted responses");
             }
             self.responses.borrow_mut().remove(0)
+        }
+
+        async fn subscribe(
+            &self,
+            _params: &SubscribeParams,
+            _on_event: &mut dyn FnMut(&EventView) -> bool,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn unsubscribe(&self) -> Result<(), Error> {
+            Ok(())
         }
 
         async fn close(&self) -> Result<(), Error> {
@@ -410,23 +654,29 @@ mod tests {
         }
     }
 
-    fn assistant_text(text: &str) -> MessagesResponse {
-        MessagesResponse {
-            message: Message::assistant(vec![ContentBlock::Text {
-                text: text.to_string(),
-            }]),
-            events: vec![],
+    fn assistant_text(text: &str) -> SendOutcome {
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }]),
+                events: vec![],
+            },
+            notifications: vec![],
         }
     }
 
-    fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> MessagesResponse {
-        MessagesResponse {
-            message: Message::assistant(vec![ContentBlock::ToolUse {
-                id: id.to_string(),
-                name: name.to_string(),
-                input,
-            }]),
-            events: vec![],
+    fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> SendOutcome {
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input,
+                }]),
+                events: vec![],
+            },
+            notifications: vec![],
         }
     }
 
@@ -654,5 +904,126 @@ mod tests {
             e.to_string(),
             "tool_not_allowed (403): get_current_time is not permitted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-SDK MCP parity
+    //
+    // The three client SDKs (Rust, TypeScript, Python) must observe an IDENTICAL
+    // ordered live event sequence for the same scripted MCP-enabled turn, and
+    // parse the real (non-stub) mcp.request / mcp.response payload shapes. The
+    // canonical sequence below MUST stay byte-for-byte identical to the arrays
+    // in the TypeScript and Python SDK parity tests:
+    //   - client-typescript/src/harness.test.ts   (MCP_PARITY_SEQUENCE)
+    //   - client-python/tests/test_mcp_parity.py   (MCP_PARITY_SEQUENCE)
+    // -----------------------------------------------------------------------
+
+    /// The canonical live-notification sequence for the scripted MCP turn.
+    const MCP_PARITY_SEQUENCE: [&str; 9] = [
+        "provider.request",
+        "provider.response",
+        "tool.call",
+        "mcp.request",
+        "mcp.response",
+        "tool.result",
+        "provider.request",
+        "provider.response",
+        "server.message.send",
+    ];
+
+    fn parity_event(event_type: &str, payload: serde_json::Value) -> EventView {
+        EventView {
+            id: format!("evt_{event_type}"),
+            session_id: "ses_test".into(),
+            client_key_id: None,
+            event_type: event_type.into(),
+            payload,
+            created_at: "t".into(),
+        }
+    }
+
+    /// The scripted MCP turn: the live notifications, then a terminal text turn.
+    fn mcp_scenario_outcome() -> SendOutcome {
+        let echo = json!([{ "type": "text", "text": "echo: x" }]);
+        let notifications = vec![
+            parity_event("provider.request", json!({ "attempt": 0 })),
+            parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+            parity_event(
+                "tool.call",
+                json!({ "dispatch": "mcp", "name": "remote_search", "server_name": "echo", "input": { "q": "x" } }),
+            ),
+            parity_event(
+                "mcp.request",
+                json!({ "method": "tools/call", "server_name": "echo", "tool": "remote_search", "input": { "q": "x" } }),
+            ),
+            parity_event(
+                "mcp.response",
+                json!({ "server_name": "echo", "ok": true, "result": { "content": echo, "isError": false } }),
+            ),
+            parity_event(
+                "tool.result",
+                json!({ "tool_use_id": "tu_mcp", "dispatch": "mcp", "server_name": "echo", "is_error": false, "content": echo }),
+            ),
+            parity_event("provider.request", json!({ "attempt": 0 })),
+            parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+            parity_event(
+                "server.message.send",
+                json!({ "role": "assistant", "content": [{ "type": "text", "text": "after mcp" }] }),
+            ),
+        ];
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::Text {
+                    text: "after mcp".into(),
+                }]),
+                events: vec![],
+            },
+            notifications,
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_scenario_matches_canonical_sequence_and_parses_real_payloads() {
+        let transport = MockTransport::new(vec![Ok(mcp_scenario_outcome())]);
+        let tools = registry(vec![]);
+
+        // Collect (event_type, payload) for each observed live notification.
+        let observed = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        let sink = observed.clone();
+        let mut hooks = Hooks::default().on_event(move |ev| {
+            sink.lock()
+                .unwrap()
+                .push((ev.event_type.clone(), ev.payload.clone()));
+            Ok(())
+        });
+
+        // MCP tools are dispatched server-side, so the loop ends after one turn.
+        let out = run_loop(&transport, &tools, &mut hooks, Message::user("search please"))
+            .await
+            .unwrap();
+        assert_eq!(out.text(), "after mcp");
+
+        let events = observed.lock().unwrap();
+        let seq: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(seq, MCP_PARITY_SEQUENCE);
+
+        // Real (non-stub) mcp.request / mcp.response payloads parse to shape.
+        let req_payload = &events.iter().find(|(t, _)| t == "mcp.request").unwrap().1;
+        let req: crate::McpRequestPayload = serde_json::from_value(req_payload.clone()).unwrap();
+        assert_eq!(req.method, "tools/call");
+        assert_eq!(req.server_name.as_deref(), Some("echo"));
+        assert_eq!(req.tool, "remote_search");
+        assert_eq!(req.input, json!({ "q": "x" }));
+
+        let resp_payload = &events.iter().find(|(t, _)| t == "mcp.response").unwrap().1;
+        let resp: crate::McpResponsePayload = serde_json::from_value(resp_payload.clone()).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["content"][0]["text"], json!("echo: x"));
+        assert!(resp.error.is_none());
+
+        // No trace of the removed stub payload shape.
+        assert!(events
+            .iter()
+            .all(|(_, p)| p.get("status").and_then(|s| s.as_str()) != Some("stub")));
     }
 }

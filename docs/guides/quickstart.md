@@ -41,7 +41,9 @@ to loopback **inside** the container and is never exposed — reach it via
 | `BAE_DB_PATH` | `/var/lib/bae/bae.db` | SQLite database file. Mount a volume here to persist data. |
 | `BAE_LOG` | `info` | Tracing filter, e.g. `baesrv=debug,tower=warn`. |
 | `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain in-flight requests on SIGTERM. |
+| `BAE_CONFIG` | _(none)_ | Path to a `bae-config.toml` file for MCP server configuration. |
 
+See [Configuration](../reference/configuration.md) for the full reference.
 Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the
 environment and referenced from profile configs using `${ANTHROPIC_API_KEY}`
 syntax — they are never written to the database.
@@ -175,31 +177,51 @@ SESSION_KEY=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys
 
 ## 5. Send a message
 
+Message sending uses `POST /api/v1/sessions/{id}/rpc` with a JSON-RPC 2.0
+envelope. The response is a stream of newline-delimited JSON objects
+(`application/x-ndjson`): zero or more `session.event` notifications, followed
+by a terminal result object.
+
 ```sh
-curl -s -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/messages" \
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"message": {"role": "user", "content": "What time is it?"}}'
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "session.sendMessage",
+    "params": {"message": {"role": "user", "content": "What time is it?"}}
+  }'
 ```
 
-Response (`200 OK`):
-```json
-{
-  "message": {
-    "role": "assistant",
-    "content": [{"type": "text", "text": "It is currently …"}]
-  },
-  "events": [
-    {"id": "evt_…", "event_type": "client.message.send", "payload": {…}, "created_at": "…"},
-    {"id": "evt_…", "event_type": "provider.request",    "payload": {…}, "created_at": "…"},
-    {"id": "evt_…", "event_type": "provider.response",   "payload": {…}, "created_at": "…"},
-    {"id": "evt_…", "event_type": "server.message.send", "payload": {…}, "created_at": "…"}
-  ]
-}
+The response streams multiple lines. Each line is a complete JSON object:
+
+```
+{"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"client.message.send",…}}
+{"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"provider.request",…}}
+{"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"provider.response",…}}
+{"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"server.message.send",…}}
+{"jsonrpc":"2.0","id":1,"result":{"message":{"role":"assistant","content":[{"type":"text","text":"It is currently …"}]},"events":[…]}}
 ```
 
-The `events` array contains every event appended during this call, in order.
-See [message-types.md](message-types.md) for the full event catalog.
+Objects without `"id"` are live event notifications. The last object (carrying
+`"id":1`) is the terminal response; its `result` contains the final
+`message` and the full `events` array for the turn.
+
+To extract just the assistant's reply:
+
+```sh
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
+  -H "Authorization: Bearer $SESSION_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"session.sendMessage","params":{"message":{"role":"user","content":"What time is it?"}}}' \
+  | tail -1 \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result']['message']['content'][0]['text'])"
+```
+
+See [Wire Protocol](../reference/wire-protocol.md) for the full envelope
+specification and [Client API](../reference/client-api.md) for method params
+and result shapes.
 
 ---
 
@@ -215,7 +237,9 @@ curl -s -X DELETE "http://localhost:8080/api/v1/sessions/$SESSION_ID" \
 
 ## Next steps
 
-- [Admin API reference](admin-api.md) — manage profiles and keys.
-- [Client API reference](client-api.md) — full session and message endpoints.
-- [Profiles](profiles.md) — provider config, env var references, fallbacks, MCP stubs.
-- [Message types](message-types.md) — all twelve `event_type` values and their payloads.
+- [Admin API reference](../reference/admin-api.md) — manage profiles and keys.
+- [Client API reference](../reference/client-api.md) — full session and message endpoints.
+- [Profiles](../profiles.md) — provider config, env var references, fallbacks, MCP wiring.
+- [Message types](../reference/message-types.md) — all twelve `event_type` values and their payloads.
+- [MCP Servers](mcp-servers.md) — connect real MCP tools to a profile.
+- [Event Streaming](event-streaming.md) — live progress notifications and observer subscriptions.

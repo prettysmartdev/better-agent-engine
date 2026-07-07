@@ -1,6 +1,6 @@
 # APIs
 
-Convention: rest
+Convention: rest + JSON-RPC 2.0 (hybrid, see below)
 Protocol: http
 
 ## Design:
@@ -22,4 +22,11 @@ Conventions:
 - JSON request/response bodies with `snake_case` field names.
 - List endpoints use cursor pagination (`?cursor=…&limit=…`) returning `{items, next_cursor}`.
 - Errors return an RFC 7807-style body: `{type, title, status, detail}` with appropriate HTTP status codes.
-- Health at `GET /healthz` (unauthenticated, for probes); long-running run output streamed via SSE.
+- Health at `GET /healthz` (unauthenticated, plain HTTP, for probes — no JSON-RPC envelope).
+- The **client port** (`BAE_ADDR`) is a hybrid: REST/HTTP for all management
+  operations (session open/close, metadata, event history), plus one JSON-RPC
+  2.0 endpoint — `POST /api/v1/sessions/{id}/rpc` — for the live session loop.
+  That endpoint streams `application/x-ndjson`; all other client-port endpoints
+  return single buffered JSON bodies.
+- The **admin port** (`BAE_ADMIN_ADDR`) is REST/HTTP throughout. No JSON-RPC,
+  no SSE anywhere on the admin port.

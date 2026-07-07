@@ -6,7 +6,7 @@
 //! session key on everything else — verified with Argon2id in constant time,
 //! filtered by `role` and `deleted_at IS NULL` in the lookup query.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use crate::api::error::ApiError;
 use crate::api::pagination::{next_cursor, PageQuery};
 use crate::api::AppState;
-use crate::engine::session::{self, Outcome};
+use crate::config_file::McpServerConfig;
+use crate::engine::broadcast;
+use crate::engine::mcp::McpSession;
 use crate::events::EventType;
 use crate::store::keys::{self, KeyRecord};
 use crate::store::profiles::{self, ProfileRecord};
@@ -58,7 +60,7 @@ fn auth_client(state: &AppState, headers: &HeaderMap) -> Result<KeyRecord, ApiEr
 /// Authenticate the request as the session key for `session_id`, returning the
 /// session and the key. Rejects a session key presented on the wrong session
 /// (the lookup is scoped to `session_id`, so a mismatched key finds no row).
-fn auth_session(
+pub(crate) fn auth_session(
     state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
@@ -177,8 +179,11 @@ pub async fn create(
     let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
 
     // Create the session row, its session key, and the session.open event under
-    // one lock.
-    let session = state.store.with_conn(|c| {
+    // one lock. The session.open event is inserted inside this transaction (it is
+    // atomic with row creation) and published afterwards through the broadcast
+    // choke point; no watcher can exist yet, so the publish is a harmless no-op,
+    // but it keeps every event insert funnelled through one place.
+    let (session, open_event) = state.store.with_conn(|c| {
         let session = sessions::create_session(
             c,
             &client_key.id,
@@ -196,7 +201,7 @@ pub async fn create(
                     ApiError::internal("failed to hash session key")
                 }
             })?;
-        sessions::insert_event(
+        let open_event = sessions::insert_event(
             c,
             &session.id,
             Some(&client_key.id),
@@ -204,8 +209,15 @@ pub async fn create(
             &json!({ "client_version": body.client_version, "tools": tool_names }),
         )
         .map_err(ApiError::from_db)?;
-        Ok::<_, ApiError>(session)
+        Ok::<_, ApiError>((session, open_event))
     })?;
+    state.broadcaster.publish(&open_event);
+
+    // Resolve the profile's configured MCP servers against the startup registry
+    // and connect to each. Resolution is deliberately at session-creation time
+    // (not profile-create time): the registry is server-config-driven and may
+    // differ from what existed when the profile was written.
+    resolve_mcp_servers(&state, &profile, &session.id).await;
 
     Ok((
         StatusCode::CREATED,
@@ -215,6 +227,88 @@ pub async fn create(
             "profile": public_profile(&profile),
         })),
     ))
+}
+
+/// Connect the MCP servers a profile opts into, and retain the live connections
+/// on `state` for the life of the session.
+///
+/// For each name in `profile.mcp_servers`:
+/// - not found in the registry → `tracing::error!` and skip (non-fatal, logged
+///   **every** session creation — never deduplicated/cached);
+/// - found but fails to connect (missing stdio binary, unreachable endpoint,
+///   unset auth env var) → treated exactly like "not found": log and skip.
+///
+/// This never fails session creation; a fully-unresolvable profile just yields a
+/// session with no MCP tools.
+async fn resolve_mcp_servers(state: &AppState, profile: &ProfileRecord, session_id: &str) {
+    // `mcp_servers` is a JSON array of server-name strings (validated as such at
+    // profile-write time). Anything else yields no servers.
+    let names: Vec<String> = profile
+        .mcp_servers
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        return;
+    }
+
+    // Resolve names against the registry first (never short-circuiting on a
+    // miss), then log every miss individually and connect every hit.
+    let (resolved, missing) = resolve_registry_names(&state.mcp_registry, &names);
+    for name in &missing {
+        tracing::error!(
+            profile_id = %profile.id,
+            profile_name = %profile.name,
+            mcp_server_name = %name,
+            session_id = %session_id,
+            "configured MCP server not found in bae-config.toml; skipping"
+        );
+    }
+
+    let mut mcp = McpSession::new();
+    for cfg in resolved {
+        if let Err(e) = mcp.connect(cfg).await {
+            // A resolves-by-name-but-fails-to-connect server is handled the same
+            // as "not found": log and skip, non-fatal to session creation.
+            tracing::error!(
+                profile_id = %profile.id,
+                profile_name = %profile.name,
+                mcp_server_name = %cfg.name,
+                session_id = %session_id,
+                error = %e,
+                "configured MCP server failed to connect; skipping"
+            );
+        }
+    }
+
+    if mcp.has_servers() {
+        state.insert_mcp_session(session_id, mcp);
+    }
+}
+
+/// Split a profile's configured MCP server names into `(resolved, missing)`
+/// against the startup registry, preserving order and **never** short-circuiting
+/// on a miss — every absent name is returned so the caller logs and skips each
+/// one individually. The pure resolution step behind [`resolve_mcp_servers`],
+/// separated out so the valid-resolves / invalid-skipped / empty-registry matrix
+/// is unit-testable without spinning up a live MCP connection.
+pub(crate) fn resolve_registry_names<'a>(
+    registry: &'a HashMap<String, McpServerConfig>,
+    names: &[String],
+) -> (Vec<&'a McpServerConfig>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+    for name in names {
+        match registry.get(name) {
+            Some(cfg) => resolved.push(cfg),
+            None => missing.push(name.clone()),
+        }
+    }
+    (resolved, missing)
 }
 
 /// Handle a profile that has been deleted before session open: record an error
@@ -255,17 +349,15 @@ fn profile_unavailable_at_open(
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/v1/sessions/{id}/messages
+// Message body (shared with the JSON-RPC `session.sendMessage` method)
 // ---------------------------------------------------------------------------
 
-/// `POST /api/v1/sessions/{id}/messages` body.
+/// The `message` object carried by `session.sendMessage`'s `params` (and, before
+/// this work item, by `POST /api/v1/sessions/{id}/messages`). The message-send
+/// loop now lives on the JSON-RPC `/rpc` endpoint (see [`super::rpc`]); this type
+/// and the helpers below are shared with it.
 #[derive(Debug, Deserialize)]
-pub struct PostMessage {
-    pub message: MessageBody,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MessageBody {
+pub(crate) struct MessageBody {
     #[serde(default = "default_role")]
     pub role: String,
     pub content: Value,
@@ -275,113 +367,9 @@ fn default_role() -> String {
     "user".to_string()
 }
 
-pub async fn post_message(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(body): Json<PostMessage>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let (session, _key) = auth_session(&state, &headers, &id)?;
-    if session.state != STATE_OPEN {
-        return Err(ApiError::conflict(
-            "session_closed",
-            format!("session is {}, not open", session.state),
-        ));
-    }
-
-    let mut events: Vec<EventRecord> = Vec::new();
-
-    // Record the incoming client turn. If it carries tool_result blocks (the
-    // client returning output for a prior tool.call), log those explicitly too.
-    let msg_payload = json!({ "role": body.message.role, "content": body.message.content });
-    events.push(
-        state
-            .store
-            .with_conn(|c| {
-                sessions::insert_event(
-                    c,
-                    &session.id,
-                    Some(&session.client_key_id),
-                    EventType::ClientMessageSend,
-                    &msg_payload,
-                )
-            })
-            .map_err(ApiError::from_db)?,
-    );
-    for block in tool_result_blocks(&body.message.content) {
-        events.push(
-            state
-                .store
-                .with_conn(|c| {
-                    sessions::insert_event(
-                        c,
-                        &session.id,
-                        Some(&session.client_key_id),
-                        EventType::ToolResult,
-                        &block,
-                    )
-                })
-                .map_err(ApiError::from_db)?,
-        );
-    }
-
-    // The profile could have been deleted mid-session.
-    let profile = state
-        .store
-        .with_conn(|c| profiles::get(c, &session.profile_id))
-        .map_err(ApiError::from_db)?;
-    let profile = match profile {
-        Some(p) => p,
-        None => {
-            let ev = state
-                .store
-                .with_conn(|c| {
-                    sessions::insert_event(
-                        c,
-                        &session.id,
-                        Some(&session.client_key_id),
-                        EventType::SessionError,
-                        &json!({ "reason": "profile_unavailable", "profile_id": session.profile_id }),
-                    )
-                })
-                .map_err(ApiError::from_db)?;
-            events.push(ev);
-            let _ = state
-                .store
-                .with_conn(|c| sessions::close_session(c, &session.id, STATE_ERROR));
-            return Err(ApiError::unprocessable(
-                "profile_unavailable",
-                "the profile bound to this session is no longer available",
-            ));
-        }
-    };
-
-    // Run the loop and merge its events after the client turn.
-    let turn = session::run_turn(&state.store, &state.http, &session, &profile)
-        .await
-        .map_err(|e| {
-            tracing::error!("session loop failed: {e}");
-            ApiError::internal("session loop failed")
-        })?;
-    events.extend(turn.events);
-
-    let events_json: Vec<Value> = events.iter().map(event_view).collect();
-    let status = match turn.outcome {
-        Outcome::Completed | Outcome::Paused => StatusCode::OK,
-        Outcome::ProvidersFailed => StatusCode::BAD_GATEWAY,
-    };
-    Ok((
-        status,
-        Json(json!({
-            "message": turn.message,
-            "events": events_json,
-        })),
-    ))
-}
-
 /// Extract `tool_result` blocks from a message content value, as `tool.result`
 /// event payloads. A plain string or a block-less array yields nothing.
-fn tool_result_blocks(content: &Value) -> Vec<Value> {
+pub(crate) fn tool_result_blocks(content: &Value) -> Vec<Value> {
     content
         .as_array()
         .map(|arr| {
@@ -404,7 +392,7 @@ fn tool_result_blocks(content: &Value) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 /// JSON view of one `session_events` row.
-fn event_view(e: &EventRecord) -> Value {
+pub(crate) fn event_view(e: &EventRecord) -> Value {
     json!({
         "id": e.id,
         "session_id": e.session_id,
@@ -449,25 +437,105 @@ pub async fn close(
         .store
         .with_conn(|c| sessions::close_session(c, &session.id, STATE_CLOSED))
         .map_err(ApiError::from_db)?;
+
+    // A `session.close` event is only meaningful for a real open->closed
+    // transition; a session that was already terminal (e.g. moved to `error` by a
+    // provider failure) does not get one.
+    if closed {
+        // Log + publish the close event through the broadcast choke point so any
+        // live `session.subscribe` watcher sees the session end before its stream
+        // closes.
+        broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            &session.id,
+            Some(&session.client_key_id),
+            EventType::SessionClose,
+            &json!({ "reason": "client_close" }),
+        )
+        .map_err(ApiError::from_db)?;
+    }
+
+    // Free the session's in-memory resources unconditionally — including when the
+    // session was already terminal. A session that ended in `error` can never
+    // transition through `close_session`, so if cleanup were gated on the
+    // transition it would leak its MCP subprocess and its broadcast-channel entry
+    // until server restart. Both operations are idempotent no-ops when the
+    // resources are already gone (e.g. a double DELETE).
+    //
+    // Drop the broadcast channel (dropping the sender ends every live watcher's
+    // stream cleanly), then tear down any live MCP connections (kill spawned
+    // stdio subprocesses and drop the registry entry).
+    state.broadcaster.remove(&session.id);
+    if let Some(mcp) = state.take_mcp_session(&session.id) {
+        mcp.lock().await.shutdown().await;
+    }
+
     if !closed {
         return Err(ApiError::conflict(
             "session_closed",
             format!("session is already {}", session.state),
         ));
     }
-    state
-        .store
-        .with_conn(|c| {
-            sessions::insert_event(
-                c,
-                &session.id,
-                Some(&session.client_key_id),
-                EventType::SessionClose,
-                &json!({ "reason": "client_close" }),
-            )
-        })
-        .map_err(ApiError::from_db)?;
+
     Ok(Json(
         json!({ "session_id": session.id, "state": STATE_CLOSED }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_file::McpTransport;
+
+    fn stdio_cfg(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("true".into()),
+            args: vec![],
+            url: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn registry(names: &[&str]) -> HashMap<String, McpServerConfig> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), stdio_cfg(n)))
+            .collect()
+    }
+
+    #[test]
+    fn valid_names_resolve_and_a_middle_miss_does_not_short_circuit() {
+        let reg = registry(&["fs", "search"]);
+        let names = vec![
+            "fs".to_string(),
+            "ghost".to_string(),
+            "search".to_string(),
+        ];
+        let (resolved, missing) = resolve_registry_names(&reg, &names);
+        // The miss between two valid names must not drop the trailing valid one.
+        let resolved_names: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(resolved_names, vec!["fs", "search"]);
+        assert_eq!(missing, vec!["ghost".to_string()]);
+    }
+
+    #[test]
+    fn names_absent_from_a_populated_registry_are_all_missing() {
+        let reg = registry(&["fs"]);
+        let names = vec!["ghost".to_string(), "phantom".to_string()];
+        let (resolved, missing) = resolve_registry_names(&reg, &names);
+        assert!(resolved.is_empty());
+        assert_eq!(missing, names);
+    }
+
+    #[test]
+    fn empty_registry_makes_every_name_missing() {
+        let reg: HashMap<String, McpServerConfig> = HashMap::new();
+        let names = vec!["fs".to_string(), "search".to_string()];
+        let (resolved, missing) = resolve_registry_names(&reg, &names);
+        assert!(resolved.is_empty());
+        assert_eq!(missing, names);
+    }
 }

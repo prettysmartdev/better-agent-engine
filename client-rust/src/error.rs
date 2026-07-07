@@ -10,16 +10,36 @@ pub enum Error {
     #[error("HTTP transport error: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// The server returned an RFC 7807 problem document (any non-2xx that
-    /// isn't the special 502 providers-failed case).
+    /// The server returned an RFC 7807 problem document on a REST route, or as
+    /// the pre-stream HTTP status of a `/rpc` call (e.g. `401` auth failure,
+    /// checked before the NDJSON body opens).
     #[error("API error: {0}")]
     Api(ApiError),
 
-    /// `POST …/messages` returned `502`: every provider (primary + fallbacks)
-    /// failed server-side. The session is now in the `error` state. `events`
-    /// carries the events appended during the call — inspect the
-    /// `provider.response` failures for the cause (e.g. an unset provider key).
-    #[error("all providers failed (502); session is now in the error state")]
+    /// The `/rpc` stream carried a JSON-RPC 2.0 error object (HTTP was still
+    /// `200`). Reserved for `-32700` parse / `-32600` invalid-request /
+    /// `-32601` method-not-found / `-32602` invalid-params / `-32603` internal
+    /// / `-32000` application errors (session-not-open,
+    /// profile-unavailable-mid-session, `lagged`). Distinct from
+    /// [`Error::Api`], which is a pre-stream HTTP/RFC-7807 failure.
+    #[error("JSON-RPC error {code}: {message}")]
+    Rpc {
+        /// The JSON-RPC error code.
+        code: i64,
+        /// The JSON-RPC error message.
+        message: String,
+    },
+
+    /// Every provider (primary + fallbacks) failed server-side during a
+    /// `session.sendMessage` turn. The session is now in the `error` state.
+    ///
+    /// The `/rpc` loop delivers this as a normal terminal `result` (the generic
+    /// "provider unavailable" turn), **not** a 502 or a JSON-RPC error; the
+    /// harness recognises the `session.error`/`all_providers_failed` event in
+    /// the turn's `events` and surfaces it here for API continuity. Inspect the
+    /// `provider.response` failures in `events` for the cause (e.g. an unset
+    /// provider key).
+    #[error("all providers failed; session is now in the error state")]
     ProvidersFailed {
         /// Events appended during the failed call, in order.
         events: Vec<EventView>,

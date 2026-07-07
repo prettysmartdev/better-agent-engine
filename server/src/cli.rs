@@ -7,20 +7,37 @@
 //!
 //! Subcommands implemented at this stage: the default `serve`, plus `migrate`
 //! and `version`. `serve` is assumed when no subcommand is given.
+//!
+//! The single global flag is `--config <path>`, giving the path to an optional
+//! `bae-config.toml` (the MCP server registry). It may appear before or after
+//! the subcommand (`baesrv --config x`, `baesrv serve --config x`). When both
+//! `--config` and the `BAE_CONFIG` env var are set, `--config` wins — the
+//! flag-beats-env-var precedence `aspec/uxui/cli.md` commits to.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::config_file::BaeConfigFile;
 
 /// Parse arguments, run the selected subcommand, and return a process exit code.
 pub fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let (config_flag, args) = match parse_config_flag(&raw) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("baesrv: {msg}");
+            print_usage();
+            // Usage error.
+            return ExitCode::from(2);
+        }
+    };
     let subcommand = args.first().map(String::as_str);
 
     match subcommand {
-        None | Some("serve") => run_serve(),
+        None | Some("serve") => run_serve(config_flag),
         Some("migrate") => run_migrate(),
         Some("version") | Some("--version") | Some("-V") => {
             print_version();
@@ -39,12 +56,61 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn run_serve() -> ExitCode {
+/// Pull an optional `--config <path>` (or `--config=<path>`) out of `raw`,
+/// returning the resolved path (if any) and the remaining args with the flag
+/// removed. An error string is returned if `--config` is given without a value.
+fn parse_config_flag(raw: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let mut path: Option<PathBuf> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if arg == "--config" {
+            let value = raw
+                .get(i + 1)
+                .ok_or_else(|| "--config requires a path argument".to_string())?;
+            path = Some(PathBuf::from(value));
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            if value.is_empty() {
+                return Err("--config requires a path argument".to_string());
+            }
+            path = Some(PathBuf::from(value));
+            i += 1;
+        } else {
+            rest.push(arg.clone());
+            i += 1;
+        }
+    }
+    Ok((path, rest))
+}
+
+/// Resolve the config-file path: `--config` wins over `BAE_CONFIG`; neither set
+/// yields `None` (empty MCP registry, not an error).
+fn resolve_config_path(flag: Option<PathBuf>) -> Option<PathBuf> {
+    resolve_config_path_with(flag, std::env::var_os("BAE_CONFIG").map(PathBuf::from))
+}
+
+/// The precedence rule, split from the live environment read so it can be unit
+/// tested exhaustively without mutating (racy) process-global `BAE_CONFIG`:
+/// `flag` (`--config`) wins over `env` (`BAE_CONFIG`); neither set → `None`.
+fn resolve_config_path_with(flag: Option<PathBuf>, env: Option<PathBuf>) -> Option<PathBuf> {
+    flag.or(env)
+}
+
+fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
     let config = match load_config() {
         Ok(c) => c,
         Err(code) => return code,
     };
     init_tracing(&config.log);
+
+    // Load the optional MCP server registry from bae-config.toml (via --config
+    // or BAE_CONFIG). A missing file is not an error; a malformed one is.
+    let mcp_registry = match load_mcp_registry(config_flag) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
 
     // Fail fast on database problems before binding any port.
     let store = match crate::open_store(&config) {
@@ -66,13 +132,46 @@ fn run_serve() -> ExitCode {
         }
     };
 
-    match runtime.block_on(crate::serve(config, store)) {
+    match runtime.block_on(crate::serve(config, store, mcp_registry)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
             ExitCode::from(e.exit_code() as u8)
         }
     }
+}
+
+/// Resolve `--config`/`BAE_CONFIG`, load and validate the MCP server registry.
+/// A missing file (or neither source set) yields an empty registry with no
+/// error; a malformed file or a structural error (duplicate name, unsupported
+/// transport) is a usage error (exit 2). Tracing is already initialised here, so
+/// authoring errors are also echoed to stderr like other config errors.
+fn load_mcp_registry(
+    config_flag: Option<PathBuf>,
+) -> Result<std::collections::HashMap<String, crate::config_file::McpServerConfig>, ExitCode> {
+    let path = resolve_config_path(config_flag);
+    load_mcp_registry_from(path.as_deref()).map_err(|e| {
+        eprintln!("baesrv: configuration error: {e}");
+        ExitCode::from(e.exit_code() as u8)
+    })
+}
+
+/// Path-driven half of [`load_mcp_registry`], split out for testability.
+fn load_mcp_registry_from(
+    path: Option<&Path>,
+) -> Result<
+    std::collections::HashMap<String, crate::config_file::McpServerConfig>,
+    crate::config_file::ConfigFileError,
+> {
+    let file = BaeConfigFile::load(path)?;
+    let registry = file.mcp_registry()?;
+    if !registry.is_empty() {
+        tracing::info!(
+            count = registry.len(),
+            "loaded MCP server registry from bae-config.toml"
+        );
+    }
+    Ok(registry)
 }
 
 fn run_migrate() -> ExitCode {
@@ -124,7 +223,7 @@ fn print_usage() {
         "baesrv {} — Better Agent Engine server
 
 USAGE:
-    baesrv [COMMAND]
+    baesrv [COMMAND] [--config <path>]
 
 COMMANDS:
     serve      Run the HTTP server (default)
@@ -132,8 +231,83 @@ COMMANDS:
     version    Print version and supported API versions
     help       Print this message
 
-Configuration is via BAE_* environment variables; see docs/ and
+OPTIONS:
+    --config <path>   Path to an optional bae-config.toml (MCP server
+                      registry). May also be set via the BAE_CONFIG env var;
+                      when both are set, --config wins. A missing file is not
+                      an error (empty registry).
+
+Server configuration is via BAE_* environment variables; see docs/ and
 aspec/devops/operations.md.",
         crate::VERSION
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_config_flag_space_form() {
+        let (path, rest) = parse_config_flag(&[
+            "serve".into(),
+            "--config".into(),
+            "/etc/bae.toml".into(),
+        ])
+        .unwrap();
+        assert_eq!(path, Some(PathBuf::from("/etc/bae.toml")));
+        assert_eq!(rest, vec!["serve".to_string()]);
+    }
+
+    #[test]
+    fn extracts_config_flag_equals_form_before_subcommand() {
+        let (path, rest) =
+            parse_config_flag(&["--config=/tmp/x.toml".into(), "migrate".into()]).unwrap();
+        assert_eq!(path, Some(PathBuf::from("/tmp/x.toml")));
+        assert_eq!(rest, vec!["migrate".to_string()]);
+    }
+
+    #[test]
+    fn missing_config_value_is_error() {
+        assert!(parse_config_flag(&["--config".into()]).is_err());
+        assert!(parse_config_flag(&["--config=".into()]).is_err());
+    }
+
+    #[test]
+    fn no_flag_leaves_args_untouched() {
+        let (path, rest) = parse_config_flag(&["serve".into()]).unwrap();
+        assert!(path.is_none());
+        assert_eq!(rest, vec!["serve".to_string()]);
+    }
+
+    #[test]
+    fn flag_wins_over_env_var() {
+        // With a flag present, BAE_CONFIG is not consulted.
+        let resolved = resolve_config_path(Some(PathBuf::from("/from/flag.toml")));
+        assert_eq!(resolved, Some(PathBuf::from("/from/flag.toml")));
+    }
+
+    #[test]
+    fn config_precedence_all_four_combinations() {
+        let flag = || Some(PathBuf::from("/from/flag.toml"));
+        let env = || Some(PathBuf::from("/from/env.toml"));
+
+        // --config alone → the flag path.
+        assert_eq!(resolve_config_path_with(flag(), None), flag());
+        // BAE_CONFIG alone → the env path.
+        assert_eq!(resolve_config_path_with(None, env()), env());
+        // Both set → --config wins.
+        assert_eq!(resolve_config_path_with(flag(), env()), flag());
+        // Neither set → None (empty registry, not an error).
+        assert_eq!(resolve_config_path_with(None, None), None);
+    }
+
+    #[test]
+    fn missing_registry_file_is_empty_no_error() {
+        let path = std::env::temp_dir().join("baesrv-cli-absent.toml");
+        let reg = load_mcp_registry_from(Some(&path)).unwrap();
+        assert!(reg.is_empty());
+        // Neither source set → None → empty.
+        assert!(load_mcp_registry_from(None).unwrap().is_empty());
+    }
 }

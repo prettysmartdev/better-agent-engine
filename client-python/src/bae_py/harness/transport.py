@@ -5,10 +5,11 @@ tests inject a mock through the same protocol so they run fully offline.
 
 from __future__ import annotations
 
+import json as _json
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Mapping, Protocol, runtime_checkable
 
-from ..errors import TransportError
+from ..errors import ApiError, TransportError
 
 
 @dataclass(slots=True)
@@ -21,7 +22,12 @@ class TransportResponse:
 
 @runtime_checkable
 class Transport(Protocol):
-    """Minimal async HTTP interface the harness depends on."""
+    """Minimal async HTTP interface the harness depends on.
+
+    ``request`` covers the REST management routes (session open/close, events
+    replay); ``stream`` drives the JSON-RPC session loop over ``…/rpc``,
+    yielding one decoded JSON-RPC frame (a ``dict``) per NDJSON line.
+    """
 
     async def request(
         self,
@@ -31,6 +37,15 @@ class Transport(Protocol):
         headers: Mapping[str, str],
         json: Any | None = None,
     ) -> TransportResponse: ...
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json: Any | None = None,
+    ) -> AsyncIterator[dict[str, Any]]: ...
 
     async def aclose(self) -> None: ...
 
@@ -67,6 +82,45 @@ class HttpxTransport:
             except ValueError:
                 body = None
         return TransportResponse(status=resp.status_code, body=body)
+
+    async def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json: Any | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """POST a JSON-RPC request and yield each NDJSON frame as it arrives.
+
+        A non-2xx status is a pre-stream RFC 7807 error (:class:`ApiError`, e.g.
+        auth), raised before the first frame; the stream body itself is HTTP 200.
+        """
+        try:
+            async with self._client.stream(
+                method, url, headers=dict(headers), json=json
+            ) as resp:
+                if not (200 <= resp.status_code < 300):
+                    await resp.aread()
+                    body: Any = None
+                    if resp.content:
+                        try:
+                            body = resp.json()
+                        except ValueError:
+                            body = None
+                    raise ApiError.from_body(resp.status_code, body)
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield _json.loads(line)
+                    except ValueError as exc:
+                        raise TransportError(
+                            f"malformed JSON-RPC frame from {method} {url}"
+                        ) from exc
+        except self._httpx.HTTPError as exc:
+            raise TransportError(f"request to {url} failed: {exc}") from exc
 
     async def aclose(self) -> None:
         await self._client.aclose()

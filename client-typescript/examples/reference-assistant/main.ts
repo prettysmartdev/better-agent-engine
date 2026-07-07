@@ -19,6 +19,7 @@ import {
   Config,
   Harness,
   ProvidersFailedError,
+  describeEvent,
   messageText,
   randomHex,
   type Content,
@@ -103,6 +104,13 @@ async function main(): Promise<void> {
         `[hook ${correlationId}] after_tool_call ${toolResult.name} -> ${JSON.stringify(toolResult.content)}`,
       );
     },
+    // on_event observes the live `session.event` stream carried by the `/rpc`
+    // NDJSON notifications. describeEvent knows the real (non-stub)
+    // mcp.request / mcp.response payload shapes.
+    on_event: (event) => {
+      hookCalls++;
+      console.error(`[hook ${correlationId}] on_event ${describeEvent(event)}`);
+    },
   });
 
   const session = await harness.connect();
@@ -113,10 +121,25 @@ async function main(): Promise<void> {
   try {
     const reply = await session.send(prompt);
     console.log(messageText(reply));
+
+    // Optional: tap the live event feed via session.subscribe. Opt-in (set
+    // BAE_SUBSCRIBE_DEMO) so the example stays a quick one-shot. A bogus
+    // sinceEventId forces a replay from the start; we stop after the first
+    // event so the demo terminates — a real observer would keep reading.
+    if (process.env.BAE_SUBSCRIBE_DEMO) {
+      console.error(`[example] subscribe demo (stopping after the first event)…`);
+      await session.subscribe(
+        (event) => {
+          console.error(`[subscribe] ${describeEvent(event)}`);
+          return false;
+        },
+        { sinceEventId: "evt_replay_from_start" },
+      );
+    }
   } catch (err) {
     if (err instanceof ProvidersFailedError) {
       console.error(
-        `error: the server could not reach any provider (502). Is ${providerKeyEnv} ` +
+        `error: the server could not reach any provider. Is ${providerKeyEnv} ` +
           `set in the server's environment and valid? Session events:`,
       );
       for (const event of err.events) {
