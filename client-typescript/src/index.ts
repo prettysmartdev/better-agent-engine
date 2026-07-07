@@ -26,15 +26,17 @@ export type { ToolDefinition, ToolHandler } from "./tool.js";
 export type { Hooks, HookName } from "./hooks.js";
 export {
   FetchTransport,
+  isTerminalFrame,
+  eventFromFrame,
   type Transport,
   type TransportRequest,
   type TransportResponse,
-  type MessagesResponse,
 } from "./transport.js";
 export {
   BaeError,
   ApiError,
   ProvidersFailedError,
+  RpcError,
   UnknownToolError,
   ToolError,
   HookError,
@@ -56,4 +58,13 @@ export {
   type ProfileProvider,
   type EventType,
   type SessionEvent,
+  type RpcMethod,
+  type JsonRpcRequest,
+  type JsonRpcErrorObject,
+  type JsonRpcFrame,
+  type SendMessageParams,
+  type SubscribeParams,
+  type SendMessageResult,
+  type McpRequestPayload,
+  type McpResponsePayload,
 } from "./types.js";

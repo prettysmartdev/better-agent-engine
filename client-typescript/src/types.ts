@@ -160,17 +160,36 @@ export interface ToolResultPayload {
   tool_use_id: string;
   dispatch: "client" | "mcp";
   content: unknown;
-  status?: "stub";
+  /** Present on `mcp`-dispatched results: the server that produced it. */
+  server_name?: string | null;
+  /** Present on `mcp`-dispatched results: whether the MCP call errored. */
+  is_error?: boolean;
 }
+/** Payload of an `mcp.request` event: the engine calling a configured server. */
 export interface McpRequestPayload {
-  status: "stub";
+  /** The MCP method invoked (currently always `"tools/call"`). */
+  method: string;
+  /** The server the call was routed to, or null if the tool was unroutable. */
+  server_name: string | null;
+  /** The requested tool name. */
   tool: string;
+  /** The JSON arguments passed to the tool. */
   input: Record<string, unknown>;
 }
-export interface McpResponsePayload {
-  status: "stub";
-  tool: string;
-}
+/** Payload of an `mcp.response` event. `ok` discriminates success vs failure. */
+export type McpResponsePayload =
+  | {
+      server_name: string | null;
+      ok: true;
+      /** The MCP `result` object (`{content, isError?}`). */
+      result: Record<string, unknown>;
+    }
+  | {
+      server_name: string | null;
+      ok: false;
+      /** The error description. */
+      error: string;
+    };
 export interface SessionOpenPayload {
   client_version: string | null;
   tools: string[];
@@ -247,9 +266,9 @@ export function describeEvent(event: SessionEvent): string {
     case "tool.result":
       return `tool result (${event.payload.dispatch})`;
     case "mcp.request":
-      return `mcp request ${event.payload.tool} (stub)`;
+      return `mcp request ${event.payload.tool} → ${event.payload.server_name ?? "<unrouted>"}`;
     case "mcp.response":
-      return `mcp response ${event.payload.tool} (stub)`;
+      return `mcp response from ${event.payload.server_name ?? "<unrouted>"} (ok=${event.payload.ok})`;
     case "session.open":
       return "session opened";
     case "session.close":
@@ -261,4 +280,73 @@ export function describeEvent(event: SessionEvent): string {
     default:
       return assertNever(event);
   }
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 envelopes for the session loop (`POST …/rpc`)
+//
+// The management routes (session open/close, events replay) stay plain REST;
+// only the message loop is JSON-RPC. A request is POSTed to
+// `POST /api/v1/sessions/{id}/rpc` and the reply is an `application/x-ndjson`
+// stream of these envelopes. A frame with no `id` is a notification (its
+// `params` carry a `session.event`); the frame carrying the request `id` is the
+// terminal response (`result` on success, `error` on failure).
+// ---------------------------------------------------------------------------
+
+/** JSON-RPC methods the session loop understands. */
+export type RpcMethod =
+  | "session.sendMessage"
+  | "session.subscribe"
+  | "session.unsubscribe";
+
+/** A JSON-RPC 2.0 request envelope. */
+export interface JsonRpcRequest<P = unknown> {
+  jsonrpc: "2.0";
+  /** Correlation id echoed back on the terminal response. */
+  id: number;
+  method: RpcMethod;
+  params: P;
+}
+
+/** A JSON-RPC 2.0 error object (terminal, or a mid-stream notice like `lagged`). */
+export interface JsonRpcErrorObject {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+/**
+ * A single JSON-RPC 2.0 frame decoded from the NDJSON stream. Branch on `id`:
+ * a frame with no `id` is a notification (`method`/`params`, e.g. a
+ * `session.event`); the frame with the request `id` is the terminal response
+ * (`result` or `error`).
+ */
+export interface JsonRpcFrame {
+  jsonrpc?: "2.0";
+  id?: number | string | null;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: JsonRpcErrorObject;
+}
+
+/** Params for `session.sendMessage`. */
+export interface SendMessageParams {
+  message: Message;
+}
+
+/** Params for `session.subscribe`. */
+export interface SubscribeParams {
+  since_event_id?: string;
+}
+
+/**
+ * The terminal `result` of a `session.sendMessage` call — the same
+ * `{message, events}` body the legacy synchronous message route returned.
+ * `events` is the full turn event list; the live `session.event` notifications
+ * are an additive, filtered subset of it.
+ */
+export interface SendMessageResult {
+  message: Message;
+  events: SessionEvent[];
 }

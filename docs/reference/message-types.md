@@ -1,12 +1,15 @@
 # Message Types
 
 Every row in `session_events` has an `event_type` field drawn from the closed
-set below. Adding a new event type requires a code change in the server and
-all SDKs — the enum is exhaustive in every language so unhandled variants are
+set below. Adding a new event type requires a code change in the server and all
+SDKs — the enum is exhaustive in every language so unhandled variants are
 compile or type errors.
 
-Events are returned in the `events` array on `POST …/messages` (events
-appended during that call) and via `GET …/events` (full session history).
+Events are returned in the `events` array on the terminal result of
+`session.sendMessage` (events appended during that call) and via
+`GET /api/v1/sessions/{id}/events` (full session history). They are also
+delivered as live `session.event` notifications on the `/rpc` NDJSON stream —
+see [Event Streaming](../guides/event-streaming.md).
 
 **EventView shape** (all endpoints):
 
@@ -84,6 +87,8 @@ auth token is **never** included.
 
 - `attempt` is 0-indexed.
 - `kind` is `"primary"` or `"fallback"`.
+- `tools` includes both client-declared tools and any tools fetched from
+  connected MCP servers.
 - Inserted **before** each provider attempt (primary + every fallback).
 
 ---
@@ -133,26 +138,31 @@ The server or harness is about to invoke a tool.
 
 ```json
 {
-  "id":       "tu_abc123",
-  "name":     "get_current_time",
-  "input":    {},
-  "dispatch": "client"
+  "id":          "tu_abc123",
+  "name":        "get_current_time",
+  "input":       {},
+  "dispatch":    "client",
+  "server_name": null
 }
 ```
 
-**MCP dispatch (stub):**
+**MCP dispatch:**
 
 ```json
 {
-  "id":       "tu_xyz789",
-  "name":     "some_mcp_tool",
-  "input":    {"query": "…"},
-  "dispatch": "mcp"
+  "id":          "tu_xyz789",
+  "name":        "list_directory",
+  "input":       {"path": "/data"},
+  "dispatch":    "mcp",
+  "server_name": "filesystem"
 }
 ```
 
 - `dispatch` is `"client"` for tools declared at session open and `"mcp"` for
-  all others (handled server-side as MCP stubs today).
+  tools handled server-side by a configured MCP server.
+- `server_name` is the MCP server's name from `bae-config.toml`, or `null` if
+  dispatch is `"client"` or if the tool name was not found in any server's tool
+  list (indicates a mis-routed call).
 
 ---
 
@@ -166,35 +176,52 @@ The result returned from a tool call.
 {
   "tool_use_id": "tu_abc123",
   "dispatch":    "client",
+  "server_name": null,
+  "is_error":    false,
   "content":     "2026-07-06T18:26:10Z"
 }
 ```
 
-**MCP stub result:**
+**MCP result (success):**
 
 ```json
 {
   "tool_use_id": "tu_xyz789",
   "dispatch":    "mcp",
-  "status":      "stub",
-  "content":     []
+  "server_name": "filesystem",
+  "is_error":    false,
+  "content":     [{"type": "text", "text": "README.md\ndata.csv"}]
 }
 ```
 
-`content` mirrors the `tool_result` block the provider receives.
+**MCP result (error):**
+
+```json
+{
+  "tool_use_id": "tu_xyz789",
+  "dispatch":    "mcp",
+  "server_name": "filesystem",
+  "is_error":    true,
+  "content":     "MCP error: connection refused"
+}
+```
+
+- `content` mirrors the `tool_result` block the provider receives.
+- `is_error: true` means the MCP call failed or returned an error; the session
+  continues and the provider receives the error content so it can adjust.
 
 ---
 
 ### `mcp.request`
 
-A request sent to an MCP server. Currently a stub — full MCP implementation
-is a later work item.
+A request sent to an MCP server.
 
 ```json
 {
-  "status": "stub",
-  "tool":   "some_mcp_tool",
-  "input":  {"query": "…"}
+  "method":      "tools/call",
+  "server_name": "filesystem",
+  "tool":        "list_directory",
+  "input":       {"path": "/data"}
 }
 ```
 
@@ -202,12 +229,28 @@ is a later work item.
 
 ### `mcp.response`
 
-A response from an MCP server. Currently a stub.
+A response from an MCP server.
+
+**Success:**
 
 ```json
 {
-  "status": "stub",
-  "tool":   "some_mcp_tool"
+  "server_name": "filesystem",
+  "ok":          true,
+  "result":      {
+    "content": [{"type": "text", "text": "README.md\ndata.csv"}],
+    "isError": false
+  }
+}
+```
+
+**Failure:**
+
+```json
+{
+  "server_name": "filesystem",
+  "ok":          false,
+  "error":       "stdio process exited unexpectedly"
 }
 ```
 
@@ -225,7 +268,7 @@ Emitted when the session is created.
 ```
 
 - `client_version` is `null` if not provided at session creation.
-- `tools` is the list of tool names declared at open.
+- `tools` is the list of tool names declared at open (client-side tools only).
 
 ---
 
@@ -268,6 +311,9 @@ Note: `"provider_call_failed"` is recorded once when the primary fails but
 a fallback attempt follows. If a fallback succeeds, the session continues
 normally. Only `"all_providers_failed"` moves the session to `error`.
 
+When `"all_providers_failed"`, `session.sendMessage`'s terminal result still
+carries this event in `result.events` — not a JSON-RPC error object.
+
 ---
 
 ### `session.compaction`
@@ -300,7 +346,7 @@ provider.response      (ok: true)
 server.message.send
 ```
 
-**Client-side tool call (two `POST …/messages` calls):**
+**Client-side tool call (two `session.sendMessage` calls):**
 
 Call 1:
 ```
@@ -320,16 +366,16 @@ provider.response      (ok: true)
 server.message.send    (final text)
 ```
 
-**MCP stub tool call (single `POST …/messages` call, server-side):**
+**MCP tool call (single `session.sendMessage` call, server-side):**
 
 ```
 client.message.send
 provider.request
 provider.response      (ok: true)
-tool.call              (dispatch: mcp)
-mcp.request
-mcp.response
-tool.result            (dispatch: mcp, status: stub)
+tool.call              (dispatch: mcp, server_name: "filesystem")
+mcp.request            (method: tools/call)
+mcp.response           (ok: true)
+tool.result            (dispatch: mcp, is_error: false)
 provider.request
 provider.response      (ok: true)
 server.message.send

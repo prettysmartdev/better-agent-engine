@@ -5,7 +5,7 @@ of an agent: which LLM provider to call, how to authenticate with it, which
 fallback providers to try if the primary fails, which MCP servers are
 available, and which client-side tools agents are allowed to declare.
 
-Profiles are managed via the admin API — see [admin-api.md](admin-api.md).
+Profiles are managed via the admin API — see [admin-api.md](reference/admin-api.md).
 
 ---
 
@@ -55,7 +55,8 @@ Rules:
   fail.
 - If the referenced variable is **not set** at call time, the attempt fails
   with a `provider.response` failure event (`ok: false`) and the fallback walk
-  begins. This is surfaced to the client as a `502` if no fallback succeeds.
+  begins. If no fallback succeeds, `session.sendMessage` returns a terminal
+  `result` with a "provider unavailable" message (SDKs raise `ProvidersFailedError`).
 
 The admin surface returns the literal template string (e.g.
 `"${ANTHROPIC_API_KEY}"`), not the resolved value. The client-facing session
@@ -90,9 +91,10 @@ primary fails:
 - Each entry has the same shape as `provider_config`.
 - Fallbacks are tried in order after the primary fails. The first successful
   response ends the walk.
-- If all providers fail, the session moves to `error` state and the client
-  receives a `502` with the normal `{message, events}` body containing the
-  failure trail.
+- If all providers fail, the session moves to `error` state. `session.sendMessage`
+  returns a terminal `result` (HTTP 200) whose `message` contains a generic
+  "provider unavailable" assistant turn and whose `events` include the failure
+  trail. SDKs surface this as `ProvidersFailedError`.
 - `"provider_call_failed"` events are recorded for each failing attempt;
   `"all_providers_failed"` is recorded if every attempt fails.
 - Omit or pass `[]` for no fallbacks (default).
@@ -101,24 +103,28 @@ primary fails:
 
 ## MCP servers
 
-`mcp_servers` lists MCP server stubs available to sessions on this profile:
+`mcp_servers` opts this profile into a subset of the MCP servers declared in
+`bae-config.toml`. It is an **array of server name strings**:
 
 ```json
-"mcp_servers": [
-  {"name": "filesystem"},
-  {"name": "web-search"}
-]
+"mcp_servers": ["filesystem", "web-search"]
 ```
 
-Full MCP implementation is a later work item. Currently:
+At session creation, BAE looks up each name in the registry built from
+`bae-config.toml`. For each found server it connects, runs the MCP
+`initialize` handshake, and merges the server's tools into the tool list
+advertised to the provider. A name not found in the registry is skipped
+non-fatally (an error is logged every session creation; session open still
+succeeds).
 
-- MCP server entries are stored on the profile and returned at session open.
-- When the LLM calls a tool that was **not** declared by the client at session
-  open, the server dispatches it as an MCP stub: it records `tool.call`
-  (dispatch: mcp), `mcp.request`, `mcp.response` (with `{"status":"stub"}`),
-  and `tool.result` events, and sends a stub result back to the provider.
-- The session loop continues with the stub result until the LLM produces a
-  final text turn.
+See [MCP Servers guide](guides/mcp-servers.md) for a hands-on walkthrough,
+and [Configuration](reference/configuration.md) for the full `bae-config.toml`
+schema.
+
+> **Alpha breaking change.** Prior to work item 0003, `mcp_servers` accepted
+> objects (`[{"name":"filesystem"}]`). It now accepts strings only
+> (`["filesystem"]`). Existing profile data using the old shape should be
+> updated.
 
 ---
 
@@ -190,9 +196,7 @@ is accepted. A client declaring an additional tool not in the list is rejected.
       "max_tokens": 4096
     }
   ],
-  "mcp_servers": [
-    {"name": "filesystem"}
-  ],
+  "mcp_servers": ["filesystem"],
   "allowed_tools": ["get_current_time", "read_file"]
 }
 ```

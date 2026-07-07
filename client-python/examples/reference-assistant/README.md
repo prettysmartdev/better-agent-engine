@@ -33,8 +33,8 @@ for the admin-side setup (create a profile, create a key).
 
 The provider key itself is used **server-side** and never sent by the SDK, but
 the example fails fast with a clear message if it is unset locally, and reports
-the server's `502 providers-failed` outcome (likely an unset/invalid key on the
-server) if it happens at runtime.
+the server's `all-providers-failed` outcome (surfaced as `ProvidersFailedError`,
+likely an unset/invalid key on the server) if it happens at runtime.
 
 ## Run
 

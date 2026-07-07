@@ -13,9 +13,10 @@ use serde_json::{json, Value};
 use crate::api::error::ApiError;
 use crate::api::pagination::{next_cursor, PageQuery};
 use crate::api::AppState;
+use crate::engine::broadcast;
 use crate::events::EventType;
 use crate::store::keys::{self, KeyRecord};
-use crate::store::{profiles, sessions};
+use crate::store::profiles;
 
 /// `POST /admin/v1/keys` body.
 #[derive(Debug, Deserialize)]
@@ -103,7 +104,10 @@ pub async fn list(
 /// `DELETE /admin/v1/keys/:id`
 ///
 /// Revokes the key and invalidates its open sessions, logging a `session.close`
-/// event on each.
+/// event on each. Each forced close also publishes through the broadcast choke
+/// point (so a live `session.subscribe` observer sees the session end) and frees
+/// the session's in-memory resources — its broadcast channel and any live MCP
+/// connections — mirroring the client `DELETE /api/v1/sessions/{id}` path.
 pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -117,12 +121,22 @@ pub async fn delete(
     };
     for session_id in &closed_sessions {
         let payload = json!({ "reason": "client_key_revoked" });
-        state
-            .store
-            .with_conn(|c| {
-                sessions::insert_event(c, session_id, Some(&id), EventType::SessionClose, &payload)
-            })
-            .map_err(ApiError::from_db)?;
+        broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            session_id,
+            Some(&id),
+            EventType::SessionClose,
+            &payload,
+        )
+        .map_err(ApiError::from_db)?;
+        // Drop the broadcast channel (ending any live observer's stream) and tear
+        // down any live MCP connections, so a revocation-forced close doesn't leak
+        // subprocesses or channel entries.
+        state.broadcaster.remove(session_id);
+        if let Some(mcp) = state.take_mcp_session(session_id) {
+            mcp.lock().await.shutdown().await;
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

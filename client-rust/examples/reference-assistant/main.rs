@@ -19,14 +19,15 @@
 //!
 //! The provider key must be present in this process's environment: BAE resolves
 //! the profile's `${ANTHROPIC_API_KEY}` server-side, but the example checks it
-//! up front so a missing key fails fast with a clear message instead of a 502.
+//! up front so a missing key fails fast with a clear message instead of a
+//! provider-unavailable turn buried in the session events.
 
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bae_rs::{Config, Harness, Hooks, Tool};
+use bae_rs::{Config, Harness, Hooks, McpRequestPayload, McpResponsePayload, Tool};
 use serde_json::json;
 
 /// Env var naming the provider key the configured profile references. The
@@ -49,8 +50,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let client_key = require_env("BAE_CLIENT_KEY")?;
 
     // The provider credential is a *server-side* concern, but we fail fast here
-    // with a clear message rather than letting the server return a 502 with a
-    // provider.response failure buried in its events.
+    // with a clear message rather than letting the turn come back as a generic
+    // provider-unavailable result with the provider.response failure in its events.
     let provider_key_env = std::env::var("BAE_PROVIDER_KEY_ENV")
         .unwrap_or_else(|_| PROVIDER_KEY_ENV_DEFAULT.to_string());
     require_env(&provider_key_env).map_err(|_| {
@@ -78,7 +79,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // --- 3. Hooks: exercise every customization point at least once --------
     // A shared counter proves each point actually fired by the end of the run.
     let hook_hits = Arc::new(AtomicUsize::new(0));
-    let (h1, h2, h3, h4) = (
+    let (h1, h2, h3, h4, h5) = (
+        hook_hits.clone(),
         hook_hits.clone(),
         hook_hits.clone(),
         hook_hits.clone(),
@@ -115,6 +117,39 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 result.name, result.content
             );
             Ok(())
+        })
+        // on_event observes the live `session.event` stream delivered over the
+        // `/rpc` NDJSON notifications. We give MCP events special treatment to
+        // show the real (non-stub) `mcp.request` / `mcp.response` payloads.
+        .on_event(move |event| {
+            h5.fetch_add(1, Ordering::SeqCst);
+            match event.event_type.as_str() {
+                "mcp.request" => {
+                    if let Ok(p) = serde_json::from_value::<McpRequestPayload>(event.payload.clone())
+                    {
+                        eprintln!(
+                            "[event] mcp.request  server={} tool={} method={}",
+                            p.server_name.as_deref().unwrap_or("<unrouted>"),
+                            p.tool,
+                            p.method
+                        );
+                    }
+                }
+                "mcp.response" => {
+                    if let Ok(p) =
+                        serde_json::from_value::<McpResponsePayload>(event.payload.clone())
+                    {
+                        eprintln!(
+                            "[event] mcp.response server={} ok={}{}",
+                            p.server_name.as_deref().unwrap_or("<unrouted>"),
+                            p.ok,
+                            p.error.map(|e| format!(" error={e}")).unwrap_or_default()
+                        );
+                    }
+                }
+                other => eprintln!("[event] {other}"),
+            }
+            Ok(())
         });
 
     // --- 4. Open a session and run the loop --------------------------------
@@ -137,6 +172,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // --- 5. Print the final assistant turn ---------------------------------
     println!("{}", reply.text());
 
+    // --- 5b. Optional: tap the live event feed via session.subscribe -------
+    // Opt-in (set BAE_SUBSCRIBE_DEMO) so the example stays a quick one-shot.
+    // A bogus `since_event_id` forces a replay from the start of the session;
+    // we stop after the first event (returning `false`) so the demo terminates
+    // — a real observer would keep the stream open for live notifications.
+    if std::env::var("BAE_SUBSCRIBE_DEMO").is_ok() {
+        eprintln!("[subscribe] replaying session events (stopping after the first)…");
+        session
+            .subscribe(Some("evt_replay_from_start"), |event| {
+                eprintln!("[subscribe] {} {}", event.event_type, event.id);
+                false
+            })
+            .await
+            .map_err(explain)?;
+    }
+
     // Best-effort close; a failure here shouldn't mask a successful run.
     if let Err(err) = session.close().await {
         eprintln!("[warn] closing session failed: {err}");
@@ -157,7 +208,7 @@ fn require_env(name: &str) -> Result<String, Box<dyn Error>> {
 fn explain(err: bae_rs::Error) -> Box<dyn Error> {
     match err {
         bae_rs::Error::ProvidersFailed { events } => format!(
-            "the server could not reach any LLM provider (HTTP 502). This usually means the \
+            "the server could not reach any LLM provider. This usually means the \
              profile's provider key is unset/invalid server-side, or the provider is down. \
              {} event(s) were recorded for this turn; inspect the `provider.response` \
              failures via GET /api/v1/sessions/<id>/events.",

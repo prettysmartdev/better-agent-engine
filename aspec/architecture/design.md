@@ -12,9 +12,10 @@ Reasoning:
 
 ### Principle 2: Thin protocol, customizable harness
 Description:
-- The wire protocol (/api/v1 REST) is small and stable. Customizability lives in the client harnesses — the agent loop, tool dispatch, and prompting strategies are library code the developer composes and overrides, not server behavior.
+- The wire protocol is small and stable. The client port is a deliberate hybrid: REST/HTTP for management operations (session CRUD, metadata, event history — small, stable, unchanged) plus one JSON-RPC 2.0 endpoint (`POST /api/v1/sessions/{id}/rpc`) for the live session loop that needs streaming. Customizability lives in the client harnesses — the agent loop, tool dispatch, and prompting strategies are library code the developer composes and overrides, not server behavior.
+- **Scoped exception — server-side MCP dispatch:** MCP servers (configured in `bae-config.toml`) are connected and invoked by the server, not client harnesses. This is a deliberate, bounded exception: an MCP server is an external process/service the *operator* configures; its tools are not application logic that belongs in a harness. The core principle ("tool implementations live in client harnesses") applies to agent-specific application tools; MCP dispatch is infrastructure-level and correctly lives server-side.
 Reasoning:
-- A small protocol keeps three client implementations in lockstep and lets the server evolve independently; pushing customization to the client keeps the server generic across wildly different agent designs.
+- A small, stable protocol keeps three client implementations in lockstep and lets the server evolve independently; pushing customization to the client keeps the server generic across wildly different agent designs. Server-side MCP dispatch is scoped narrowly to the streaming loop so it does not pollute the REST surface.
 
 ### Principle 3: Independent components, identical verbs
 Description:
@@ -32,10 +33,12 @@ graph TD
     end
 
     subgraph "BAE Server (Docker container)"
-        API["REST API /api/v1 (axum)"]
+        API["REST + JSON-RPC /api/v1 (axum)"]
         ENG[Agent/session/run engine]
         DB[(SQLite)]
+        MCP[MCP servers via bae-config.toml]
         API --> ENG --> DB
+        ENG --> MCP
     end
 
     RC -->|HTTP + bearer key| API
@@ -50,8 +53,8 @@ graph TD
 Name: baesrv (server/)
 Purpose: Stateful HTTP service owning all durable agent state.
 Description and Scope:
-- Rust binary exposing the versioned REST API; persists agents, sessions, events, and runs in SQLite; runs embedded, forward-only migrations at startup.
-- Scope: API surface, persistence, authentication/RBAC, run lifecycle. Out of scope: agent loop logic, prompting strategies, tool implementations (those live in client harnesses).
+- Rust binary exposing the versioned REST + JSON-RPC API; persists agents, sessions, events, and runs in SQLite; runs embedded, forward-only migrations at startup; connects to operator-configured MCP servers.
+- Scope: API surface, persistence, authentication/RBAC, run lifecycle, server-side MCP dispatch (see Principle 2 for the rationale). Out of scope: agent loop logic, prompting strategies, application tool implementations (those live in client harnesses).
 
 ### Component 2:
 Name: bae-rs (client-rust/)

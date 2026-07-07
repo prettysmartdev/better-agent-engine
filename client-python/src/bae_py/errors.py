@@ -42,17 +42,37 @@ class ApiError(BaeError):
 
 
 class ProvidersFailedError(BaeError):
-    """A ``502`` from ``…/messages``: all provider configs failed (§5.2).
+    """All provider configs failed server-side during a ``session.sendMessage``
+    turn; the session is now in the ``error`` state.
 
-    The body is the normal ``{message, events}`` shape (not a problem doc); the
-    session is now in the ``error`` state. Inspect ``events`` for the
-    ``provider.response`` failures (e.g. an unset provider-key env var).
+    The ``/rpc`` loop delivers this as a normal terminal ``{message, events}``
+    result (not a 502 or a JSON-RPC error); the harness recognises the
+    ``session.error``/``all_providers_failed`` event in the turn and surfaces it
+    here for continuity. Inspect ``events`` for the ``provider.response``
+    failures (e.g. an unset provider-key env var).
     """
 
     def __init__(self, message: "Message", events: "list[SessionEvent]") -> None:
         self.assistant_message = message
         self.events = events
-        super().__init__("all provider configs failed (HTTP 502)")
+        super().__init__("all provider configs failed")
+
+
+class RpcError(BaeError):
+    """The ``/rpc`` stream carried a JSON-RPC 2.0 error object (HTTP was still
+    ``200``).
+
+    Reserved for ``-32700`` parse / ``-32600`` invalid-request / ``-32601``
+    method-not-found / ``-32602`` invalid-params / ``-32603`` internal errors
+    and ``-32000`` application errors (session-not-open,
+    profile-unavailable-mid-session, ``lagged``). Distinct from
+    :class:`ApiError`, which is a pre-stream HTTP/RFC-7807 failure (e.g. auth).
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.rpc_message = message
+        super().__init__(f"JSON-RPC error {code}: {message}")
 
 
 class UnknownToolError(BaeError):

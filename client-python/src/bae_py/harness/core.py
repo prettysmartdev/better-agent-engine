@@ -7,22 +7,26 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+from typing import Awaitable, Callable, Union
+
 from ..config import Config
 from ..errors import (
     ApiError,
     HookError,
     ProvidersFailedError,
+    RpcError,
     ToolError,
     UnknownToolError,
 )
 from ..hooks import Hooks
 from ..tool import Tool, ToolRegistry
 from ..types import (
+    EventType,
     Message,
     Profile,
+    SendMessageResult,
     SessionEvent,
     ToolResultBlock,
-    parse_events,
     to_message,
 )
 from .transport import HttpxTransport, Transport, TransportResponse
@@ -138,10 +142,15 @@ class Session:
         self._hooks = hooks
         self._owns_transport = owns_transport
         self._closed = False
+        #: Monotonic JSON-RPC request id, unique per session.
+        self._rpc_id = 0
 
     async def send(self, message: "str | Message") -> Message:
-        """Send a user turn and drive the full round-trip (api-contract §6).
+        """Send a user turn and drive the full round-trip (harness loop).
 
+        Each turn is a ``session.sendMessage`` JSON-RPC call over ``…/rpc``:
+        live ``session.event`` notifications are handed to the ``on_event``
+        hook, and the terminal ``{message, events}`` result drives the loop.
         Dispatches any ``tool_use`` blocks the server returns to the registered
         handlers, sends the ``tool_result`` blocks back, and repeats until an
         assistant turn contains no tool calls — which is then returned.
@@ -149,22 +158,13 @@ class Session:
         current = to_message(message)
         while True:
             await self._run_hook("before_send", self._hooks.before_send, current)
-            resp = await self._transport.request(
-                "POST",
-                self.config.url(f"/api/v1/sessions/{self.session_id}/messages"),
-                headers=self._session_auth(),
-                json={"message": current.to_wire()},
-            )
-            body = resp.body or {}
-            if resp.status == 502:
-                raise ProvidersFailedError(
-                    Message.from_wire(body.get("message", {})),
-                    parse_events(body.get("events")),
-                )
-            _raise_for_status(resp)
 
-            self.last_events = parse_events(body.get("events"))
-            assistant = Message.from_wire(body["message"])
+            result, notifications = await self._send_message(current)
+            for event in notifications:
+                await self._run_hook("on_event", self._hooks.on_event, event)
+
+            self.last_events = result.events
+            assistant = result.message
             await self._run_hook("after_receive", self._hooks.after_receive, assistant)
 
             tool_uses = assistant.tool_uses()
@@ -181,11 +181,88 @@ class Session:
                     output = await _maybe_await(tool.handler(tu.input))
                 except Exception as exc:
                     raise ToolError(tu.name, exc) from exc
-                result = ToolResultBlock(tool_use_id=tu.id, content=output)
-                await self._run_hook("after_tool_call", self._hooks.after_tool_call, result)
-                results.append(result)
+                result_block = ToolResultBlock(tool_use_id=tu.id, content=output)
+                await self._run_hook("after_tool_call", self._hooks.after_tool_call, result_block)
+                results.append(result_block)
 
             current = Message(role="user", content=results)
+
+    async def subscribe(
+        self,
+        handler: Callable[[SessionEvent], Union[None, bool, Awaitable[Union[None, bool]]]],
+        *,
+        since_event_id: str | None = None,
+    ) -> None:
+        """Subscribe to this session's live ``session.event`` feed via
+        ``session.subscribe``, invoking ``handler`` for each event in order.
+
+        With ``since_event_id`` the server first replays persisted events after
+        that id, then streams live ones **indefinitely**. The stream is
+        open-ended: return ``False`` from ``handler`` to stop reading (dropping
+        the connection ends the subscription server-side), or call
+        :meth:`unsubscribe` from elsewhere. Returns once the stream ends.
+        """
+        params: dict[str, Any] = {} if since_event_id is None else {"since_event_id": since_event_id}
+        frames = self._transport.stream(
+            "POST",
+            self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
+            headers=self._session_auth(),
+            json=self._rpc_request("session.subscribe", params),
+        )
+        async for frame in frames:
+            _raise_for_rpc_error(frame)
+            if _is_terminal(frame):
+                break
+            event = _event_from_frame(frame)
+            if event is not None:
+                if await _maybe_await(handler(event)) is False:
+                    break
+
+    async def unsubscribe(self) -> None:
+        """End any active :meth:`subscribe` streams for this session
+        (``session.unsubscribe``)."""
+        frames = self._transport.stream(
+            "POST",
+            self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
+            headers=self._session_auth(),
+            json=self._rpc_request("session.unsubscribe", {}),
+        )
+        async for frame in frames:
+            _raise_for_rpc_error(frame)
+            if _is_terminal(frame):
+                break
+
+    async def _send_message(
+        self, message: Message
+    ) -> tuple[SendMessageResult, list[SessionEvent]]:
+        """Drive one ``session.sendMessage`` turn: stream the NDJSON reply,
+        collecting ``session.event`` notifications and resolving on the terminal
+        frame. An all-providers-failed turn raises :class:`ProvidersFailedError`;
+        a JSON-RPC error object raises :class:`RpcError`.
+        """
+        frames = self._transport.stream(
+            "POST",
+            self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
+            headers=self._session_auth(),
+            json=self._rpc_request("session.sendMessage", {"message": message.to_wire()}),
+        )
+        notifications: list[SessionEvent] = []
+        async for frame in frames:
+            if _is_terminal(frame):
+                _raise_for_rpc_error(frame)
+                result = SendMessageResult.from_wire(frame.get("result") or {})
+                if _providers_failed(result.events):
+                    raise ProvidersFailedError(result.message, result.events)
+                return result, notifications
+            _raise_for_rpc_error(frame)
+            event = _event_from_frame(frame)
+            if event is not None:
+                notifications.append(event)
+        raise RpcError(-32603, "stream ended without a terminal response")
+
+    def _rpc_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self._rpc_id += 1
+        return {"jsonrpc": "2.0", "id": self._rpc_id, "method": method, "params": params}
 
     async def close(self) -> None:
         """Close the session (DELETE) and release the owned transport, if any.
@@ -234,3 +311,38 @@ def _raise_for_status(resp: TransportResponse) -> None:
     if 200 <= resp.status < 300:
         return
     raise ApiError.from_body(resp.status, resp.body)
+
+
+def _is_terminal(frame: dict[str, Any]) -> bool:
+    """A frame carrying an ``id`` is the terminal response; else a notification."""
+    return frame.get("id") is not None
+
+
+def _raise_for_rpc_error(frame: dict[str, Any]) -> None:
+    """Raise :class:`RpcError` if a JSON-RPC frame carries an ``error`` object."""
+    err = frame.get("error")
+    if err is not None:
+        raise RpcError(int(err.get("code", -32603)), str(err.get("message", "")))
+
+
+def _event_from_frame(frame: dict[str, Any]) -> SessionEvent | None:
+    """Decode a ``session.event`` notification's ``params`` into a
+    :class:`SessionEvent`; return ``None`` for any other notification."""
+    if frame.get("method") != "session.event":
+        return None
+    params = frame.get("params")
+    if params is None:
+        return None
+    return SessionEvent.from_wire(params)
+
+
+def _providers_failed(events: list[SessionEvent]) -> bool:
+    """Does this turn's event list mark an all-providers-failed outcome? The
+    server no longer returns a 502: the failure turn arrives as a normal
+    terminal result, distinguished only by a ``session.error``/
+    ``all_providers_failed`` event."""
+    return any(
+        e.event_type == EventType.SESSION_ERROR
+        and e.payload.get("reason") == "all_providers_failed"
+        for e in events
+    )

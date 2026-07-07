@@ -14,18 +14,25 @@
 //! 4. On success, insert a `provider.response` with the raw body.
 //! 5. If the response contains tool calls, insert a `tool.call` per call.
 //!    Client-side tools (declared by the client at session open) are returned to
-//!    the client for execution and the turn pauses. MCP tools take the stub path
-//!    (`mcp.request` / `mcp.response` with `{status:"stub"}`, then `tool.result`)
-//!    and the loop continues with the stub result appended.
+//!    the client for execution and the turn pauses. MCP tools are dispatched to
+//!    the session's live MCP connections (`mcp.request` / `mcp.response` with the
+//!    real `tools/call` exchange, then `tool.result`) and the loop continues with
+//!    the real result appended. A tool the session has no MCP server for, or a
+//!    server that fails mid-turn, yields an error-shaped `tool.result` so the
+//!    model can adjust — the turn is never aborted for a tool failure.
 //! 6. On a plain (no-tool) response, insert `server.message.send` and finish.
 //!
 //! The auth token is resolved inside [`super::provider::call`] and never reaches
 //! this module, an event payload, or a log line.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
+use super::broadcast::{self, EventBroadcaster};
+use super::mcp::McpSession;
 use super::provider::{self, ProviderConfig};
 use crate::events::EventType;
 use crate::store::sessions::{self, EventRecord, SessionRecord, STATE_ERROR};
@@ -68,20 +75,27 @@ impl std::fmt::Display for TurnError {
 }
 impl std::error::Error for TurnError {}
 
-/// Append an event and return the record. Centralises the `with_conn` +
-/// error-mapping boilerplate the loop repeats.
+/// Append an event, publish it live, and return the record. Routes through the
+/// shared [`broadcast::insert_and_publish`] choke point so every event the turn
+/// logs also reaches live `session.sendMessage`/`session.subscribe` watchers,
+/// and centralises the error-mapping boilerplate the loop repeats.
 fn log_event(
     store: &Store,
+    broadcaster: &EventBroadcaster,
     session_id: &str,
     client_key_id: &str,
     event_type: EventType,
     payload: Value,
 ) -> Result<EventRecord, TurnError> {
-    store
-        .with_conn(|c| {
-            sessions::insert_event(c, session_id, Some(client_key_id), event_type, &payload)
-        })
-        .map_err(TurnError)
+    broadcast::insert_and_publish(
+        store,
+        broadcaster,
+        session_id,
+        Some(client_key_id),
+        event_type,
+        &payload,
+    )
+    .map_err(TurnError)
 }
 
 /// Run one client turn. The caller has already inserted the incoming
@@ -90,27 +104,39 @@ fn log_event(
 pub async fn run_turn(
     store: &Store,
     http: &reqwest::Client,
+    broadcaster: &EventBroadcaster,
     session: &SessionRecord,
     profile: &ProfileRecord,
+    mcp: Option<Arc<Mutex<McpSession>>>,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
     let cid = session.client_key_id.as_str();
     let mut events: Vec<EventRecord> = Vec::new();
 
-    // The client-side tools the LLM is allowed to call, and the tool-definition
-    // array we advertise to the provider.
-    let tools_value = match &session.client_tools {
-        Value::Array(_) => session.client_tools.clone(),
-        _ => json!([]),
+    // The client-side tools the LLM is allowed to call. Only these count as
+    // "client dispatch"; MCP tools (merged below) route to the MCP path.
+    let client_tools: Vec<Value> = match &session.client_tools {
+        Value::Array(a) => a.clone(),
+        _ => Vec::new(),
     };
-    let client_tool_names: HashSet<String> = tools_value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let client_tool_names: HashSet<String> = client_tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+
+    // Merge the session's MCP tool definitions (from `tools/list` at connect
+    // time) into what we advertise to the provider, and snapshot the
+    // `tool_name -> server_name` routes for dispatch and event tagging.
+    let mut advertised_tools = client_tools;
+    let mcp_routes: std::collections::HashMap<String, String> = match &mcp {
+        Some(m) => {
+            let guard = m.lock().await;
+            advertised_tools.extend(guard.tools().iter().cloned());
+            guard.routes_snapshot()
+        }
+        None => std::collections::HashMap::new(),
+    };
+    let tools_value = Value::Array(advertised_tools);
 
     // Parse provider configs. A malformed primary config is an operator error:
     // record it and end as ProvidersFailed rather than panicking.
@@ -120,6 +146,7 @@ pub async fn run_turn(
             Err(e) => {
                 events.push(log_event(
                     store,
+                    broadcaster,
                     sid,
                     cid,
                     EventType::SessionError,
@@ -144,6 +171,7 @@ pub async fn run_turn(
             let kind = if i == 0 { "primary" } else { "fallback" };
             events.push(log_event(
                 store,
+                broadcaster,
                 sid,
                 cid,
                 EventType::ProviderRequest,
@@ -163,6 +191,7 @@ pub async fn run_turn(
                 Ok(body) => {
                     events.push(log_event(
                         store,
+                        broadcaster,
                         sid,
                         cid,
                         EventType::ProviderResponse,
@@ -174,6 +203,7 @@ pub async fn run_turn(
                 Err(e) => {
                     events.push(log_event(
                         store,
+                        broadcaster,
                         sid,
                         cid,
                         EventType::ProviderResponse,
@@ -187,6 +217,7 @@ pub async fn run_turn(
                     if i == 0 {
                         events.push(log_event(
                             store,
+                            broadcaster,
                             sid,
                             cid,
                             EventType::SessionError,
@@ -202,6 +233,7 @@ pub async fn run_turn(
             None => {
                 events.push(log_event(
                     store,
+                    broadcaster,
                     sid,
                     cid,
                     EventType::SessionError,
@@ -220,6 +252,7 @@ pub async fn run_turn(
             let message = json!({ "role": "assistant", "content": content });
             events.push(log_event(
                 store,
+                broadcaster,
                 sid,
                 cid,
                 EventType::ServerMessageSend,
@@ -232,21 +265,21 @@ pub async fn run_turn(
             });
         }
 
-        // Record every tool call, tagged with how it will be dispatched.
+        // Record every tool call, tagged with how it will be dispatched. MCP
+        // calls also carry the resolved `server_name` (null if unroutable).
         for tu in &tool_uses {
             let name = tu.name.as_str();
-            let dispatch = if client_tool_names.contains(name) {
-                "client"
-            } else {
-                "mcp"
-            };
-            events.push(log_event(
-                store,
-                sid,
-                cid,
-                EventType::ToolCall,
-                json!({ "id": tu.id, "name": name, "input": tu.input, "dispatch": dispatch }),
-            )?);
+            let is_client = client_tool_names.contains(name);
+            let mut payload = json!({
+                "id": tu.id,
+                "name": name,
+                "input": tu.input,
+                "dispatch": if is_client { "client" } else { "mcp" },
+            });
+            if !is_client {
+                payload["server_name"] = json!(mcp_routes.get(name));
+            }
+            events.push(log_event(store, broadcaster, sid, cid, EventType::ToolCall, payload)?);
         }
 
         let has_client_tool = tool_uses
@@ -259,6 +292,7 @@ pub async fn run_turn(
             let message = json!({ "role": "assistant", "content": content });
             events.push(log_event(
                 store,
+                broadcaster,
                 sid,
                 cid,
                 EventType::ServerMessageSend,
@@ -271,42 +305,98 @@ pub async fn run_turn(
             });
         }
 
-        // All tool calls are MCP: run the stub path and continue the loop with
-        // the stub results appended. This assistant turn is internal (not sent
-        // to the client) so it is not persisted as server.message.send; it is
-        // kept in the in-memory history for the next provider call.
+        // All tool calls are MCP: dispatch each to the session's live MCP
+        // connections and continue the loop with the real results appended. This
+        // assistant turn is internal (not sent to the client) so it is not
+        // persisted as server.message.send; it is kept in the in-memory history
+        // for the next provider call.
         history.push(json!({ "role": "assistant", "content": content }));
         let mut result_blocks: Vec<Value> = Vec::new();
         for tu in &tool_uses {
+            let name = tu.name.as_str();
+            let server = mcp_routes.get(name).cloned();
+
             events.push(log_event(
                 store,
+                broadcaster,
                 sid,
                 cid,
                 EventType::McpRequest,
-                json!({ "status": "stub", "tool": tu.name, "input": tu.input }),
+                json!({
+                    "method": "tools/call",
+                    "server_name": server,
+                    "tool": name,
+                    "input": tu.input,
+                }),
             )?);
+
+            // Dispatch, mapping every outcome (success, missing server, or a
+            // connection that died mid-turn) to a (response payload, result
+            // content, is_error) triple. A failure is never fatal to the turn:
+            // the model sees an error result and can adjust. No reconnect.
+            let (response_payload, result_content, is_error) = match (&mcp, &server) {
+                (Some(m), Some(srv)) => match m.lock().await.call_tool(name, &tu.input).await {
+                    Ok(result) => {
+                        let is_err = result
+                            .get("isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let content = result.get("content").cloned().unwrap_or_else(|| json!([]));
+                        (
+                            json!({ "server_name": srv, "ok": !is_err, "result": result }),
+                            content,
+                            is_err,
+                        )
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        (
+                            json!({ "server_name": srv, "ok": false, "error": msg }),
+                            mcp_error_content(&e.to_string()),
+                            true,
+                        )
+                    }
+                },
+                // No MCP server is configured for this tool: the profile
+                // referenced an unconfigured/typo'd server, or the model invoked
+                // a tool that was never advertised.
+                _ => {
+                    let msg = format!("no MCP server is configured for tool '{name}'");
+                    (
+                        json!({ "server_name": server, "ok": false, "error": msg.clone() }),
+                        mcp_error_content(&msg),
+                        true,
+                    )
+                }
+            };
+
             events.push(log_event(
                 store,
+                broadcaster,
                 sid,
                 cid,
                 EventType::McpResponse,
-                json!({ "status": "stub", "tool": tu.name }),
+                response_payload,
             )?);
-            let result_content = json!([{
-                "type": "text",
-                "text": format!("MCP stub: no result available for tool '{}'", tu.name),
-            }]);
             events.push(log_event(
                 store,
+                broadcaster,
                 sid,
                 cid,
                 EventType::ToolResult,
-                json!({ "tool_use_id": tu.id, "dispatch": "mcp", "status": "stub", "content": result_content }),
+                json!({
+                    "tool_use_id": tu.id,
+                    "dispatch": "mcp",
+                    "server_name": server,
+                    "is_error": is_error,
+                    "content": result_content,
+                }),
             )?);
             result_blocks.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
                 "content": result_content,
+                "is_error": is_error,
             }));
         }
         history.push(json!({ "role": "user", "content": Value::Array(result_blocks) }));
@@ -316,6 +406,7 @@ pub async fn run_turn(
     // Exceeded the round-trip budget.
     events.push(log_event(
         store,
+        broadcaster,
         sid,
         cid,
         EventType::SessionError,
@@ -342,6 +433,12 @@ fn finish_failed(
         events,
         outcome: Outcome::ProvidersFailed,
     })
+}
+
+/// Build the error-shaped `tool_result` content for a failed MCP dispatch, so
+/// the model sees the failure as tool output rather than the turn aborting.
+fn mcp_error_content(msg: &str) -> Value {
+    json!([{ "type": "text", "text": format!("MCP error: {msg}") }])
 }
 
 /// A `tool_use` block extracted from an assistant response.

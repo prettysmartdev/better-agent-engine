@@ -14,7 +14,6 @@ Environment variables:
 - `BAE_ADMIN_ADDR` — admin-only listen address (default `127.0.0.1:8081`). Must be a loopback address — the server refuses to start otherwise, so the admin surface is never reachable off-host.
 - `BAE_DB_PATH` — SQLite database path (default `/var/lib/bae/bae.db` in the image)
 - `BAE_LOG` — tracing filter (default `info`)
-- `BAE_TLS_ENABLED` — whether an upstream proxy terminates TLS (default `false`). Informational only: the container always speaks plain HTTP internally.
 - `BAE_SHUTDOWN_TIMEOUT` — seconds to drain in-flight requests on SIGTERM before forcing shutdown (default `30`).
 - Invalid values are usage errors (exit code 2); an unwritable `BAE_DB_PATH` or an in-use admin port is a runtime error (exit code 1) reported before the server begins serving.
 - Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the environment of whichever process calls the provider.

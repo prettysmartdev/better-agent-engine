@@ -34,7 +34,8 @@ npm run example -- "What time is it?"
 
 - Exits `1` with a clear message if `BAE_CLIENT_KEY` or the provider key env var
   (named by `BAE_PROVIDER_KEY_ENV`) is unset.
-- If the server cannot reach any provider it returns `502`; the example catches
+- If the server cannot reach any provider, the `session.sendMessage` turn comes
+  back as a provider-unavailable result; the example catches
   `ProvidersFailedError`, prints the session events, and exits `1` — the usual
   cause is a missing/invalid provider key in the _server's_ environment.
 

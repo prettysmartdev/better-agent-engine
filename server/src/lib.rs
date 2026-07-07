@@ -15,13 +15,17 @@
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod config_file;
 pub mod engine;
 pub mod events;
 pub mod store;
 
 pub use config::Config;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+
+use config_file::McpServerConfig;
 
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -94,8 +98,15 @@ pub fn open_store(config: &Config) -> Result<Store, StoreError> {
 ///
 /// `store` is passed in (rather than opened here) so the caller can fail fast on
 /// database problems before we touch the network.
-pub async fn serve(config: Config, store: Store) -> Result<(), RunError> {
-    let state = AppState::new(store);
+///
+/// `mcp_registry` is the (possibly empty) set of MCP servers parsed from
+/// `bae-config.toml`; it is held in-memory on [`AppState`] and never persisted.
+pub async fn serve(
+    config: Config,
+    store: Store,
+    mcp_registry: HashMap<String, McpServerConfig>,
+) -> Result<(), RunError> {
+    let state = AppState::with_mcp_registry(store, mcp_registry);
 
     // Bind the client listener. Plain HTTP — TLS terminates upstream; this port
     // must sit behind a reverse proxy on an internal network, never exposed

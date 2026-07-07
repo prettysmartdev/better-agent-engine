@@ -211,6 +211,110 @@ def assert_never(value: NoReturn) -> NoReturn:
     raise AssertionError(f"unhandled event type: {value!r}")
 
 
+# ---------------------------------------------------------------------------
+# MCP event payloads (the real, non-stub shapes emitted by the engine)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class McpRequestPayload:
+    """Payload of an ``mcp.request`` event: the engine calling a configured
+    server. Parse it from a :class:`SessionEvent` whose ``event_type`` is
+    :attr:`EventType.MCP_REQUEST`.
+    """
+
+    method: str  # the MCP method invoked (currently always "tools/call")
+    server_name: str | None  # the server the call routed to, or None if unroutable
+    tool: str
+    input: dict[str, Any]
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "McpRequestPayload":
+        return cls(
+            method=payload.get("method", ""),
+            server_name=payload.get("server_name"),
+            tool=payload.get("tool", ""),
+            input=payload.get("input") or {},
+        )
+
+
+@dataclass(slots=True)
+class McpResponsePayload:
+    """Payload of an ``mcp.response`` event. ``ok`` discriminates success
+    (``result`` set) from failure (``error`` set). Parse it from a
+    :class:`SessionEvent` whose ``event_type`` is :attr:`EventType.MCP_RESPONSE`.
+    """
+
+    server_name: str | None
+    ok: bool
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "McpResponsePayload":
+        return cls(
+            server_name=payload.get("server_name"),
+            ok=bool(payload.get("ok")),
+            result=payload.get("result"),
+            error=payload.get("error"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC 2.0 envelopes for the session loop (`POST …/rpc`)
+#
+# The management routes (session open/close, events replay) stay plain REST;
+# only the message loop is JSON-RPC. A request is POSTed to
+# ``POST /api/v1/sessions/{id}/rpc`` and the reply is an ``application/x-ndjson``
+# stream of these envelopes: a frame with no ``id`` is a notification (its
+# ``params`` carry a ``session.event``); the frame carrying the request ``id``
+# is the terminal response (``result`` on success, ``error`` on failure).
+# ---------------------------------------------------------------------------
+
+# The JSON-RPC methods the session loop understands.
+RPC_METHODS = ("session.sendMessage", "session.subscribe", "session.unsubscribe")
+
+
+@dataclass(slots=True)
+class JsonRpcError:
+    """A JSON-RPC 2.0 error object (terminal, or a mid-stream notice)."""
+
+    code: int
+    message: str
+    data: Any = None
+
+
+@dataclass(slots=True)
+class JsonRpcRequest:
+    """A JSON-RPC 2.0 request envelope."""
+
+    id: int
+    method: str
+    params: dict[str, Any]
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": self.id, "method": self.method, "params": self.params}
+
+
+@dataclass(slots=True)
+class SendMessageResult:
+    """The terminal ``result`` of a ``session.sendMessage`` call — the same
+    ``{message, events}`` body the legacy synchronous message route returned.
+    ``events`` is the full turn event list; the live ``session.event``
+    notifications are an additive, filtered subset of it.
+    """
+
+    message: Message
+    events: list[SessionEvent]
+
+    @classmethod
+    def from_wire(cls, raw: dict[str, Any]) -> "SendMessageResult":
+        return cls(
+            message=Message.from_wire(raw.get("message") or {}),
+            events=parse_events(raw.get("events")),
+        )
+
+
 def describe_event(event: SessionEvent) -> str:
     """One-line human description of an event.
 
@@ -234,9 +338,11 @@ def describe_event(event: SessionEvent) -> str:
         case EventType.TOOL_RESULT:
             return f"tool result ({event.payload.get('dispatch')})"
         case EventType.MCP_REQUEST:
-            return f"MCP request: {event.payload.get('tool')}"
+            server = event.payload.get("server_name") or "<unrouted>"
+            return f"MCP request: {event.payload.get('tool')} → {server}"
         case EventType.MCP_RESPONSE:
-            return f"MCP response: {event.payload.get('tool')}"
+            server = event.payload.get("server_name") or "<unrouted>"
+            return f"MCP response from {server} (ok={event.payload.get('ok')})"
         case EventType.SESSION_OPEN:
             return "session opened"
         case EventType.SESSION_CLOSE:

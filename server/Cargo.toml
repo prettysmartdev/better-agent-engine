@@ -9,13 +9,16 @@ publish = false
 [dependencies]
 # HTTP server and async runtime.
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "process", "io-util"] }
 # SQLite storage. `bundled` compiles SQLite into the binary so the production
 # image needs no system libsqlite3 (keeps the slim runtime base dependency-free).
 rusqlite = { version = "0.32", features = ["bundled"] }
 # API (de)serialization.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `bae-config.toml` parsing (optional MCP server registry). Loaded separately
+# from the `BAE_*` env config; absent file is not an error.
+toml = "0.8"
 # Structured logging to stderr.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -30,6 +33,10 @@ subtle = "2"
 # OpenSSL; `json` gives typed request/response bodies. Points at whatever
 # `base_url` a profile declares, so tests can target a local mock HTTP server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Stream adapter for the `POST /api/v1/sessions/{id}/rpc` NDJSON response body
+# (JSON-RPC session loop). Already in the dependency graph via reqwest/axum, so
+# no extra download; only `stream::unfold` + the `Stream` trait are used.
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 # Integration tests boot the real routers on ephemeral ports and drive them over
@@ -40,3 +47,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 axum = "0.8"
 serde_json = "1"
+# The MCP integration tests capture the server's `tracing` output to assert the
+# "configured MCP server not found" error is logged per session creation (never
+# deduplicated). Both are already in the main dependency graph (and Cargo.lock),
+# so the test build stays offline with no extra downloads.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

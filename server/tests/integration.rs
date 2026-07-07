@@ -14,15 +14,22 @@
 //!   by active keys, list pagination cursors;
 //! - the full session lifecycle with the exact ordered event sequence and replay;
 //! - auth rejection cases;
-//! - provider fallback (failure + success), all-providers-failed (502), and a
-//!   missing-env-var provider failure;
+//! - provider fallback (failure + success), all-providers-failed (delivered as a
+//!   terminal `result` on the 200 NDJSON stream, not a 502), and a missing-env-var
+//!   provider failure;
 //! - client-side and MCP tool dispatch round trips;
 //! - the tool allowlist;
-//! - the revoke cascade invalidating a live session.
+//! - the revoke cascade invalidating a live session;
+//! - the JSON-RPC `/rpc` session loop: envelope error codes, live `session.event`
+//!   notification delivery on `session.sendMessage`, `session.subscribe` live +
+//!   `since_event_id` resume, and real (non-stub) MCP round trips with a local
+//!   stdio fixture MCP server (`tests/fixtures/mcp_echo_server.py`).
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
 use axum::extract::Request;
@@ -31,8 +38,10 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use reqwest::Method;
 use serde_json::{json, Value};
+use tracing_subscriber::fmt::MakeWriter;
 
 use baesrv::api::AppState;
+use baesrv::config_file::{BaeConfigFile, McpServerConfig};
 use baesrv::store::{generate_id, Store};
 
 // ---------------------------------------------------------------------------
@@ -134,13 +143,23 @@ impl Drop for TestServer {
 /// Boot the real routers on an ephemeral client/admin port pair with a fresh
 /// temp-file database, exactly as `baesrv::serve` would (minus signal handling).
 async fn start_server() -> TestServer {
+    start_server_with_registry(std::collections::HashMap::new()).await
+}
+
+/// Like [`start_server`], but with a preloaded MCP server registry (as
+/// `bae-config.toml` would supply at startup). Used by the MCP integration
+/// tests, which build the registry from a fixture `bae-config.toml` through the
+/// real loader.
+async fn start_server_with_registry(
+    registry: std::collections::HashMap<String, baesrv::config_file::McpServerConfig>,
+) -> TestServer {
     let dir = std::env::temp_dir().join(format!("baesrv-it-{}", generate_id("")));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("test.db");
 
     // A real file-backed store exercises the migration runner on a fresh DB.
     let store = Store::open(&db_path).expect("open temp store");
-    let state = AppState::new(store);
+    let state = AppState::with_mcp_registry(store, registry);
 
     let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -253,6 +272,64 @@ impl TestServer {
     async fn client_get(&self, path: &str, token: Option<&str>) -> (u16, Value, String) {
         self.send(Method::GET, format!("{}{path}", self.client), token, None)
             .await
+    }
+
+    /// Drive the JSON-RPC `session.sendMessage` method on
+    /// `POST /api/v1/sessions/{id}/rpc` (the replacement for the removed
+    /// `POST /messages` route). `message` is the inner message object
+    /// (`{role?, content}`).
+    ///
+    /// Returns `(http_status, value, raw)`. On a non-200 (auth failure, an RFC
+    /// 7807 body) `value` is the parsed body. On 200 the response is the NDJSON
+    /// JSON-RPC stream: `value` is the terminal response's `result`
+    /// (`{message, events}`, the same shape the old route returned), or the whole
+    /// terminal object when it is a JSON-RPC error.
+    async fn send_message(
+        &self,
+        session_id: &str,
+        token: &str,
+        message: Value,
+    ) -> (u16, Value, String) {
+        let url = format!("{}/api/v1/sessions/{session_id}/rpc", self.client);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session.sendMessage",
+            "params": { "message": message },
+        });
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .expect("rpc send");
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            let v = serde_json::from_str(&text).unwrap_or(Value::Null);
+            return (status, v, text);
+        }
+        // NDJSON: the terminal object is the one carrying the request id.
+        let mut terminal = Value::Null;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let obj: Value = match serde_json::from_str(line) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            if obj.get("id").and_then(Value::as_i64) == Some(1) {
+                terminal = obj;
+            }
+        }
+        let out = terminal
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| terminal.clone());
+        (status, out, text)
     }
     async fn client_delete(&self, path: &str, token: Option<&str>) -> (u16, Value, String) {
         self.send(
@@ -522,10 +599,10 @@ async fn session_lifecycle_exact_event_sequence_and_replay() {
 
     // Send one text turn.
     let (status, resp, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "role": "user", "content": "hello" } }),
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "role": "user", "content": "hello" }),
         )
         .await;
     assert_eq!(status, 200, "messages: {raw}");
@@ -634,24 +711,17 @@ async fn auth_rejection_cases() {
     let (session1, session1_key, _) = ts.open_session(&client_key, json!([])).await;
     let (_session2, session2_key, _) = ts.open_session(&client_key, json!([])).await;
 
-    // A wholly bogus session key → 401.
+    // A wholly bogus session key → 401 (auth is a transport gate on /rpc, before
+    // the JSON-RPC stream is opened).
     let (status, _v, _raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session1}/messages"),
-            Some("bae_ses_bogus"),
-            json!({ "message": { "content": "hi" } }),
-        )
+        .send_message(&session1, "bae_ses_bogus", json!({ "content": "hi" }))
         .await;
     assert_eq!(status, 401, "bogus session key");
 
     // A *valid* session key used on the wrong session → 401 (the lookup is
     // scoped to the session id, so a mismatched key finds no row).
     let (status, _v, _raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session1}/messages"),
-            Some(&session2_key),
-            json!({ "message": { "content": "hi" } }),
-        )
+        .send_message(&session1, &session2_key, json!({ "content": "hi" }))
         .await;
     assert_eq!(status, 401, "session key on wrong session");
     let (status, _v, _raw) = ts
@@ -718,11 +788,7 @@ async fn provider_fallback_failure_then_success() {
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
     let (status, resp, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": "hello" } }),
-        )
+        .send_message(&session_id, &session_key, json!({ "content": "hello" }))
         .await;
     assert_eq!(status, 200, "fallback should succeed: {raw}");
     assert_eq!(
@@ -762,7 +828,7 @@ async fn provider_fallback_failure_then_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn all_providers_failed_returns_502() {
+async fn all_providers_failed_returns_terminal_result_then_rejects() {
     let ts = start_server().await;
     let mock = start_mock().await;
     let primary = format!("{mock}/fail");
@@ -772,27 +838,26 @@ async fn all_providers_failed_returns_502() {
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
     let (status, resp, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": "hello" } }),
-        )
+        .send_message(&session_id, &session_key, json!({ "content": "hello" }))
         .await;
-    // 502 with the normal {message, events} body (NOT a problem doc).
-    assert_eq!(status, 502, "all providers failed: {raw}");
-    assert!(resp["message"].is_object());
+    // On /rpc the HTTP stream is 200; the provider failure rides in the terminal
+    // response's result (message + events), session moved to error state.
+    assert_eq!(status, 200, "rpc stream opens: {raw}");
+    assert!(resp["message"].is_object(), "terminal result carries a message: {raw}");
     let types = event_types(&resp["events"]);
     assert!(types.contains(&"provider.response".to_string()));
     assert!(types.contains(&"session.error".to_string()));
-    // The session is now in error state → further sends are a conflict.
-    let (status, _v, _raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": "again" } }),
-        )
+    // The session is now in error state → a further sendMessage is refused with a
+    // JSON-RPC error object (code -32000) in the stream, not a new turn.
+    let (status, again, raw) = ts
+        .send_message(&session_id, &session_key, json!({ "content": "again" }))
         .await;
-    assert_eq!(status, 409, "error-state session rejects new turns");
+    assert_eq!(status, 200, "rpc stream opens even when refusing: {raw}");
+    assert_eq!(
+        again["error"]["code"],
+        json!(-32000),
+        "error-state session rejects new turns: {raw}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -816,15 +881,12 @@ async fn provider_missing_env_var_fails_with_traced_response() {
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
     let (status, resp, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": "hello" } }),
-        )
+        .send_message(&session_id, &session_key, json!({ "content": "hello" }))
         .await;
+    // The provider failure now rides in the 200 NDJSON stream's terminal result.
     assert_eq!(
-        status, 502,
-        "missing env var should fail the provider: {raw}"
+        status, 200,
+        "rpc stream opens even on provider failure: {raw}"
     );
     let failure = resp["events"]
         .as_array()
@@ -866,11 +928,7 @@ async fn client_side_tool_dispatch_round_trip() {
     // First turn: the provider asks for a client-side tool; the loop pauses and
     // hands the tool_use back to the harness.
     let (status, first, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": "what time is it?" } }),
-        )
+        .send_message(&session_id, &session_key, json!({ "content": "what time is it?" }))
         .await;
     assert_eq!(status, 200, "first turn: {raw}");
     let tool_use = first["message"]["content"]
@@ -894,14 +952,14 @@ async fn client_side_tool_dispatch_round_trip() {
     // The harness runs the tool and returns its result.
     let tool_use_id = tool_use["id"].as_str().unwrap();
     let (status, second, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": [{
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": [{
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": "12:00 UTC",
-            }] } }),
+            }] }),
         )
         .await;
     assert_eq!(status, 200, "second turn: {raw}");
@@ -937,11 +995,7 @@ async fn mcp_tool_dispatch_round_trip() {
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
     let (status, resp, raw) = ts
-        .client_post(
-            &format!("/api/v1/sessions/{session_id}/messages"),
-            Some(&session_key),
-            json!({ "message": { "content": "search please" } }),
-        )
+        .send_message(&session_id, &session_key, json!({ "content": "search please" }))
         .await;
     assert_eq!(status, 200, "mcp turn: {raw}");
     assert_eq!(
@@ -1059,4 +1113,732 @@ async fn revoke_client_key_invalidates_live_session() {
         )
         .await;
     assert_eq!(status, 401, "revoked cascade invalidates the session key");
+}
+
+// ===========================================================================
+// JSON-RPC session loop (`POST /api/v1/sessions/{id}/rpc`) + MCP round trips
+// ===========================================================================
+
+/// When to stop reading a `session.subscribe` stream in [`TestServer::subscribe_collect`].
+enum StopWhen {
+    /// Stop after the first `session.event` whose `event_type` matches.
+    EventType(String),
+    /// Stop after the first `session.event` whose event `id` matches (unique, so
+    /// deterministic — used to catch up to a known last persisted event).
+    EventId(String),
+}
+
+impl TestServer {
+    /// Create a profile bound to `base_url` with an explicit `mcp_servers` list.
+    async fn create_profile_with_mcp(
+        &self,
+        base_url: &str,
+        mcp_servers: Value,
+        allowed_tools: Value,
+    ) -> String {
+        let body = json!({
+            "name": format!("profile-{}", generate_id("")),
+            "provider_config": {
+                "provider": "anthropic",
+                "base_url": base_url,
+                "model": "claude-mock-1",
+                "auth_token": "test-token",
+            },
+            "fallback_configs": [],
+            "mcp_servers": mcp_servers,
+            "allowed_tools": allowed_tools,
+        });
+        let (status, v, raw) = self.admin_post("/admin/v1/profiles", body).await;
+        assert_eq!(status, 201, "create profile (mcp) failed: {raw}");
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    /// POST a raw body to `/rpc` and return `(status, frames, raw_text)`, where
+    /// `frames` is every non-empty NDJSON line parsed as JSON. Suitable for
+    /// methods that terminate (sendMessage, unsubscribe, envelope errors); NOT
+    /// for an open-ended `session.subscribe` (use [`Self::subscribe_collect`]).
+    async fn rpc_raw(&self, session_id: &str, token: &str, body: String) -> (u16, Vec<Value>, String) {
+        let url = format!("{}/api/v1/sessions/{session_id}/rpc", self.client);
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("rpc send");
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let frames = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+        (status, frames, text)
+    }
+
+    /// [`Self::rpc_raw`] with a JSON `Value` body.
+    async fn rpc(&self, session_id: &str, token: &str, body: Value) -> (u16, Vec<Value>, String) {
+        self.rpc_raw(session_id, token, serde_json::to_string(&body).unwrap())
+            .await
+    }
+
+    /// Open a `session.subscribe` stream and collect frames until one satisfies
+    /// `stop` or `timeout` elapses (returns whatever was collected on timeout).
+    /// Dropping the response on return ends the subscription server-side.
+    async fn subscribe_collect(
+        &self,
+        session_id: &str,
+        token: &str,
+        since_event_id: Option<&str>,
+        stop: StopWhen,
+        timeout: Duration,
+    ) -> Vec<Value> {
+        let url = format!("{}/api/v1/sessions/{session_id}/rpc", self.client);
+        let params = match since_event_id {
+            Some(s) => json!({ "since_event_id": s }),
+            None => json!({}),
+        };
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session.subscribe",
+            "params": params,
+        });
+        let mut resp = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .expect("subscribe send");
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut frames: Vec<Value> = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let chunk = match tokio::time::timeout(deadline - now, resp.chunk()).await {
+                Ok(Ok(Some(c))) => c,
+                // timeout, clean end, or transport error
+                _ => break,
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = &line[..line.len() - 1];
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_slice::<Value>(line) else {
+                    continue;
+                };
+                let matched = match &stop {
+                    StopWhen::EventType(t) => v["params"]["event_type"] == json!(t),
+                    StopWhen::EventId(id) => v["params"]["id"] == json!(id),
+                };
+                frames.push(v);
+                if matched {
+                    return frames;
+                }
+            }
+        }
+        frames
+    }
+}
+
+/// The ordered `event_type` list of the `session.event` notifications in a frame
+/// list (ignoring the terminal result/error).
+fn notification_event_types(frames: &[Value]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|f| f["method"] == json!("session.event"))
+        .map(|f| f["params"]["event_type"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+/// The ordered event `id` list of the `session.event` notifications in a frame list.
+fn notification_event_ids(frames: &[Value]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|f| f["method"] == json!("session.event"))
+        .map(|f| f["params"]["id"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+/// The first JSON-RPC error code among a frame list, if any.
+fn rpc_error_code(frames: &[Value]) -> Option<i64> {
+    frames
+        .iter()
+        .find_map(|f| f.get("error").and_then(|e| e.get("code")).and_then(Value::as_i64))
+}
+
+/// Frames that are terminal responses (carry `result` or `error`).
+fn terminal_frames(frames: &[Value]) -> Vec<&Value> {
+    frames
+        .iter()
+        .filter(|f| f.get("result").is_some() || f.get("error").is_some())
+        .collect()
+}
+
+/// Absolute path to a file under `tests/fixtures/`.
+fn fixture(name: &str) -> String {
+    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Build an MCP registry from a `bae-config.toml` string through the **real**
+/// loader + validator, exactly as startup would.
+fn registry_from_toml(toml: &str) -> HashMap<String, McpServerConfig> {
+    let dir = std::env::temp_dir().join(format!("baecfg-{}", generate_id("")));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bae-config.toml");
+    std::fs::write(&path, toml).unwrap();
+    let cfg = BaeConfigFile::load(Some(&path)).expect("load bae-config.toml");
+    let reg = cfg.mcp_registry().expect("build registry");
+    let _ = std::fs::remove_dir_all(&dir);
+    reg
+}
+
+/// A registry with one stdio server (`name`) backed by the echo fixture. If
+/// `pidfile` is given, the fixture is told to record its PID there.
+fn echo_registry(name: &str, pidfile: Option<&str>) -> HashMap<String, McpServerConfig> {
+    let fixture_path = fixture("mcp_echo_server.py");
+    let args = match pidfile {
+        Some(pf) => format!("[{fixture_path:?}, {pf:?}]"),
+        None => format!("[{fixture_path:?}]"),
+    };
+    registry_from_toml(&format!(
+        "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = {args}\n"
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Log capture (for the "not found is logged every session" assertion)
+// ---------------------------------------------------------------------------
+
+/// A `tracing` writer that appends formatted log lines to a shared buffer.
+#[derive(Clone)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install (once for the whole test binary) a global `tracing` subscriber that
+/// captures `baesrv` error logs into a shared buffer, and return that buffer.
+/// Every test shares it, so tests asserting on it use unique server names and
+/// filter by them.
+fn log_capture() -> Arc<Mutex<Vec<u8>>> {
+    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    static INIT: Once = Once::new();
+    let buf = BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone();
+    INIT.call_once(|| {
+        let writer = CaptureWriter(buf.clone());
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("baesrv=error"))
+            .with_writer(writer)
+            .with_ansi(false)
+            .without_time()
+            .try_init();
+    });
+    buf
+}
+
+fn captured_text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC envelope handling
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jsonrpc_envelope_error_codes() {
+    let ts = start_server().await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/text");
+    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    // Malformed JSON → -32700.
+    let (status, frames, raw) = ts.rpc_raw(&sid, &key, "{ not json".into()).await;
+    assert_eq!(status, 200, "envelope errors ride the 200 stream: {raw}");
+    assert_eq!(rpc_error_code(&frames), Some(-32700), "parse error: {raw}");
+
+    // Well-formed JSON that is not a request object → -32600.
+    let (_s, frames, raw) = ts.rpc_raw(&sid, &key, "123".into()).await;
+    assert_eq!(rpc_error_code(&frames), Some(-32600), "non-object: {raw}");
+
+    // A batch (array) request → -32600.
+    let batch = json!([{ "jsonrpc": "2.0", "id": 1, "method": "session.unsubscribe" }]);
+    let (_s, frames, raw) = ts.rpc(&sid, &key, batch).await;
+    assert_eq!(rpc_error_code(&frames), Some(-32600), "batch: {raw}");
+
+    // Missing/!2.0 `jsonrpc` version → -32600.
+    let (_s, frames, raw) = ts
+        .rpc(&sid, &key, json!({ "id": 1, "method": "session.unsubscribe" }))
+        .await;
+    assert_eq!(rpc_error_code(&frames), Some(-32600), "missing jsonrpc: {raw}");
+
+    // Missing `method` → -32600.
+    let (_s, frames, raw) = ts.rpc(&sid, &key, json!({ "jsonrpc": "2.0", "id": 1 })).await;
+    assert_eq!(rpc_error_code(&frames), Some(-32600), "missing method: {raw}");
+
+    // Unknown `method` → -32601, and the response echoes the request id.
+    let (_s, frames, raw) = ts
+        .rpc(
+            &sid,
+            &key,
+            json!({ "jsonrpc": "2.0", "id": 42, "method": "no.such.method", "params": {} }),
+        )
+        .await;
+    assert_eq!(rpc_error_code(&frames), Some(-32601), "unknown method: {raw}");
+    let terminals = terminal_frames(&frames);
+    assert_eq!(terminals.len(), 1, "exactly one response for an id'd request: {raw}");
+    assert_eq!(terminals[0]["id"], json!(42), "response echoes the request id: {raw}");
+
+    // Known method, missing required `params.message` → -32602.
+    let (_s, frames, raw) = ts
+        .rpc(
+            &sid,
+            &key,
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "session.sendMessage", "params": {} }),
+        )
+        .await;
+    assert_eq!(rpc_error_code(&frames), Some(-32602), "missing message param: {raw}");
+
+    // Known method, `params.message` present but the wrong shape → -32602.
+    let (_s, frames, raw) = ts
+        .rpc(
+            &sid,
+            &key,
+            json!({ "jsonrpc": "2.0", "id": 6, "method": "session.sendMessage",
+                    "params": { "message": 5 } }),
+        )
+        .await;
+    assert_eq!(rpc_error_code(&frames), Some(-32602), "invalid message param: {raw}");
+
+    // NOTIFICATION SEMANTICS: an object with no `id` is a JSON-RPC notification.
+    // The server performs the method's side effect (here, cancelling any active
+    // subscriptions) but MUST NOT send a response — no result, no error frame.
+    let (status, frames, raw) = ts
+        .rpc(&sid, &key, json!({ "jsonrpc": "2.0", "method": "session.unsubscribe" }))
+        .await;
+    assert_eq!(status, 200, "notification still opens the 200 stream: {raw}");
+    let terminals = terminal_frames(&frames);
+    assert!(
+        terminals.is_empty(),
+        "a no-id request (notification) gets no response frame: {raw}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// session.sendMessage live notification delivery
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_message_streams_events_then_one_terminal() {
+    let ts = start_server().await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/text");
+    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    let (status, frames, raw) = ts
+        .rpc(
+            &sid,
+            &key,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "session.sendMessage",
+                    "params": { "message": { "role": "user", "content": "hello" } } }),
+        )
+        .await;
+    assert_eq!(status, 200, "rpc stream: {raw}");
+
+    // The live notifications, in order, exclude the client's own
+    // client.message.send (a client-authored event is never echoed back).
+    assert_eq!(
+        notification_event_types(&frames),
+        vec!["provider.request", "provider.response", "server.message.send"],
+        "live notifications in order, client-authored events excluded: {raw}"
+    );
+
+    // Exactly one terminal response, carrying the request id and the full
+    // `{message, events}` body — where `events` still includes the filtered
+    // client.message.send (nothing is lost for a caller that ignores the feed).
+    let terminals = terminal_frames(&frames);
+    assert_eq!(terminals.len(), 1, "exactly one terminal response: {raw}");
+    let terminal = terminals[0];
+    assert_eq!(terminal["id"], json!(1));
+    assert_eq!(terminal["result"]["message"]["role"], json!("assistant"));
+    let result_types = event_types(&terminal["result"]["events"]);
+    assert!(
+        result_types.contains(&"client.message.send".to_string()),
+        "terminal result.events retains the full turn including client.message.send: {result_types:?}"
+    );
+    // The terminal is the last frame (notifications precede it).
+    assert!(
+        frames.last().unwrap().get("result").is_some(),
+        "terminal response comes after all notifications: {raw}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// session.subscribe — live delivery from a second connection
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_receives_live_turn_events_from_a_second_connection() {
+    let ts = start_server().await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/text");
+    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    // One connection subscribes; a second drives a turn with the same session
+    // key. The subscribe future and the (delayed) send future run concurrently
+    // on this task — the send waits briefly so the subscribe is live first.
+    let subscriber = ts.subscribe_collect(
+        &sid,
+        &key,
+        None,
+        StopWhen::EventType("server.message.send".into()),
+        Duration::from_secs(5),
+    );
+    let driver = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        ts.send_message(&sid, &key, json!({ "role": "user", "content": "hi" }))
+            .await
+    };
+    let (frames, (send_status, _res, _raw)) = tokio::join!(subscriber, driver);
+    assert_eq!(send_status, 200, "the driving sendMessage succeeded");
+
+    // The subscribe feed carries the same live, ordered, client-filtered events.
+    assert_eq!(
+        notification_event_types(&frames),
+        vec!["provider.request", "provider.response", "server.message.send"],
+        "subscribe delivered the turn's events in order, client-authored events excluded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// session.subscribe — resume via since_event_id
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_resume_replays_after_since_event_id_without_gap_or_dup() {
+    let ts = start_server().await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/text");
+    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    // Persist two turns' worth of events.
+    let (s1, _r1, _raw1) = ts.send_message(&sid, &key, json!({ "content": "one" })).await;
+    assert_eq!(s1, 200);
+    let (s2, _r2, _raw2) = ts.send_message(&sid, &key, json!({ "content": "two" })).await;
+    assert_eq!(s2, 200);
+
+    // The authoritative, ordered, *unfiltered* history (replay is unfiltered too,
+    // matching this — the documented replay/live seam).
+    let (_s, events, _raw) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&key))
+        .await;
+    let items = events["items"].as_array().unwrap();
+    assert!(items.len() >= 6, "expected several persisted events: {items:?}");
+    let ids: Vec<String> = items
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+
+    // Reconnect mid-history: resume after the 3rd event.
+    let since = &ids[2];
+    let last_id = ids.last().unwrap().clone();
+    let expected_after: Vec<String> = ids[3..].to_vec();
+
+    let frames = ts
+        .subscribe_collect(
+            &sid,
+            &key,
+            Some(since),
+            StopWhen::EventId(last_id.clone()),
+            Duration::from_secs(5),
+        )
+        .await;
+    let got = notification_event_ids(&frames);
+
+    // No missed events, no duplicates, exactly the tail after `since`.
+    assert_eq!(got, expected_after, "replay covers exactly the events after since_event_id");
+    let mut unique = got.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), got.len(), "no duplicate events in the resume replay");
+}
+
+// ---------------------------------------------------------------------------
+// MCP round trip — real (non-stub) payloads via a local stdio fixture server
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_round_trip_emits_real_payloads() {
+    let ts = start_server_with_registry(echo_registry("echo", None)).await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/mcp");
+
+    // The profile opts into the "echo" MCP server; the client declares no tools,
+    // so the provider's tool_use for `remote_search` is dispatched to MCP.
+    let profile_id = ts
+        .create_profile_with_mcp(&base, json!(["echo"]), json!([]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    let (status, resp, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "search please" }))
+        .await;
+    assert_eq!(status, 200, "mcp turn: {raw}");
+    assert_eq!(resp["message"]["content"][0]["text"], json!("after mcp stub"));
+
+    let evs = resp["events"].as_array().unwrap();
+    let find = |t: &str| -> Value {
+        evs.iter()
+            .find(|e| e["event_type"] == json!(t))
+            .unwrap_or_else(|| panic!("missing {t} event: {raw}"))
+            .clone()
+    };
+
+    // Real mcp.request — routed to the named server, carrying the tool + input.
+    let req = find("mcp.request");
+    assert_eq!(req["payload"]["method"], json!("tools/call"));
+    assert_eq!(req["payload"]["server_name"], json!("echo"));
+    assert_eq!(req["payload"]["tool"], json!("remote_search"));
+    assert_eq!(req["payload"]["input"], json!({ "q": "x" }));
+
+    // Real mcp.response — non-stub result content produced by the fixture.
+    let res = find("mcp.response");
+    assert_eq!(res["payload"]["server_name"], json!("echo"));
+    assert_eq!(res["payload"]["ok"], json!(true));
+    assert_eq!(
+        res["payload"]["result"]["content"][0]["text"],
+        json!("echo: x"),
+        "the fixture's real tool result flows through: {raw}"
+    );
+
+    // Real tool.result — mcp dispatch, not an error, carrying the real content.
+    let tr = find("tool.result");
+    assert_eq!(tr["payload"]["dispatch"], json!("mcp"));
+    assert_eq!(tr["payload"]["server_name"], json!("echo"));
+    assert_eq!(tr["payload"]["is_error"], json!(false));
+    assert_eq!(tr["payload"]["content"][0]["text"], json!("echo: x"));
+
+    // No trace of the removed stub payload shape (`{"status":"stub", ...}`)
+    // anywhere in the turn. (The mock's final text happens to read "after mcp
+    // stub", so we match the exact old marker, not the bare word.)
+    assert!(
+        !resp.to_string().contains("\"status\":\"stub\""),
+        "the removed stub payload shape must not appear: {raw}"
+    );
+
+    let (status, _v, _raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&key))
+        .await;
+    assert_eq!(status, 200, "close tears down the MCP subprocess");
+}
+
+// ---------------------------------------------------------------------------
+// Invalid MCP server name — logged every session creation (not deduplicated)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_mcp_name_logged_on_every_session_while_valid_connects() {
+    // Install the log capture BEFORE the server starts so its errors are caught.
+    let logs = log_capture();
+    let ts = start_server_with_registry(echo_registry("echo", None)).await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/mcp");
+
+    // A unique missing name so this test's log lines are unambiguous in the
+    // shared capture buffer.
+    let ghost = format!("ghost-{}", generate_id(""));
+    let profile_id = ts
+        .create_profile_with_mcp(&base, json!(["echo", ghost]), json!([]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+
+    // Two separate sessions against the same profile. For each, drive an MCP turn
+    // and assert the valid "echo" server connected (real, ok:true mcp.response).
+    for attempt in 0..2 {
+        let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+        let (status, resp, raw) = ts
+            .send_message(&sid, &key, json!({ "content": "search please" }))
+            .await;
+        assert_eq!(status, 200, "attempt {attempt}: {raw}");
+        let res = resp["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event_type"] == json!("mcp.response"))
+            .unwrap_or_else(|| panic!("attempt {attempt} missing mcp.response: {raw}"));
+        assert_eq!(res["payload"]["server_name"], json!("echo"), "attempt {attempt}");
+        assert_eq!(res["payload"]["ok"], json!(true), "attempt {attempt}: echo connected");
+        let _ = ts
+            .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&key))
+            .await;
+    }
+
+    // The "not found" error was logged for the ghost name on BOTH creations —
+    // exactly twice, i.e. never deduplicated/cached across sessions.
+    let text = captured_text(&logs);
+    let not_found_lines = text
+        .lines()
+        .filter(|l| l.contains(&ghost) && l.contains("not found"))
+        .count();
+    assert_eq!(
+        not_found_lines, 2,
+        "the missing MCP server must be logged on every session creation (found {not_found_lines}):\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP connection failure is non-fatal
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_connection_failure_is_non_fatal() {
+    let logs = log_capture();
+    // A stdio server whose command does not exist — connect will fail.
+    let bad = format!("broken-{}", generate_id(""));
+    let registry = registry_from_toml(&format!(
+        "[[mcp.servers]]\nname = {bad:?}\ntransport = \"stdio\"\ncommand = \"baesrv-no-such-binary-xyzzy\"\n"
+    ));
+    let ts = start_server_with_registry(registry).await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/mcp");
+
+    let profile_id = ts
+        .create_profile_with_mcp(&base, json!([bad]), json!([]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+
+    // Session creation still succeeds despite the unreachable server.
+    let (status, v, raw) = ts
+        .client_post(
+            "/api/v1/sessions",
+            Some(&client_key),
+            json!({ "tools": [] }),
+        )
+        .await;
+    assert_eq!(status, 201, "connect failure must not fail session creation: {raw}");
+    let sid = v["session_id"].as_str().unwrap().to_string();
+    let key = v["session_key"].as_str().unwrap().to_string();
+
+    // The failing server is absent from the session's tools: the provider's
+    // tool_use for `remote_search` has no MCP server to route to, so the turn
+    // still completes with an error-shaped (non-fatal) tool.result.
+    let (status, resp, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "search please" }))
+        .await;
+    assert_eq!(status, 200, "turn completes despite absent tool: {raw}");
+    let tr = resp["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.result"))
+        .expect("a tool.result event");
+    assert_eq!(tr["payload"]["is_error"], json!(true), "absent server → error result");
+
+    // And the connect failure was logged.
+    let text = captured_text(&logs);
+    assert!(
+        text.lines().any(|l| l.contains(&bad) && l.contains("failed to connect")),
+        "the connect failure must be logged for {bad}:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup on session close — spawned MCP subprocess is terminated
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_close_terminates_spawned_mcp_subprocess() {
+    // The fixture records its PID so we can confirm the subprocess is reaped.
+    let pid_dir = std::env::temp_dir().join(format!("baepid-{}", generate_id("")));
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    let pidfile = pid_dir.join("mcp.pid");
+    let pidfile_str = pidfile.to_str().unwrap().to_string();
+
+    let ts = start_server_with_registry(echo_registry("echo", Some(&pidfile_str))).await;
+    let mock = start_mock().await;
+    let base = format!("{mock}/text");
+
+    let profile_id = ts
+        .create_profile_with_mcp(&base, json!(["echo"]), json!([]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    // The fixture writes its PID at startup; wait for it, then confirm alive.
+    let pid = read_pid(&pidfile).await.expect("fixture wrote its PID");
+    assert!(proc_exists(pid), "MCP subprocess {pid} should be running while the session is open");
+
+    // Closing the session tears the subprocess down.
+    let (status, _v, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&key))
+        .await;
+    assert_eq!(status, 200, "close: {raw}");
+
+    // The spawned subprocess is terminated (poll for reaping).
+    let mut terminated = false;
+    for _ in 0..100 {
+        if !proc_exists(pid) {
+            terminated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(terminated, "MCP subprocess {pid} must be terminated after DELETE");
+
+    let _ = std::fs::remove_dir_all(&pid_dir);
+    // (The broadcast-registry-entry removal on close is covered directly by the
+    // `broadcast::tests::remove_closes_receivers` unit test.)
+}
+
+/// Poll `pidfile` until it holds a parseable PID (or give up after ~2s).
+async fn read_pid(pidfile: &std::path::Path) -> Option<u32> {
+    for _ in 0..40 {
+        if let Ok(s) = std::fs::read_to_string(pidfile) {
+            if let Ok(pid) = s.trim().parse::<u32>() {
+                return Some(pid);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// Whether a process with `pid` currently exists (Linux `/proc` check — the test
+/// container is Linux, matching the deployment target).
+fn proc_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }

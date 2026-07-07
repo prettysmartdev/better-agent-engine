@@ -1,4 +1,4 @@
-import type { Message, ToolUse, ToolResult } from "./types.js";
+import type { Message, SessionEvent, ToolUse, ToolResult } from "./types.js";
 
 /**
  * Optional harness customization points. Each hook receives the relevant,
@@ -6,11 +6,11 @@ import type { Message, ToolUse, ToolResult } from "./types.js";
  * that **throws** aborts the loop (surfaced as a {@link HookError}).
  *
  * Fire order per iteration of the loop:
- *   before_send → (POST) → after_receive →
+ *   before_send → (send) → on_event* → after_receive →
  *   [ per tool_use:  before_tool_call → handler → after_tool_call ]
  */
 export interface Hooks {
-  /** Outgoing turn, just before it is POSTed. Mutations are sent. */
+  /** Outgoing turn, just before it is sent. Mutations are sent. */
   before_send?: (message: Message) => void | Promise<void>;
   /** Assistant turn, immediately after it is received. */
   after_receive?: (message: Message) => void | Promise<void>;
@@ -21,6 +21,13 @@ export interface Hooks {
    * `toolResult.content` changes what the server receives.
    */
   after_tool_call?: (toolResult: ToolResult) => void | Promise<void>;
+  /**
+   * A live `session.event` observed on the `/rpc` notification stream during a
+   * turn, in arrival order. Read-only: the same events are also available in
+   * bulk from the terminal result, so agents that ignore live progress can
+   * leave this unset.
+   */
+  on_event?: (event: SessionEvent) => void | Promise<void>;
 }
 
 /** The four hook point names, for diagnostics. */

@@ -36,10 +36,10 @@ pub enum EventType {
     /// Result returned from a tool call.
     #[serde(rename = "tool.result")]
     ToolResult,
-    /// Request sent to an MCP server (stub; full impl later).
+    /// Request sent to an MCP server (real `tools/call` dispatch).
     #[serde(rename = "mcp.request")]
     McpRequest,
-    /// Response from an MCP server (stub).
+    /// Response from an MCP server.
     #[serde(rename = "mcp.response")]
     McpResponse,
     /// Session connection established.

@@ -2,17 +2,19 @@
 //!
 //! Four points let a program observe or mutate the round-trip:
 //!
-//! - [`Hooks::before_send`] — the outgoing [`Message`] just before it is POSTed.
+//! - [`Hooks::before_send`] — the outgoing [`Message`] just before it is sent.
 //! - [`Hooks::after_receive`] — the assistant [`Message`] just after it arrives.
 //! - [`Hooks::before_tool_call`] — a [`ToolUse`] just before its handler runs.
 //! - [`Hooks::after_tool_call`] — a [`ToolResult`] just before it is sent back.
+//! - [`Hooks::on_event`] — each live `session.event` [`EventView`] observed on
+//!   the `/rpc` notification stream during a turn (read-only).
 //!
 //! Each hook receives `&mut` access to its event (so it may rewrite it) and
 //! returns [`HookResult`]. Returning `Err` aborts the loop: the harness stops
 //! immediately and surfaces the error as [`crate::Error::Hook`].
 
 use crate::tool::BoxError;
-use crate::types::{Message, ToolResult, ToolUse};
+use crate::types::{EventView, Message, ToolResult, ToolUse};
 
 /// Result type for hook callbacks. `Err` aborts the harness loop.
 pub type HookResult = Result<(), BoxError>;
@@ -20,6 +22,7 @@ pub type HookResult = Result<(), BoxError>;
 type MessageHook = Box<dyn FnMut(&mut Message) -> HookResult + Send>;
 type ToolUseHook = Box<dyn FnMut(&mut ToolUse) -> HookResult + Send>;
 type ToolResultHook = Box<dyn FnMut(&mut ToolResult) -> HookResult + Send>;
+type EventHook = Box<dyn FnMut(&EventView) -> HookResult + Send>;
 
 /// A set of optional lifecycle callbacks. Construct with [`Hooks::default`]
 /// and attach callbacks with the builder methods; unset hooks are no-ops.
@@ -29,6 +32,7 @@ pub struct Hooks {
     after_receive: Option<MessageHook>,
     before_tool_call: Option<ToolUseHook>,
     after_tool_call: Option<ToolResultHook>,
+    on_event: Option<EventHook>,
 }
 
 impl Hooks {
@@ -68,6 +72,21 @@ impl Hooks {
         self
     }
 
+    /// Runs for each live `session.event` notification observed on the `/rpc`
+    /// stream during a [`send`](crate::Session::send) turn, in arrival order.
+    ///
+    /// This is a read-only observer of the server's event feed (provider calls,
+    /// tool dispatch, MCP requests/responses, …). The same events are also
+    /// available in bulk from the terminal result, so an agent that does not
+    /// care about live progress can leave this unset.
+    pub fn on_event<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&EventView) -> HookResult + Send + 'static,
+    {
+        self.on_event = Some(Box::new(f));
+        self
+    }
+
     pub(crate) fn run_before_send(&mut self, msg: &mut Message) -> HookResult {
         match &mut self.before_send {
             Some(f) => f(msg),
@@ -95,6 +114,13 @@ impl Hooks {
             None => Ok(()),
         }
     }
+
+    pub(crate) fn run_on_event(&mut self, event: &EventView) -> HookResult {
+        match &mut self.on_event {
+            Some(f) => f(event),
+            None => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Hooks {
@@ -111,6 +137,7 @@ impl std::fmt::Debug for Hooks {
             .field("after_receive", &mark(&self.after_receive))
             .field("before_tool_call", &mark(&self.before_tool_call))
             .field("after_tool_call", &mark(&self.after_tool_call))
+            .field("on_event", &mark(&self.on_event))
             .finish()
     }
 }

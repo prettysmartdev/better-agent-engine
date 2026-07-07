@@ -14,6 +14,7 @@ from bae_py import (
     Harness,
     Message,
     ProvidersFailedError,
+    RpcError,
     TextBlock,
     Tool,
     ToolError,
@@ -28,6 +29,8 @@ from mock_transport import (
     assistant_tool_call,
     connect_response,
     ok,
+    rpc_error_frame,
+    rpc_terminal,
 )
 
 
@@ -95,8 +98,11 @@ async def test_tool_call_round_trip_dispatches_and_echoes_id() -> None:
     assert reply.text() == "it is noon"
     # The handler ran with the model-supplied input.
     assert calls == [{"unix": True}]
-    # The second message POST carried a tool_result echoing tool_use.id.
-    followup = transport.requests[2].json["message"]
+    # The second /rpc call carried a session.sendMessage whose params.message is
+    # a tool_result echoing tool_use.id.
+    envelope = transport.requests[2].json
+    assert envelope["method"] == "session.sendMessage"
+    followup = envelope["params"]["message"]
     assert followup["role"] == "user"
     block = followup["content"][0]
     assert block["type"] == "tool_result"
@@ -162,7 +168,7 @@ async def test_before_tool_call_and_after_tool_call_receive_typed_events() -> No
 
     assert seen["use"] == ("tu_9", "get_current_time")
     assert seen["result"] == "tu_9"
-    assert transport.requests[2].json["message"]["content"][0]["content"] == "REWRITTEN"
+    assert transport.requests[2].json["params"]["message"]["content"][0]["content"] == "REWRITTEN"
 
 
 async def test_before_send_can_mutate_outgoing_message() -> None:
@@ -177,7 +183,7 @@ async def test_before_send_can_mutate_outgoing_message() -> None:
 
     await session.send("whisper")
 
-    assert transport.requests[1].json["message"]["content"] == "WHISPER"
+    assert transport.requests[1].json["params"]["message"]["content"] == "WHISPER"
 
 
 async def test_async_hook_and_async_handler_are_awaited() -> None:
@@ -251,23 +257,18 @@ async def test_tool_handler_error_propagates_as_tool_error() -> None:
     assert isinstance(exc.value.cause, ValueError)
 
 
-async def test_non_2xx_becomes_api_error_with_slug() -> None:
-    problem = TransportResponse(
-        status=409,
-        body={
-            "type": "session_closed",
-            "title": "Session is closed",
-            "status": 409,
-            "detail": "no more turns",
-        },
+async def test_rpc_error_object_in_stream_becomes_rpc_error() -> None:
+    # A closed/not-open session is a -32000 JSON-RPC error object in the stream
+    # (HTTP is still 200), not an HTTP 409 problem doc.
+    transport = MockTransport(
+        script=[connect_response(), [rpc_error_frame(-32000, "session is not open")]]
     )
-    transport = MockTransport(script=[connect_response(), problem])
     session = await Harness(_config(), transport=transport).connect()
 
-    with pytest.raises(ApiError) as exc:
+    with pytest.raises(RpcError) as exc:
         await session.send("go")
-    assert exc.value.type == "session_closed"
-    assert exc.value.status == 409
+    assert exc.value.code == -32000
+    assert "not open" in exc.value.rpc_message
 
 
 async def test_connect_error_maps_and_closes_owned_transport() -> None:
@@ -286,8 +287,10 @@ async def test_connect_error_maps_and_closes_owned_transport() -> None:
     assert transport.closed is True
 
 
-async def test_providers_failed_502_raises_with_events() -> None:
-    body = {
+async def test_all_providers_failed_turn_raises_with_events() -> None:
+    # The server no longer returns 502: the failure turn arrives as a normal
+    # terminal result whose events include session.error/all_providers_failed.
+    result = {
         "message": {"role": "assistant", "content": [{"type": "text", "text": "unavailable"}]},
         "events": [
             {
@@ -297,10 +300,18 @@ async def test_providers_failed_502_raises_with_events() -> None:
                 "event_type": "provider.response",
                 "payload": {"ok": False, "status": None, "error": "env var unset"},
                 "created_at": "2026-07-06T00:00:00Z",
-            }
+            },
+            {
+                "id": "evt_2",
+                "session_id": "ses_test",
+                "client_key_id": "key_1",
+                "event_type": "session.error",
+                "payload": {"reason": "all_providers_failed"},
+                "created_at": "2026-07-06T00:00:01Z",
+            },
         ],
     }
-    transport = MockTransport(script=[connect_response(), TransportResponse(status=502, body=body)])
+    transport = MockTransport(script=[connect_response(), [rpc_terminal(result)]])
     session = await Harness(_config(), transport=transport).connect()
 
     with pytest.raises(ProvidersFailedError) as exc:

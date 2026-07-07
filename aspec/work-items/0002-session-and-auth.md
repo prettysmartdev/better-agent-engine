@@ -6,7 +6,7 @@ Issue: issuelink
 ## Summary:
 - Stand up the `server/` crate as a running service: an axum HTTP server with `GET /healthz` and `GET /api/v1/meta`, environment-driven configuration (`BAE_ADDR`, `BAE_DB_PATH`, `BAE_LOG`), and SQLite initialization with an embedded, forward-only migration runner (migration 0001 creating the schema-version table).
 
-- authentication and session creation for client/server: baesrv exposes two ports. The first (443 if TLS enabled, 8080 if not) for client interactions, serving JSON-RPC over HTTP/2. The second for admin-only interactions, and ONLY binds to localhost.
+- authentication and session creation for client/server: baesrv exposes two ports. The first (`BAE_ADDR`, default `8080`) for client interactions, serving JSON-RPC over HTTP/2. The second for admin-only interactions, and ONLY binds to localhost.
 
 - admin port exposes a simple HTTP REST API for managing the server. First endpoint(s) to implement are: create client key, list client keys, delete client key. localhost client (via curl) can hit create client key endpoint to create a new key, hashed key stored in sqlite alongside client name provided by request. list endpoint lists clients with active keys, created date, last used date. hashed key value is not returned ever. delete endpoint deletes the indicated client key
 
@@ -197,6 +197,6 @@ Each client includes `examples/reference-assistant/` implementing the `reference
 - All SQLite migrations are embedded via `include_str!` macros and applied by the migration runner; migrations are forward-only and check `schema_version` before applying to be safe against concurrent starts.
 - Module layout: key generation/hashing/comparison in `server/src/store/keys.rs`; admin handlers in `server/src/api/admin/`; client API handlers in `server/src/api/client/`; session engine loop in `server/src/engine/session.rs`.
 - Client SDK harness logic lives in `src/harness.{rs,ts,py}` (or idiomatic equivalent) and re-exports a clean top-level API. Each SDK's `examples/reference-assistant/` exercises every hook point at least once, serving as living documentation.
-- All new `BAE_*` env vars (`BAE_ADMIN_ADDR`, `BAE_TLS_ENABLED`) must be documented in the existing env-var reference and validated at startup per `aspec/uxui/cli.md`.
+- All new `BAE_*` env vars (`BAE_ADMIN_ADDR`) must be documented in the existing env-var reference and validated at startup per `aspec/uxui/cli.md`.
 - Never persist or log resolved env var token values; resolve `${ENV_VAR_NAME}` immediately before the provider HTTP call and discard after.
 - Verify the production image still builds (`make image`) after this work item since it introduces the first real binary behavior and dual-port listener.

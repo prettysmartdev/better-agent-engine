@@ -188,6 +188,23 @@ pub fn stream_history(conn: &Connection, session_id: &str) -> rusqlite::Result<V
     Ok(history)
 }
 
+/// Resolve an event id to its rowid within a session, for `since_event_id`
+/// replay. Returns `None` if no event with that id exists in the session (a
+/// stale or foreign id), letting the caller fall back to replaying from the
+/// start.
+pub fn rowid_of_event(
+    conn: &Connection,
+    session_id: &str,
+    event_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT rowid FROM session_events WHERE session_id = ?1 AND id = ?2",
+        params![session_id, event_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+}
+
 /// One page of a session's events, ordered by insertion (rowid), for replay.
 /// `after` is the exclusive rowid cursor; `limit` rows are returned. The bool is
 /// true when more rows remain after this page.
