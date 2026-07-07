@@ -18,6 +18,17 @@ Incorporate client-side tools with simple tool handlers and server-side MCP serv
 
 > Status: alpha. The codebase, tooling, and project specification are in place; APIs and SDKs will likely change.
 
+## Quickstart
+
+```sh
+docker run -p 8080:8080 -v bae-data:/var/lib/bae better-agent-engine
+curl http://localhost:8080/healthz
+```
+
+Then create a profile and client key via the admin API, exchange the key
+for a session, and send a message. Full walkthrough:
+[`docs/quickstart.md`](docs/quickstart.md).
+
 ## Local development
 
 Everything runs in Docker via Make. The only host requirements are `docker`

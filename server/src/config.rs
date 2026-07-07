@@ -34,9 +34,6 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Tracing filter (`BAE_LOG`), e.g. `info` or `baesrv=debug,tower=warn`.
     pub log: String,
-    /// Whether an upstream proxy terminates TLS (`BAE_TLS_ENABLED`). Informational:
-    /// the container always speaks plain HTTP internally regardless of this flag.
-    pub tls_enabled: bool,
     /// How long to drain in-flight requests on shutdown (`BAE_SHUTDOWN_TIMEOUT`).
     pub shutdown_timeout: Duration,
 }
@@ -54,8 +51,6 @@ pub enum ConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
-    /// A boolean-valued variable was neither truthy nor falsy.
-    InvalidBool { var: &'static str, value: String },
     /// A duration-valued variable was not a non-negative integer of seconds.
     InvalidDuration { var: &'static str, value: String },
     /// `BAE_ADMIN_ADDR` resolved to a non-loopback address. The admin surface
@@ -77,10 +72,6 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidAddr { var, value, source } => write!(
                 f,
                 "{var}: {value:?} is not a valid host:port address ({source})"
-            ),
-            ConfigError::InvalidBool { var, value } => write!(
-                f,
-                "{var}: {value:?} is not a boolean (use true/false, 1/0, yes/no)"
             ),
             ConfigError::InvalidDuration { var, value } => {
                 write!(f, "{var}: {value:?} is not a whole number of seconds")
@@ -116,7 +107,6 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_DB_PATH.to_owned())
             .into();
         let log = get("BAE_LOG").unwrap_or_else(|| DEFAULT_LOG.to_owned());
-        let tls_enabled = parse_bool(get, "BAE_TLS_ENABLED", false)?;
         let shutdown_timeout = Duration::from_secs(parse_secs(
             get,
             "BAE_SHUTDOWN_TIMEOUT",
@@ -128,7 +118,6 @@ impl Config {
             admin_addr,
             db_path,
             log,
-            tls_enabled,
             shutdown_timeout,
         })
     }
@@ -143,21 +132,6 @@ fn parse_addr(
     value
         .parse::<SocketAddr>()
         .map_err(|source| ConfigError::InvalidAddr { var, value, source })
-}
-
-fn parse_bool(
-    get: &dyn Fn(&str) -> Option<String>,
-    var: &'static str,
-    default: bool,
-) -> Result<bool, ConfigError> {
-    match get(var) {
-        None => Ok(default),
-        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(ConfigError::InvalidBool { var, value: v }),
-        },
-    }
 }
 
 fn parse_secs(
@@ -194,7 +168,6 @@ mod tests {
         assert_eq!(cfg.admin_addr.to_string(), "127.0.0.1:8081");
         assert_eq!(cfg.db_path.to_str().unwrap(), DEFAULT_DB_PATH);
         assert_eq!(cfg.log, "info");
-        assert!(!cfg.tls_enabled);
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
     }
 
@@ -205,14 +178,12 @@ mod tests {
             ("BAE_ADMIN_ADDR", "127.0.0.1:9001"),
             ("BAE_DB_PATH", "/data/x.db"),
             ("BAE_LOG", "debug"),
-            ("BAE_TLS_ENABLED", "true"),
             ("BAE_SHUTDOWN_TIMEOUT", "5"),
         ]))
         .unwrap();
         assert_eq!(cfg.addr.to_string(), "127.0.0.1:9000");
         assert_eq!(cfg.db_path.to_str().unwrap(), "/data/x.db");
         assert_eq!(cfg.log, "debug");
-        assert!(cfg.tls_enabled);
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(5));
     }
 
@@ -230,11 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_bool_and_duration_are_rejected() {
-        assert!(matches!(
-            Config::resolve(&getter(&[("BAE_TLS_ENABLED", "maybe")])).unwrap_err(),
-            ConfigError::InvalidBool { .. }
-        ));
+    fn invalid_duration_is_rejected() {
         assert!(matches!(
             Config::resolve(&getter(&[("BAE_SHUTDOWN_TIMEOUT", "soon")])).unwrap_err(),
             ConfigError::InvalidDuration { .. }

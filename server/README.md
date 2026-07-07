@@ -24,7 +24,7 @@ make run     # run the server
 
 Built and shipped as a Docker image via the root [`Dockerfile`](../Dockerfile):
 `make image` from the repo root. Configuration is via environment variables
-(`BAE_ADDR`, `BAE_ADMIN_ADDR`, `BAE_DB_PATH`, `BAE_LOG`, `BAE_TLS_ENABLED`,
+(`BAE_ADDR`, `BAE_ADMIN_ADDR`, `BAE_DB_PATH`, `BAE_LOG`,
 `BAE_SHUTDOWN_TIMEOUT`); see
 [`aspec/devops/operations.md`](../aspec/devops/operations.md).
 

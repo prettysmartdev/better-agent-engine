@@ -28,10 +28,9 @@ The container exposes port **8080** (client API). The admin port (8081) binds
 to loopback **inside** the container and is never exposed — reach it via
 `docker exec` (see [step 2](#2-create-a-profile)) or a local SSH tunnel.
 
-> **TLS note.** The container always speaks plain HTTP internally. TLS
-> terminates upstream — at nginx, Caddy, a cloud load balancer, etc. Do not
-> set `BAE_TLS_ENABLED=true` and expect the server to serve HTTPS directly;
-> the flag is informational only.
+> **TLS note.** The container always speaks plain HTTP internally, and there
+> is no setting to change that. TLS terminates upstream — at nginx, Caddy, a
+> cloud load balancer, etc.
 
 ### Environment variables
 
@@ -41,7 +40,6 @@ to loopback **inside** the container and is never exposed — reach it via
 | `BAE_ADMIN_ADDR` | `127.0.0.1:8081` | Admin-only listen address. Must be a loopback address; the server refuses to start otherwise. |
 | `BAE_DB_PATH` | `/var/lib/bae/bae.db` | SQLite database file. Mount a volume here to persist data. |
 | `BAE_LOG` | `info` | Tracing filter, e.g. `baesrv=debug,tower=warn`. |
-| `BAE_TLS_ENABLED` | `false` | Informational. Does not enable in-process TLS. |
 | `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain in-flight requests on SIGTERM. |
 
 Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the
