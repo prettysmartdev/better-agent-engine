@@ -49,5 +49,11 @@ RUN curl -fsSL --retry 5 https://astral.sh/uv/install.sh \
 # different filesystem than uv's cache.
 ENV UV_LINK_MODE=copy
 
+# Default log filter for the dev loop: the full server event stream at TRACE
+# (HTTP requests, session events with complete payloads), dependencies at INFO —
+# global TRACE would bury baesrv logs under hyper/tokio internals. Override per
+# run with -e BAE_LOG=… .
+ENV BAE_LOG=baesrv=trace,info
+
 WORKDIR /workspace
 CMD ["bash"]

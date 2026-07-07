@@ -106,7 +106,25 @@ pub async fn serve(
     store: Store,
     mcp_registry: HashMap<String, McpServerConfig>,
 ) -> Result<(), RunError> {
+    tracing::info!(
+        version = VERSION,
+        api_versions = ?API_VERSIONS,
+        db_path = %config.db_path.display(),
+        "Better Agent Engine (BAE) starting — welcome!"
+    );
+
     let state = AppState::with_mcp_registry(store, mcp_registry);
+
+    // Periodic activity summary. The first tick fires immediately, so one
+    // summary also lands at startup; after that, one per interval.
+    let summary_state = state.clone();
+    let summary_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SUMMARY_INTERVAL);
+        loop {
+            tick.tick().await;
+            log_activity_summary(&summary_state);
+        }
+    });
 
     // Bind the client listener. Plain HTTP — TLS terminates upstream; this port
     // must sit behind a reverse proxy on an internal network, never exposed
@@ -172,9 +190,36 @@ pub async fn serve(
     }
 
     // Dropping the last `Store` clone here closes the SQLite connection.
+    summary_task.abort();
     drop(state);
     tracing::info!("database closed; shutdown complete");
     Ok(())
+}
+
+/// How often the activity summary is logged.
+const SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// One INFO line summarising what the server currently holds: active profiles,
+/// client keys, open/total sessions, logged events, and live in-process MCP
+/// connections. Fired hourly (and once at startup) by the task [`serve`] spawns.
+fn log_activity_summary(state: &AppState) {
+    let live_mcp_sessions = state
+        .mcp_sessions
+        .lock()
+        .expect("mcp_sessions mutex poisoned")
+        .len();
+    match state.store.with_conn(store::activity_counts) {
+        Ok(c) => tracing::info!(
+            profiles = c.profiles,
+            client_keys = c.client_keys,
+            open_sessions = c.open_sessions,
+            total_sessions = c.total_sessions,
+            events = c.events,
+            live_mcp_sessions,
+            "activity summary"
+        ),
+        Err(e) => tracing::warn!("activity summary skipped: count query failed: {e}"),
+    }
 }
 
 /// Resolve once the shutdown flag flips to `true`.

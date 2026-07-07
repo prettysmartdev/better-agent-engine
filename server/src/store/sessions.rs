@@ -142,6 +142,15 @@ pub fn insert_event(
         ],
         |r| r.get(0),
     )?;
+    // The full event stream at TRACE: every persisted event with its complete
+    // payload flows through here (this is the only session_events write path).
+    tracing::trace!(
+        session_id,
+        event_id = %id,
+        event_type = %event_type,
+        payload = %payload_str,
+        "session event"
+    );
     Ok(EventRecord {
         id,
         session_id: session_id.to_owned(),

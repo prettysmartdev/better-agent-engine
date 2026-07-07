@@ -138,6 +138,44 @@ impl Store {
     }
 }
 
+/// A point-in-time snapshot of what the database holds, for the periodic
+/// activity-summary log line.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivityCounts {
+    /// Profiles not soft-deleted.
+    pub profiles: i64,
+    /// Client keys (role `client`) not revoked.
+    pub client_keys: i64,
+    /// Sessions currently in the `open` state.
+    pub open_sessions: i64,
+    /// All sessions ever created, any state.
+    pub total_sessions: i64,
+    /// Rows in the append-only `session_events` log.
+    pub events: i64,
+}
+
+/// Count the active entities in one query.
+pub fn activity_counts(conn: &Connection) -> rusqlite::Result<ActivityCounts> {
+    conn.query_row(
+        "SELECT \
+           (SELECT count(*) FROM profiles WHERE deleted_at IS NULL), \
+           (SELECT count(*) FROM keys WHERE role = 'client' AND deleted_at IS NULL), \
+           (SELECT count(*) FROM sessions WHERE state = 'open'), \
+           (SELECT count(*) FROM sessions), \
+           (SELECT count(*) FROM session_events)",
+        [],
+        |r| {
+            Ok(ActivityCounts {
+                profiles: r.get(0)?,
+                client_keys: r.get(1)?,
+                open_sessions: r.get(2)?,
+                total_sessions: r.get(3)?,
+                events: r.get(4)?,
+            })
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +188,34 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(version, LATEST_VERSION);
+    }
+
+    #[test]
+    fn activity_counts_reflect_rows_and_filters() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO profiles (id, name) VALUES ('pro_a', 'a');
+                 INSERT INTO profiles (id, name, deleted_at) VALUES ('pro_b', 'b', '2026-01-01T00:00:00.000Z');
+                 INSERT INTO keys (id, role) VALUES ('key_c', 'client');
+                 INSERT INTO keys (id, role, deleted_at) VALUES ('key_d', 'client', '2026-01-01T00:00:00.000Z');
+                 INSERT INTO keys (id, role) VALUES ('key_s', 'session');
+                 INSERT INTO sessions (id, state) VALUES ('ses_open', 'open');
+                 INSERT INTO sessions (id, state) VALUES ('ses_done', 'closed');
+                 INSERT INTO session_events (id, session_id, event_type, payload, created_at)
+                   VALUES ('evt_1', 'ses_open', 'session.open', '{}', '2026-01-01T00:00:00.000Z');",
+            )
+            .unwrap();
+        });
+
+        let counts = store.with_conn(activity_counts).unwrap();
+        // Soft-deleted rows and session-role keys are excluded from the
+        // "active" counts; closed sessions still show in the total.
+        assert_eq!(counts.profiles, 1);
+        assert_eq!(counts.client_keys, 1);
+        assert_eq!(counts.open_sessions, 1);
+        assert_eq!(counts.total_sessions, 2);
+        assert_eq!(counts.events, 1);
     }
 
     #[test]

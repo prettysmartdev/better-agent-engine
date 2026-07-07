@@ -18,11 +18,37 @@ pub mod pagination;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::Response;
 
 use crate::config_file::McpServerConfig;
 use crate::engine::broadcast::EventBroadcaster;
 use crate::engine::mcp::McpSession;
 use crate::store::Store;
+
+/// Request-logging middleware shared by both routers: one line per request with
+/// method, path, response status, and latency. `/healthz` is logged at DEBUG —
+/// load balancers and container health checks hit it every few seconds, which
+/// would drown an INFO-level log; everything else logs at INFO.
+pub async fn log_requests(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+
+    let response = next.run(request).await;
+
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if path == "/healthz" {
+        tracing::debug!(%method, path, status, elapsed_ms, "http request");
+    } else {
+        tracing::info!(%method, path, status, elapsed_ms, "http request");
+    }
+    response
+}
 
 /// Live MCP connections, keyed by session id. A session gets an entry only if at
 /// least one of its profile's configured MCP servers connected successfully; the

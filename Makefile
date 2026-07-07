@@ -1,9 +1,13 @@
 # Better Agent Engine (BAE) — root orchestration.
 #
-# All local development runs inside the Docker dev image (Dockerfile.dev),
+# All local development runs inside the containerized dev image (Dockerfile.dev),
 # with the repository bind-mounted at /workspace. Component Makefiles
 # (server/, client-rust/, client-typescript/, client-python/) invoke the
 # toolchains directly and are what actually run inside the container.
+#
+# Container engine: Docker is used when its CLI exists and the daemon responds.
+# Otherwise, if Apple's `container` CLI (https://github.com/apple/container)
+# is installed, every target transparently falls back to Apple containers.
 #
 # Typical loop:
 #   make dev-image        # build the dev toolchain image (once, or after edits)
@@ -17,22 +21,42 @@ IMAGE      ?= $(PROJECT):latest
 COMPONENTS := server client-rust client-typescript client-python
 PORT       ?= 8080
 
+# Pick the container engine: docker if the CLI exists and the daemon is up,
+# else Apple containers, else empty (container targets fail via ensure-engine).
+# ENGINE=docker|container can also be forced on the command line.
+ifeq ($(origin ENGINE), undefined)
+ifeq ($(shell command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && echo ok),ok)
+ENGINE := docker
+else ifeq ($(shell command -v container >/dev/null 2>&1 && echo ok),ok)
+ENGINE := container
+else
+ENGINE :=
+endif
+endif
+
 # Allocate a TTY only when we have one (keeps CI happy).
 TTY := $(shell [ -t 0 ] && echo --interactive --tty)
 
 # Named volume for the cargo registry so Rust dependency downloads survive
 # container restarts. Everything else (target/, node_modules/, .venv/) lives
 # in the bind-mounted workspace and is cached there naturally.
-DOCKER_RUN := docker run --rm $(TTY) \
+CARGO_VOLUME := $(PROJECT)-cargo-registry
+
+# Named volume for the server's SQLite data (default BAE_DB_PATH is
+# /var/lib/bae/bae.db) so `make run` has a writable DB directory and the
+# data survives the --rm container.
+DATA_VOLUME := $(PROJECT)-dev-data
+
+CONTAINER_RUN := $(ENGINE) run --rm $(TTY) \
 	--volume $(CURDIR):/workspace \
-	--volume $(PROJECT)-cargo-registry:/usr/local/cargo/registry \
+	--volume $(CARGO_VOLUME):/usr/local/cargo/registry \
 	--workdir /workspace \
 	$(DEV_IMAGE)
 
 # Note: the per-component <verb>-<component> targets are pattern rules and
 # intentionally NOT declared .PHONY — make ignores pattern rules for .PHONY
 # targets.
-.PHONY: help dev-image ensure-dev-image shell image run \
+.PHONY: help engine dev-image ensure-engine ensure-dev-image shell image run \
 	build test lint fmt clean
 
 help: ## Show available targets
@@ -41,24 +65,52 @@ help: ## Show available targets
 	@echo "  <verb>-<component>  Run one verb for one component, e.g. test-server,"
 	@echo "                      lint-client-python. Components: $(COMPONENTS)"
 
-dev-image: ## Build the Docker dev toolchain image
-	docker build --file Dockerfile.dev --tag $(DEV_IMAGE) .
+engine: ## Show which container engine make will use
+	@echo $(if $(ENGINE),$(ENGINE),none)
 
-ensure-dev-image:
-	@docker image inspect $(DEV_IMAGE) >/dev/null 2>&1 || $(MAKE) dev-image
+# Fail early with a clear message when no engine is usable. For Apple
+# containers, also start its services and pre-create the named volumes
+# (Docker auto-creates named volumes on `run`; `container` does not).
+ensure-engine:
+ifeq ($(ENGINE),)
+	@echo "error: no container engine available." >&2
+	@echo "       Install Docker (and start its daemon), or Apple containers" >&2
+	@echo "       (https://github.com/apple/container) on macOS." >&2
+	@exit 1
+endif
+ifeq ($(ENGINE),container)
+	@container system status >/dev/null 2>&1 || container system start
+	@for v in $(CARGO_VOLUME) $(DATA_VOLUME); do \
+		container volume inspect $$v >/dev/null 2>&1 || container volume create $$v; \
+	done
+endif
+
+dev-image: ensure-engine ## Build the dev toolchain image
+	$(ENGINE) build --file Dockerfile.dev --tag $(DEV_IMAGE) .
+
+ensure-dev-image: ensure-engine
+	@$(ENGINE) image inspect $(DEV_IMAGE) >/dev/null 2>&1 || $(MAKE) dev-image
 
 shell: ensure-dev-image ## Interactive shell inside the dev container
-	$(DOCKER_RUN) bash
+	$(CONTAINER_RUN) bash
 
-image: ## Build the production server image (Dockerfile)
-	docker build --file Dockerfile --tag $(IMAGE) .
+image: ensure-engine ## Build the production server image (Dockerfile)
+	$(ENGINE) build --file Dockerfile --tag $(IMAGE) .
 
+# Named so the loopback-only admin API is reachable via exec, e.g.:
+#   docker exec better-agent-engine-dev curl -s http://127.0.0.1:8081/admin/v1/keys …
+# (substitute `container` for `docker` on Apple containers). The provider key
+# is forwarded because profiles reference it server-side (`${ANTHROPIC_API_KEY}`);
+# expanded by the shell at run time so the value is never echoed by make.
 run: ensure-dev-image ## Run the server in the dev container (port $(PORT))
-	docker run --rm $(TTY) \
+	$(ENGINE) run --rm $(TTY) \
+		--name $(PROJECT)-dev \
 		--volume $(CURDIR):/workspace \
-		--volume $(PROJECT)-cargo-registry:/usr/local/cargo/registry \
+		--volume $(CARGO_VOLUME):/usr/local/cargo/registry \
+		--volume $(DATA_VOLUME):/var/lib/bae \
 		--workdir /workspace \
 		--publish $(PORT):$(PORT) \
+		--env ANTHROPIC_API_KEY="$$ANTHROPIC_API_KEY" \
 		$(DEV_IMAGE) make -C server run
 
 build: ## Build every component
@@ -67,16 +119,16 @@ lint: ## Lint every component
 fmt: ## Format every component
 clean: ## Clean every component's build artifacts
 build test lint fmt clean: ensure-dev-image
-	$(DOCKER_RUN) bash -ec 'for c in $(COMPONENTS); do echo "==> $$c: $@"; make -C $$c $@; done'
+	$(CONTAINER_RUN) bash -ec 'for c in $(COMPONENTS); do echo "==> $$c: $@"; make -C $$c $@; done'
 
 # Per-component verbs: make <verb>-<component>, e.g. `make test-client-rust`.
 build-%: ensure-dev-image
-	$(DOCKER_RUN) make -C $* build
+	$(CONTAINER_RUN) make -C $* build
 test-%: ensure-dev-image
-	$(DOCKER_RUN) make -C $* test
+	$(CONTAINER_RUN) make -C $* test
 lint-%: ensure-dev-image
-	$(DOCKER_RUN) make -C $* lint
+	$(CONTAINER_RUN) make -C $* lint
 fmt-%: ensure-dev-image
-	$(DOCKER_RUN) make -C $* fmt
+	$(CONTAINER_RUN) make -C $* fmt
 clean-%: ensure-dev-image
-	$(DOCKER_RUN) make -C $* clean
+	$(CONTAINER_RUN) make -C $* clean

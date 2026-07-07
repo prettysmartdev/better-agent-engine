@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/sessions/{id}/rpc", post(rpc::rpc))
         .route("/api/v1/sessions/{id}/events", get(sessions::get_events))
+        .layer(axum::middleware::from_fn(crate::api::log_requests))
         .with_state(state)
 }
 

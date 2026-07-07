@@ -37,5 +37,6 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/v1/keys", post(keys::create).get(keys::list))
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
         .route("/admin/v1/mcp-servers", get(mcp::list))
+        .layer(axum::middleware::from_fn(crate::api::log_requests))
         .with_state(state)
 }
