@@ -1,9 +1,10 @@
 //! API key generation, hashing, and verification.
 //!
-//! Two kinds of key live in the `keys` table and both flow through here:
+//! Three kinds of key live in the `keys` table and all flow through here:
 //!
 //! - **client keys** — `bae_<random>`, exchanged for a session.
 //! - **session keys** — `bae_ses_<random>`, used to drive a single session.
+//! - **admin keys** — `bae_admin_<random>`, authorize the loopback admin port.
 //!
 //! # Security properties
 //!
@@ -37,11 +38,16 @@ pub const KEY_ID_PREFIX: &str = "key_";
 pub const ROLE_CLIENT: &str = "client";
 /// The `keys.role` value for session keys.
 pub const ROLE_SESSION: &str = "session";
+/// The `keys.role` value for admin keys (loopback admin port).
+pub const ROLE_ADMIN: &str = "admin";
 
 /// Prefix on every client key's plaintext.
 pub const CLIENT_KEY_PREFIX: &str = "bae_";
 /// Prefix on every session key's plaintext.
 pub const SESSION_KEY_PREFIX: &str = "bae_ses_";
+/// Prefix on every admin key's plaintext. Distinguishes an admin key from a
+/// `bae_` client key and a `bae_ses_` session key by sight.
+pub const ADMIN_KEY_PREFIX: &str = "bae_admin_";
 /// Random bytes drawn per key body: 24 bytes = 192 bits of entropy (≥ 128).
 pub const KEY_ENTROPY_BYTES: usize = 24;
 /// Number of leading characters of a key stored/displayed as its prefix.
@@ -103,6 +109,12 @@ pub fn generate_client_key() -> GeneratedKey {
 /// Generate a new session key (`bae_ses_<random>`).
 pub fn generate_session_key() -> GeneratedKey {
     generate_key(SESSION_KEY_PREFIX)
+}
+
+/// Generate a new admin key (`bae_admin_<random>`). Same CSPRNG + entropy as a
+/// client/session key, only the prefix differs.
+pub fn generate_admin_key() -> GeneratedKey {
+    generate_key(ADMIN_KEY_PREFIX)
 }
 
 fn generate_key(prefix: &str) -> GeneratedKey {
@@ -167,6 +179,20 @@ pub fn verify_key(plaintext: &str, stored: &str) -> Result<bool, KeyError> {
     // for differing lengths (lengths are not secret), and otherwise compares
     // every byte without early return.
     Ok(bool::from(computed.as_bytes().ct_eq(expected.as_bytes())))
+}
+
+/// Whether `stored` parses as a well-formed Argon2id PHC hash string.
+///
+/// Used to validate a pre-provisioned admin-key hash file at startup (so a
+/// malformed hash is rejected once, at boot, rather than silently failing every
+/// admin request later). Only checks structural validity — that the string is a
+/// parseable PHC hash naming the `argon2id` algorithm with a salt and digest —
+/// not that it hashes any particular plaintext.
+pub fn is_valid_key_hash(stored: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored) else {
+        return false;
+    };
+    parsed.algorithm.as_str() == "argon2id" && parsed.salt.is_some() && parsed.hash.is_some()
 }
 
 /// Build an Argon2id hasher with our fixed parameters.
@@ -427,6 +453,100 @@ pub fn revoke_client_key(conn: &Connection, id: &str) -> rusqlite::Result<Option
 const STATE_OPEN: &str = "open";
 const STATE_CLOSED: &str = "closed";
 
+// ---------------------------------------------------------------------------
+// Admin keys.
+//
+// Admin keys (`role='admin'`) authorize the loopback admin port. They are
+// bootstrapped once at server startup (see `crate::admin_auth`): either
+// self-generated (the server writes the plaintext to a file and stores only the
+// hash) or ingested from a pre-provisioned Argon2id hash (the server never sees
+// the plaintext). Unlike client/session keys they carry no `profile_id`/
+// `client_id`. There is normally exactly one active admin row, but the code
+// never assumes that — a pre-provisioned replica and a manually recovered key
+// can briefly coexist, and any active admin row is a valid credential.
+// ---------------------------------------------------------------------------
+
+/// Return the first active (`deleted_at IS NULL`) `role='admin'` key, if any.
+///
+/// Used at startup to decide whether the bootstrap needs to mint or ingest a
+/// key. Only its existence matters to the bootstrap; the `key_hash` is not
+/// selected.
+pub fn find_active_admin_key(conn: &Connection) -> rusqlite::Result<Option<KeyRecord>> {
+    let sql = format!(
+        "SELECT {KEY_COLS} FROM keys \
+         WHERE role = '{ROLE_ADMIN}' AND deleted_at IS NULL \
+         ORDER BY rowid LIMIT 1"
+    );
+    conn.query_row(&sql, [], row_to_key).optional()
+}
+
+/// Persist a freshly generated admin key. `generated.plaintext` is hashed here
+/// and never stored; the caller (the startup bootstrap) is responsible for
+/// writing the plaintext to `BAE_ADMIN_KEY_FILE` exactly once.
+pub fn insert_generated_admin_key(
+    conn: &Connection,
+    name: &str,
+    generated: &GeneratedKey,
+) -> Result<KeyRecord, InsertError> {
+    let id = generate_id(KEY_ID_PREFIX);
+    let hash = hash_key(&generated.plaintext).map_err(InsertError::Key)?;
+    let sql = format!(
+        "INSERT INTO keys \
+           (id, name, key_hash, key_prefix, role, profile_id, client_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, '{ROLE_ADMIN}', NULL, NULL, {NOW_SQL}) \
+         RETURNING {KEY_COLS}"
+    );
+    conn.query_row(&sql, params![id, name, hash, generated.prefix], row_to_key)
+        .map_err(InsertError::Sqlite)
+}
+
+/// Persist an admin key from a pre-provisioned Argon2id PHC hash. The server
+/// never learns the plaintext in this path — this is the multi-replica
+/// pre-provisioning flow, where every replica ingests the identical hash
+/// (produced by `baectl auth create key`) so one plaintext authenticates
+/// against all of them. `key_hash` must already be a valid PHC string; `prefix`
+/// is stored for display only.
+pub fn insert_admin_key_from_hash(
+    conn: &Connection,
+    name: &str,
+    prefix: &str,
+    key_hash: &str,
+) -> rusqlite::Result<KeyRecord> {
+    let id = generate_id(KEY_ID_PREFIX);
+    let sql = format!(
+        "INSERT INTO keys \
+           (id, name, key_hash, key_prefix, role, profile_id, client_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, '{ROLE_ADMIN}', NULL, NULL, {NOW_SQL}) \
+         RETURNING {KEY_COLS}"
+    );
+    conn.query_row(&sql, params![id, name, key_hash, prefix], row_to_key)
+}
+
+/// Soft-delete every active admin key, returning how many rows were revoked.
+/// Used by `--rotate-admin-key` before minting fresh material.
+pub fn revoke_active_admin_keys(conn: &Connection) -> rusqlite::Result<usize> {
+    let sql = format!(
+        "UPDATE keys SET deleted_at = {NOW_SQL} \
+         WHERE role = '{ROLE_ADMIN}' AND deleted_at IS NULL"
+    );
+    conn.execute(&sql, [])
+}
+
+/// Authenticate a bearer token against **every** active admin key.
+///
+/// Unlike client-key auth this does not narrow candidates by `key_prefix`: it
+/// checks the token, in constant time, against every active `role='admin'` row
+/// (normally one, occasionally more — see the section comment). A client- or
+/// session-role key can never match, since only admin rows are selected. On the
+/// first match `last_used_at` is stamped and the record returned.
+pub fn authenticate_admin(conn: &Connection, token: &str) -> Result<Option<KeyRecord>, KeyError> {
+    let sql = format!(
+        "SELECT {KEY_COLS}, key_hash FROM keys \
+         WHERE role = '{ROLE_ADMIN}' AND deleted_at IS NULL"
+    );
+    authenticate(conn, &sql, params![], token)
+}
+
 /// Error inserting a key row.
 #[derive(Debug)]
 pub enum InsertError {
@@ -527,6 +647,35 @@ mod tests {
         let body_hex_chars = k.plaintext.len() - CLIENT_KEY_PREFIX.len();
         let entropy_bits = (body_hex_chars / 2) * 8;
         assert!(entropy_bits >= 128, "key entropy {entropy_bits} bits < 128");
+    }
+
+    #[test]
+    fn admin_key_shape_entropy_and_hash_round_trip() {
+        // Mirrors `client_key_shape` + `entropy_meets_floor` + `hash_round_trips`
+        // for the new admin key: prefix, ≥128 bits of entropy measured off a real
+        // key, and an Argon2id hash that verifies its own plaintext and rejects a
+        // wrong one (the property `baectl`'s independent hasher must match).
+        let k = generate_admin_key();
+        assert!(k.plaintext.starts_with(ADMIN_KEY_PREFIX));
+        assert!(!k.plaintext.starts_with(SESSION_KEY_PREFIX));
+        assert_eq!(
+            k.plaintext.len(),
+            ADMIN_KEY_PREFIX.len() + KEY_ENTROPY_BYTES * 2
+        );
+        // Entropy floor, measured off the actual emitted key body (hex chars).
+        let body_hex_chars = k.plaintext.len() - ADMIN_KEY_PREFIX.len();
+        let entropy_bits = (body_hex_chars / 2) * 8;
+        assert!(
+            entropy_bits >= 128,
+            "admin key entropy {entropy_bits} bits < 128"
+        );
+        assert_eq!(k.prefix.len(), KEY_PREFIX_LEN);
+        assert_eq!(k.prefix, &k.plaintext[..KEY_PREFIX_LEN]);
+
+        let hash = hash_key(&k.plaintext).unwrap();
+        assert!(hash.starts_with("$argon2id$"));
+        assert!(verify_key(&k.plaintext, &hash).unwrap());
+        assert!(!verify_key("bae_admin_wrong", &hash).unwrap());
     }
 
     #[test]

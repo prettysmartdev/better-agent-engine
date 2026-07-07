@@ -76,3 +76,12 @@ Purpose: Idiomatic Python client library and harness.
 Description and Scope:
 - Same surface as the other clients, built on httpx/pydantic; published to PyPI.
 - Scope: mirrors the other clients feature-for-feature with idiomatic Python naming (sync and async variants).
+
+### Component 5:
+Name: baectl (baectl/)
+Purpose: Thin CLI wrapper over the admin API (`/admin/v1/*`), bundled into both the dev and production images so operators can `docker exec`/`container exec` in and manage profiles and keys without hand-assembling curl calls.
+Description and Scope:
+- Rust binary, independently buildable like every other Rust component (own `Cargo.toml`, no shared workspace with `server/` or `client-rust/`), compiled to a static `x86_64-unknown-linux-musl` binary and copied into both images alongside `baesrv`.
+- Scope: profile and key CRUD against the admin port, plus a local (no-network) admin-key-generation utility (`auth create key`) for pre-provisioning one shared admin credential across multiple server replicas. Auto-configures its admin address and auth token to zero-flag defaults matching the documented `docker exec` deployment model.
+- Out of scope: session management (open/send-message/close), which hits the client port with a client/session key and is deliberately left to the published client libraries (Components 2–4) — baectl only talks to the admin port.
+- **Distinguished from Components 2–4: baectl is not a published library.** It is not released to crates.io, npm, or PyPI — it ships only inside the Docker image, and its version tracks the image tag rather than an independent SemVer line (see devops/cicd.md's Publishing section). Components 2–4 are the publishable, embeddable client libraries; baectl is an operator-facing binary with no importable API surface.

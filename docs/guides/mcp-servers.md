@@ -62,10 +62,16 @@ docker run -d \
 
 ## Step 2 — Restart and confirm registration
 
-After (re)starting, verify the server loaded the config:
+After (re)starting, verify the server loaded the config. This endpoint has
+no `baectl` wrapper (it's a read-only diagnostic, not part of the
+profile/key CRUD surface `baectl` covers), so use `curl` directly with the
+admin key `baesrv` wrote on first boot (see
+[Admin authentication](admin-authentication.md)):
 
 ```sh
-curl http://127.0.0.1:8081/admin/v1/mcp-servers
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+curl http://127.0.0.1:8081/admin/v1/mcp-servers \
+  -H "Authorization: Bearer $ADMIN_KEY"
 ```
 
 Expected response:
@@ -92,7 +98,39 @@ that the path is correct and that the process has permission to read it.
 entry in `bae-config.toml`):
 
 ```sh
+docker exec bae baectl create profile fs-assistant anthropic claude-sonnet-4-6 \
+  --max-tokens 8096 \
+  --mcp-server filesystem
+```
+
+(`--allowed-tool` is omitted, so `allowed_tools` defaults to `[]` — no
+client-side tools, MCP-only.)
+
+To update an existing profile (full replacement — `baectl` preserves the
+current name unless you pass `--name`; see the
+[baectl reference](../reference/baectl.md#baectl-update-profile)):
+
+```sh
+docker exec bae baectl update profile pro_… anthropic claude-sonnet-4-6 \
+  --max-tokens 8096 \
+  --mcp-server filesystem
+```
+
+<details>
+<summary>curl (alternative)</summary>
+
+Fetch the admin key first (`baectl` does this automatically):
+
+```sh
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+```
+
+Create:
+
+```sh
+docker exec -i -e ADMIN_KEY="$ADMIN_KEY" bae sh << 'EOF'
 curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "fs-assistant",
@@ -106,15 +144,19 @@ curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
     "mcp_servers": ["filesystem"],
     "allowed_tools": []
   }'
+EOF
 ```
 
-To update an existing profile (full replacement):
+Update (full replacement):
 
 ```sh
-curl -s -X PUT http://127.0.0.1:8081/admin/v1/profiles/pro_… \
+docker exec bae curl -s -X PUT http://127.0.0.1:8081/admin/v1/profiles/pro_… \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{ …, "mcp_servers": ["filesystem"] }'
 ```
+
+</details>
 
 > **Name-matching happens at session-creation time**, not when the profile is
 > saved. If a name in `mcp_servers` is not in the current registry when a
@@ -126,12 +168,15 @@ curl -s -X PUT http://127.0.0.1:8081/admin/v1/profiles/pro_… \
 ## Step 4 — Issue a client key
 
 ```sh
-curl -s -X POST http://127.0.0.1:8081/admin/v1/keys \
+docker exec bae curl -s -X POST http://127.0.0.1:8081/admin/v1/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"name": "fs-agent", "profile_id": "pro_…"}'
 ```
 
-Copy the `key` field — it is shown exactly once.
+Copy the `key` field — it is shown exactly once. (Or use
+`docker exec bae baectl create key fs-agent pro_… --json` — see the
+[baectl reference](../reference/baectl.md#baectl-create-key).)
 
 ```sh
 CLIENT_KEY="bae_…"
@@ -241,12 +286,16 @@ Python + `uv`):
 # Point to the fetch config:
 BAE_CONFIG=examples/bae-config/fetch.toml baesrv
 
-# Confirm:
-curl http://127.0.0.1:8081/admin/v1/mcp-servers
+# Confirm (the server here runs natively, not in a container, so read the
+# admin key file directly):
+ADMIN_KEY=$(cat /var/lib/bae/admin-key.pem)
+curl http://127.0.0.1:8081/admin/v1/mcp-servers -H "Authorization: Bearer $ADMIN_KEY"
 # {"items":[{"name":"fetch","transport":"stdio"}]}
 
-# Create a profile that opts into it:
+# Create a profile that opts into it (or: docker exec bae baectl create profile
+# fetch-assistant anthropic claude-sonnet-4-6 --mcp-server fetch):
 curl -X POST http://127.0.0.1:8081/admin/v1/profiles \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"name":"fetch-assistant","provider_config":{…},"mcp_servers":["fetch"]}'
 

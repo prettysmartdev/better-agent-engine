@@ -18,7 +18,7 @@
 PROJECT    := better-agent-engine
 DEV_IMAGE  ?= awman-$(PROJECT):latest
 IMAGE      ?= $(PROJECT):latest
-COMPONENTS := server client-rust client-typescript client-python
+COMPONENTS := server baectl client-rust client-typescript client-python
 PORT       ?= 8080
 
 # Pick the container engine: docker if the CLI exists and the daemon is up,
@@ -53,11 +53,28 @@ CONTAINER_RUN := $(ENGINE) run --rm $(TTY) \
 	--workdir /workspace \
 	$(DEV_IMAGE)
 
+# Runner for the component verbs (build/test/lint/fmt/clean and their
+# <verb>-<component> variants). With a container engine these run inside the dev
+# image — the canonical, reproducible path. With no engine available they fall
+# back to the host toolchain so `make test` (and the sibling verbs) still work in
+# engine-less environments such as CI sandboxes and remote workers, where the
+# component Makefiles run directly. That fallback requires the toolchains the dev
+# image bundles (cargo, npm, uv) to be present on the host. The image-centric
+# targets (shell/image/run/dev-image/image-smoke/check-static) have no host
+# equivalent and still hard-require an engine via ensure-engine.
+ifeq ($(ENGINE),)
+DEV_IMAGE_DEP :=
+RUN_IN_DEV    :=
+else
+DEV_IMAGE_DEP := ensure-dev-image
+RUN_IN_DEV    := $(CONTAINER_RUN)
+endif
+
 # Note: the per-component <verb>-<component> targets are pattern rules and
 # intentionally NOT declared .PHONY — make ignores pattern rules for .PHONY
 # targets.
 .PHONY: help engine dev-image ensure-engine ensure-dev-image shell image run \
-	build test lint fmt clean
+	build test lint fmt clean check-static image-smoke
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -97,6 +114,19 @@ shell: ensure-dev-image ## Interactive shell inside the dev container
 image: ensure-engine ## Build the production server image (Dockerfile)
 	$(ENGINE) build --file Dockerfile --tag $(IMAGE) .
 
+# Static-binary regression guard for baectl. Runs inside the dev image, which
+# carries the x86_64-unknown-linux-musl target + musl-tools, and asserts the
+# release binary links statically (no transitive OpenSSL/glibc). Catches a
+# dependency regression that would break the dependency-free runtime image.
+check-static: ensure-dev-image ## Verify baectl builds as a static musl binary
+	$(CONTAINER_RUN) make -C baectl check-static
+
+# Image smoke test: build the production image and run the bundled baectl in it.
+# The runtime base carries no Rust toolchain, so `baectl --help` succeeding proves
+# the shipped binary is genuinely self-contained/static.
+image-smoke: image ## Build the image and run `baectl --help` in it
+	$(ENGINE) run --rm $(IMAGE) baectl --help
+
 # Named so the loopback-only admin API is reachable via exec, e.g.:
 #   docker exec better-agent-engine-dev curl -s http://127.0.0.1:8081/admin/v1/keys …
 # (substitute `container` for `docker` on Apple containers). The provider key
@@ -118,17 +148,17 @@ test: ## Test every component
 lint: ## Lint every component
 fmt: ## Format every component
 clean: ## Clean every component's build artifacts
-build test lint fmt clean: ensure-dev-image
-	$(CONTAINER_RUN) bash -ec 'for c in $(COMPONENTS); do echo "==> $$c: $@"; make -C $$c $@; done'
+build test lint fmt clean: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) bash -ec 'for c in $(COMPONENTS); do echo "==> $$c: $@"; make -C $$c $@; done'
 
 # Per-component verbs: make <verb>-<component>, e.g. `make test-client-rust`.
-build-%: ensure-dev-image
-	$(CONTAINER_RUN) make -C $* build
-test-%: ensure-dev-image
-	$(CONTAINER_RUN) make -C $* test
-lint-%: ensure-dev-image
-	$(CONTAINER_RUN) make -C $* lint
-fmt-%: ensure-dev-image
-	$(CONTAINER_RUN) make -C $* fmt
-clean-%: ensure-dev-image
-	$(CONTAINER_RUN) make -C $* clean
+build-%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C $* build
+test-%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C $* test
+lint-%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C $* lint
+fmt-%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C $* fmt
+clean-%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C $* clean

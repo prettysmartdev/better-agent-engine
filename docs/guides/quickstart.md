@@ -62,12 +62,48 @@ curl http://localhost:8080/api/v1/meta
 
 ## 2. Create a profile
 
-Profiles are managed through the **admin API**, which binds to loopback only.
-From inside the container:
+Profiles are managed through the **admin API**, which binds to loopback only
+and requires the admin key `baesrv` wrote to disk on first boot (see
+[Admin authentication](admin-authentication.md)). [`baectl`](../reference/baectl.md),
+run inside the container, finds both automatically — no setup needed:
 
 ```sh
-docker exec -i bae sh << 'EOF'
+docker exec bae baectl create profile main anthropic claude-sonnet-4-6 \
+  --allowed-tool get_current_time \
+  --max-tokens 8096
+```
+
+Output:
+```
+created profile
+  id:         pro_a1b2c3d4e5f6…
+  name:       main
+  created_at: 2026-07-06T18:26:01.123Z
+```
+
+Save the profile id — you need it in the next step. To capture it in a shell
+variable instead of copying it by hand, add `--json`:
+
+```sh
+PROFILE_ID=$(docker exec bae baectl create profile main anthropic claude-sonnet-4-6 \
+  --allowed-tool get_current_time \
+  --max-tokens 8096 \
+  --json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+```
+
+<details>
+<summary>curl (alternative)</summary>
+
+Fetch the admin key first (`baectl` does this automatically):
+
+```sh
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+```
+
+```sh
+docker exec -i -e ADMIN_KEY="$ADMIN_KEY" bae sh << 'EOF'
 curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "main",
@@ -83,16 +119,7 @@ curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
 EOF
 ```
 
-Response (`201 Created`):
-```json
-{
-  "id": "pro_a1b2c3d4e5f6…",
-  "name": "main",
-  "created_at": "2026-07-06T18:26:01.123Z"
-}
-```
-
-Save the profile id — you need it in the next step.
+</details>
 
 > The `allowed_tools` list controls which client-side tools agents may declare.
 > An **empty `allowed_tools` list permits no client-side tools**. Tools not in
@@ -103,29 +130,43 @@ Save the profile id — you need it in the next step.
 ## 3. Create a client key
 
 ```sh
+docker exec bae baectl create key my-agent "$PROFILE_ID"
+```
+
+Output:
+```
+created key
+  id:         key_…
+  name:       my-agent
+  key:        bae_1a2b3c4d…
+  prefix:     bae_1a2b
+  profile_id: pro_…
+  created_at: 2026-07-06T18:26:05.000Z
+```
+
+> **The `key` field is shown exactly once**, in both human and `--json`
+> output, followed by a stderr warning to copy it now — it cannot be
+> retrieved again. Only an Argon2id hash is stored.
+
+To capture it in a shell variable, add `--json`:
+
+```sh
+CLIENT_KEY=$(docker exec bae baectl create key my-agent "$PROFILE_ID" --json \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
+```
+
+<details>
+<summary>curl (alternative)</summary>
+
+```sh
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
 docker exec bae curl -s -X POST http://127.0.0.1:8081/admin/v1/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"name": "my-agent", "profile_id": "pro_a1b2c3d4e5f6…"}'
 ```
 
-Response (`201 Created`):
-```json
-{
-  "id": "key_…",
-  "name": "my-agent",
-  "key": "bae_1a2b3c4d…",
-  "prefix": "bae_1a2b",
-  "profile_id": "pro_…",
-  "created_at": "2026-07-06T18:26:05.000Z"
-}
-```
-
-> **The `key` field is shown exactly once.** Copy it now — it cannot be
-> retrieved again. Only an Argon2id hash is stored.
-
-```sh
-CLIENT_KEY="bae_1a2b3c4d…"
-```
+</details>
 
 ---
 
@@ -237,6 +278,8 @@ curl -s -X DELETE "http://localhost:8080/api/v1/sessions/$SESSION_ID" \
 
 ## Next steps
 
+- [baectl reference](../reference/baectl.md) — every `baectl` subcommand, flag, and exit code.
+- [Admin authentication](admin-authentication.md) — how the admin key is created, rotated, and disabled.
 - [Admin API reference](../reference/admin-api.md) — manage profiles and keys.
 - [Client API reference](../reference/client-api.md) — full session and message endpoints.
 - [Profiles](../profiles.md) — provider config, env var references, fallbacks, MCP wiring.

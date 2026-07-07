@@ -9,6 +9,7 @@
 Start here. Guides walk you through real tasks end to end.
 
 - [Quickstart](guides/quickstart.md) — run the server, create a profile and key, open a session, and send your first message.
+- [Admin Authentication](guides/admin-authentication.md) — how the bootstrap admin key is created, found, rotated, disabled, and pre-provisioned across replicas.
 - [MCP Servers](guides/mcp-servers.md) — connect a real MCP server (filesystem, fetch) to a profile using `bae-config.toml`.
 - [Event Streaming](guides/event-streaming.md) — consume live `session.event` notifications as a turn runs, subscribe as an observer, and resume after a disconnect.
 - [Building a Client](guides/building-a-client.md) — short per-SDK walkthrough (Rust, TypeScript, Python) covering the harness API, the JSON-RPC transport, and the `on_event` hook.
@@ -22,6 +23,7 @@ Precise specification of every API surface and configuration option.
 - [Client API](reference/client-api.md) — REST session management plus `POST /api/v1/sessions/{id}/rpc` JSON-RPC methods.
 - [Wire Protocol](reference/wire-protocol.md) — JSON-RPC 2.0 envelope conventions, NDJSON framing, and error codes.
 - [Admin API](reference/admin-api.md) — profile and key management, `GET /admin/v1/mcp-servers`.
+- [baectl](reference/baectl.md) — the admin API CLI: every subcommand, flags, exit codes, and auth/address auto-configuration.
 - [Message Types](reference/message-types.md) — all twelve `event_type` values and their payload shapes.
 - [Configuration](reference/configuration.md) — every `BAE_*` env var, the `--config` flag, and the `bae-config.toml` schema.
 

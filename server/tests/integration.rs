@@ -167,7 +167,10 @@ async fn start_server_with_registry(
     let admin_addr = admin_listener.local_addr().unwrap();
 
     let client_app = baesrv::api::client::router(state.clone());
-    let admin_app = baesrv::api::admin::router(state.clone());
+    // These integration tests predate admin-port auth and drive the admin API
+    // without a bearer key; build the admin router with auth disabled so they
+    // exercise the endpoints directly. Admin-auth enforcement has its own tests.
+    let admin_app = baesrv::api::admin::router(state.clone(), false);
     tokio::spawn(async move {
         axum::serve(client_listener, client_app).await.unwrap();
     });

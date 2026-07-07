@@ -201,10 +201,13 @@ is accepted. A client declaring an additional tool not in the list is rejected.
 }
 ```
 
-Create it:
+Create it (admin requests need the bootstrap admin key — see the
+[admin authentication guide](guides/admin-authentication.md)):
 
 ```sh
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
 curl -X POST http://127.0.0.1:8081/admin/v1/profiles \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d @profile.json
 ```
@@ -213,6 +216,7 @@ Update it (full replacement):
 
 ```sh
 curl -X PUT http://127.0.0.1:8081/admin/v1/profiles/pro_… \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d @profile.json
 ```

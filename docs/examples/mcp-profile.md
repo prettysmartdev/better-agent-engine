@@ -15,7 +15,8 @@ For the full guided walkthrough see [MCP Servers](../guides/mcp-servers.md).
 - Verify registration:
 
 ```sh
-curl http://127.0.0.1:8081/admin/v1/mcp-servers
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+curl http://127.0.0.1:8081/admin/v1/mcp-servers -H "Authorization: Bearer $ADMIN_KEY"
 # {"items":[{"name":"filesystem","transport":"stdio"}]}
 ```
 
@@ -24,7 +25,22 @@ curl http://127.0.0.1:8081/admin/v1/mcp-servers
 ## Create a profile with `mcp_servers`
 
 ```sh
-PROFILE=$(curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
+PROFILE_ID=$(docker exec bae baectl create profile fs-assistant anthropic claude-sonnet-4-6 \
+  --max-tokens 8096 \
+  --mcp-server filesystem \
+  --json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "profile: $PROFILE_ID"
+```
+
+`mcp_servers` is an array of **name strings** from `bae-config.toml`.
+
+<details>
+<summary>curl (alternative)</summary>
+
+```sh
+PROFILE=$(docker exec -i -e ADMIN_KEY="$ADMIN_KEY" bae sh << 'EOF'
+curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "fs-assistant",
@@ -37,23 +53,42 @@ PROFILE=$(curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
     },
     "mcp_servers":    ["filesystem"],
     "allowed_tools":  []
-  }')
+  }'
+EOF
+)
 PROFILE_ID=$(echo "$PROFILE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "profile: $PROFILE_ID"
 ```
 
-`mcp_servers` is an array of **name strings** from `bae-config.toml`.
+</details>
 
 ---
 
 ## Create a client key and open a session
 
 ```sh
-KEY=$(curl -s -X POST http://127.0.0.1:8081/admin/v1/keys \
+CLIENT_KEY=$(docker exec bae baectl create key fs-agent "$PROFILE_ID" --json \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
+```
+
+<details>
+<summary>curl (alternative)</summary>
+
+```sh
+KEY=$(docker exec bae curl -s -X POST http://127.0.0.1:8081/admin/v1/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"fs-agent\",\"profile_id\":\"$PROFILE_ID\"}")
 CLIENT_KEY=$(echo "$KEY" | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
+```
 
+</details>
+
+Session open uses the client key against the **client port** (8080), which
+`baectl` does not wrap — it manages profiles and keys on the admin port
+only:
+
+```sh
 SESSION=$(curl -s -X POST http://localhost:8080/api/v1/sessions \
   -H "Authorization: Bearer $CLIENT_KEY" \
   -H 'Content-Type: application/json' \
