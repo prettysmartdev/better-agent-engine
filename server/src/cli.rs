@@ -16,11 +16,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use crate::config::{Config, SandboxDriverKind};
 use crate::config_file::BaeConfigFile;
+use crate::engine::sandbox::{
+    AppleContainerDriver, DockerDriver, SandboxDriver, UnsupportedDriver,
+};
+use crate::store::{profiles, Store};
 
 /// Parse arguments, run the selected subcommand, and return a process exit code.
 pub fn run() -> ExitCode {
@@ -122,6 +127,15 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
         }
     };
 
+    // Build the host-wide sandbox driver. An unusable selection (apple-container
+    // on a non-macOS host) is fatal if any profile already declares
+    // available_sandboxes — the operator authored a config the server cannot
+    // honour, the same usage-error posture as ConfigFileError.
+    let sandbox_driver = match build_sandbox_driver(&config, &store) {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -133,11 +147,73 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    match runtime.block_on(crate::serve(config, store, mcp_registry, provider_registry)) {
+    match runtime.block_on(crate::serve(
+        config,
+        store,
+        mcp_registry,
+        provider_registry,
+        sandbox_driver,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
             ExitCode::from(e.exit_code() as u8)
+        }
+    }
+}
+
+/// Turn the configured [`SandboxDriverKind`] into the one server-wide
+/// `Arc<dyn SandboxDriver>` (next to [`crate::open_store`] in startup order).
+///
+/// `apple-container` selected on a non-macOS host cannot work
+/// ([`AppleContainerDriver::new`] returns `Unsupported`):
+/// - if any active profile declares `available_sandboxes`, this is fatal —
+///   usage error, exit 2 — since the server would be unable to honour
+///   already-authored config;
+/// - otherwise the server starts with an [`UnsupportedDriver`] that surfaces
+///   the misconfiguration as a structured error on first use, logged once
+///   here at startup.
+fn build_sandbox_driver(
+    config: &Config,
+    store: &Store,
+) -> Result<Arc<dyn SandboxDriver>, ExitCode> {
+    match config.sandbox_driver {
+        SandboxDriverKind::Docker => Ok(Arc::new(DockerDriver::new())),
+        SandboxDriverKind::AppleContainer => {
+            match AppleContainerDriver::new(std::env::consts::OS) {
+                Ok(d) => Ok(Arc::new(d)),
+                Err(e) => {
+                    let declaring =
+                        store
+                            .with_conn(profiles::list_with_sandboxes)
+                            .map_err(|db| {
+                                tracing::error!("failed to check profiles for sandboxes: {db}");
+                                ExitCode::FAILURE
+                            })?;
+                    if !declaring.is_empty() {
+                        eprintln!(
+                            "baesrv: configuration error: {e} — {} profile(s) declare \
+                             available_sandboxes that this driver cannot serve",
+                            declaring.len()
+                        );
+                        tracing::error!(
+                            error = %e,
+                            profiles = declaring.len(),
+                            "BAE_SANDBOX_DRIVER=apple-container is unusable on this host \
+                             while profiles declare available_sandboxes; refusing to start"
+                        );
+                        // Usage error, per aspec/uxui/cli.md.
+                        return Err(ExitCode::from(2));
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        "BAE_SANDBOX_DRIVER=apple-container is unusable on this host; \
+                         starting anyway (no profile declares available_sandboxes) — \
+                         sandbox calls will fail as unsupported"
+                    );
+                    Ok(Arc::new(UnsupportedDriver::new(e.to_string())))
+                }
+            }
         }
     }
 }

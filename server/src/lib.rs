@@ -103,11 +103,17 @@ pub fn open_store(config: &Config) -> Result<Store, StoreError> {
 /// `mcp_registry` and `provider_registry` are the (possibly empty) sets of MCP
 /// servers and LLM providers parsed from `bae-config.toml`; both are held
 /// in-memory on [`AppState`] and never persisted.
+///
+/// `sandbox_driver` is the host-wide container engine selected by
+/// `BAE_SANDBOX_DRIVER` (built by `cli::run_serve`); the startup pass below
+/// re-triggers image provisioning for every profile that declares
+/// `available_sandboxes`, since the status map is in-memory only.
 pub async fn serve(
     config: Config,
     store: Store,
     mcp_registry: HashMap<String, McpServerConfig>,
     provider_registry: HashMap<String, ProviderConfig>,
+    sandbox_driver: std::sync::Arc<dyn engine::sandbox::SandboxDriver>,
 ) -> Result<(), RunError> {
     tracing::info!(
         version = VERSION,
@@ -118,6 +124,23 @@ pub async fn serve(
 
     let mut state = AppState::with_registries(store, mcp_registry, provider_registry);
     state.turn_timeout = config.turn_timeout;
+    state.sandbox_driver = sandbox_driver;
+
+    // Sandbox image status is in-memory only: re-provision every declaring
+    // profile so a restart never leaves status permanently stale (and a
+    // startRemoteSandbox right after restart still finds its image ensured).
+    match state.store.with_conn(store::profiles::list_with_sandboxes) {
+        Ok(declaring) => {
+            for profile in declaring {
+                api::admin::profiles::provision_sandbox_images(
+                    &state,
+                    &profile.id,
+                    profile.sandbox_image_names(),
+                );
+            }
+        }
+        Err(e) => tracing::error!("startup sandbox provisioning skipped: {e}"),
+    }
 
     // Periodic activity summary. The first tick fires immediately, so one
     // summary also lands at startup; after that, one per interval.

@@ -215,7 +215,17 @@ mod tests {
                 | EventType::SessionError
                 | EventType::SessionCompaction
                 | EventType::SessionJoin
-                | EventType::SessionDriverRegistered => true,
+                | EventType::SessionDriverRegistered
+                // Sandbox visibility is the point: every sandbox lifecycle and
+                // dispatch event is forwarded to live watchers.
+                | EventType::SandboxAvailable
+                | EventType::SandboxStart
+                | EventType::SandboxRunning
+                | EventType::SandboxStop
+                | EventType::SandboxStopped
+                | EventType::SandboxError
+                | EventType::SandboxRequest
+                | EventType::SandboxResponse => true,
             };
             assert_eq!(
                 should_broadcast(&record(et, json!({}))),

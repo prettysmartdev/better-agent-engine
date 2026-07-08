@@ -22,7 +22,7 @@
 //!     "get_current_time",
 //!     "Return the current time as an ISO-8601 string",
 //!     json!({ "type": "object", "properties": {} }),
-//!     |_input| Ok(json!("2026-07-06T12:00:00Z")),
+//!     |_input| async move { Ok(json!("2026-07-06T12:00:00Z")) },
 //! );
 //!
 //! let mut session = Harness::new(config).with_tool(get_time).connect().await?;
@@ -48,16 +48,24 @@
 
 mod config;
 mod error;
+pub mod files;
 mod harness;
 mod hooks;
+pub mod sandbox;
 mod tool;
 mod types;
 
 pub use config::Config;
 pub use error::Error;
+pub use files::{explore_files_tool, read_file_tool, write_file_tool, FileToolConfig};
 pub use harness::{Harness, Session};
 pub use hooks::{HookResult, Hooks};
-pub use tool::{BoxError, Tool, ToolHandler};
+pub use sandbox::{
+    run_shell_command, run_shell_named, AppleContainerDriver, DockerDriver, ExecResult, RemoteMode,
+    RemoteSandboxStarted, RemoteSandboxStopped, SandboxDriver, SandboxError, SandboxHandle,
+    SandboxSession, SandboxTarget, SandboxTool, SandboxToolDef,
+};
+pub use tool::{BoxError, Tool, ToolFuture, ToolHandler};
 pub use types::{
     ApiError, Content, ContentBlock, EventView, JsonRpcError, JsonRpcFrame, JsonRpcRequest,
     McpRequestPayload, McpResponsePayload, Message, Profile, SendMessageParams, SendMessageResult,

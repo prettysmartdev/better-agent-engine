@@ -19,6 +19,14 @@ from ..errors import (
     UnknownToolError,
 )
 from ..hooks import Hooks
+from ..sandbox import (
+    ExecResult,
+    RemoteSandboxStarted,
+    RemoteSandboxStopped,
+    SandboxSession,
+    SandboxTool,
+    SandboxToolDef,
+)
 from ..tool import Tool, ToolRegistry
 from ..types import (
     EventType,
@@ -61,10 +69,34 @@ class Harness:
         # on connect and closed when the session closes.
         self._transport = transport
         self._owns_transport = transport is None
+        # The late-bound sandbox handle shared with sandbox tools and the Session,
+        # plus any Auto-mode declarations sent in the session-open list.
+        self._sandbox = SandboxSession()
+        self._sandbox_defs: list[SandboxToolDef] = []
 
     def register_tool(self, tool: Tool) -> "Harness":
         """Add a tool. Returns self for chaining."""
         self._registry.add(tool)
+        return self
+
+    def sandbox_session(self) -> SandboxSession:
+        """A handle to this harness's sandbox capability, for building sandbox
+        tools **before** ``connect()``. Its transport is late-bound at connect;
+        see :mod:`bae_py.sandbox`. Pass it to :func:`~bae_py.sandbox.run_shell_command`
+        / :func:`~bae_py.sandbox.run_shell_named`, then register the result with
+        :meth:`register_sandbox_tool`.
+        """
+        return self._sandbox
+
+    def register_sandbox_tool(self, tool: SandboxTool) -> "Harness":
+        """Register a builtin sandbox tool, routing it correctly: a
+        client-dispatched tool joins the ordinary registry; an Auto-mode
+        declaration joins the session-open ``sandbox_tools`` list. Returns self.
+        """
+        if tool.tool is not None:
+            self._registry.add(tool.tool)
+        elif tool.definition is not None:
+            self._sandbox_defs.append(tool.definition)
         return self
 
     def set_hooks(self, hooks: Hooks) -> "Harness":
@@ -105,14 +137,19 @@ class Harness:
         """
         transport = self._transport or HttpxTransport()
         try:
+            open_body: dict[str, Any] = {
+                "client_version": self.config.client_version,
+                "tools": self._registry.declarations(),
+            }
+            # Only present when Auto-mode sandbox tools are registered, so a
+            # session without them sends the exact same body as before.
+            if self._sandbox_defs:
+                open_body["sandbox_tools"] = [d.declaration() for d in self._sandbox_defs]
             resp = await transport.request(
                 "POST",
                 url,
                 headers=self._client_auth(),
-                json={
-                    "client_version": self.config.client_version,
-                    "tools": self._registry.declarations(),
-                },
+                json=open_body,
             )
             _raise_for_status(resp)
             body = resp.body or {}
@@ -125,7 +162,11 @@ class Harness:
                 session_key=body["session_key"],
                 profile=Profile.from_wire(body["profile"]),
                 owns_transport=self._owns_transport,
+                sandbox=self._sandbox,
             )
+            # Late-bind the sandbox transport now that the session exists, so any
+            # sandbox tool built pre-connect can reach the remote RPC methods.
+            self._sandbox.bind(session)
             # Register as a driver before any send: session.sendMessage requires
             # it (a -32001 error otherwise). Application code never calls this.
             await session._register_driver()
@@ -158,6 +199,7 @@ class Session:
         session_key: str,
         profile: Profile,
         owns_transport: bool,
+        sandbox: SandboxSession | None = None,
     ) -> None:
         self.config = config
         self.session_id = session_id
@@ -172,6 +214,7 @@ class Session:
         self._closed = False
         #: Monotonic JSON-RPC request id, unique per session.
         self._rpc_id = 0
+        self._sandbox = sandbox if sandbox is not None else SandboxSession()
 
     async def send(self, message: "str | Message") -> Message:
         """Send a user turn and drive the full round-trip (harness loop).
@@ -214,6 +257,98 @@ class Session:
                 results.append(result_block)
 
             current = Message(role="user", content=results)
+
+    def sandbox_session(self) -> SandboxSession:
+        """A handle to this session's sandbox capability, for building sandbox
+        tools after connect (register the resulting client-dispatched tools with
+        :meth:`register_tool`). Auto-mode declarations must instead be registered
+        on the :class:`Harness` before connect.
+        """
+        return self._sandbox
+
+    def register_tool(self, tool: Tool) -> "Session":
+        """Register an additional client-dispatched tool on the live session."""
+        self._registry.add(tool)
+        return self
+
+    async def exec_remote_sandbox(self, command: str) -> ExecResult:
+        """Run ``command`` in the session's remote sandbox
+        (``session.execRemoteSandbox``). Available to any tool handler or app code.
+        """
+        result = await self._sandbox_rpc("session.execRemoteSandbox", {"command": command})
+        return ExecResult(
+            stdout=str(result.get("stdout", "")),
+            stderr=str(result.get("stderr", "")),
+            exit_code=int(result.get("exit_code", 0)),
+        )
+
+    async def report_local_sandbox(
+        self,
+        state: str,
+        image: str,
+        container_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Report a local sandbox lifecycle transition (``session.reportLocalSandbox``)."""
+        await self._sandbox_rpc(
+            "session.reportLocalSandbox",
+            {"state": state, "image": image, "container_id": container_id, "detail": detail},
+        )
+
+    async def start_local_sandbox(self, image: str) -> None:
+        """Eagerly start a local sandbox for ``image`` (otherwise it starts lazily
+        on the first local-target tool call), reporting ``running`` to the server.
+        """
+        await self._sandbox.start_local(image)
+
+    async def stop_local_sandbox(self) -> None:
+        """Stop every local sandbox this session started, reporting ``stopped``."""
+        await self._sandbox.stop_all_local()
+
+    async def start_remote_sandbox(self, image: str) -> RemoteSandboxStarted:
+        """Ask the server to start this session's **remote** sandbox from
+        ``image`` (``session.startRemoteSandbox``). ``image`` must be in the
+        session profile's ``available_sandboxes``, or the call raises
+        :class:`RpcError` code ``-32011``. One sandbox per session: a second
+        start while one is running raises ``-32000``. Required before any
+        ``Remote``-target tool (Auto-dispatched or :meth:`exec_remote_sandbox`)
+        can run.
+        """
+        result = await self._sandbox_rpc("session.startRemoteSandbox", {"image": image})
+        started_at = result.get("started_at")
+        return RemoteSandboxStarted(
+            sandbox_id=str(result.get("sandbox_id", "")),
+            image=str(result.get("image", "")),
+            started_at=None if started_at is None else str(started_at),
+        )
+
+    async def stop_remote_sandbox(self) -> RemoteSandboxStopped:
+        """Stop this session's remote sandbox (``session.stopRemoteSandbox``).
+        Raises :class:`RpcError` code ``-32013`` if none is running. (Session
+        close also stops a still-running remote sandbox server-side.)
+        """
+        result = await self._sandbox_rpc("session.stopRemoteSandbox", {})
+        return RemoteSandboxStopped(
+            stopped=bool(result.get("stopped", False)),
+            image=str(result.get("image", "")),
+            sandbox_id=str(result.get("sandbox_id", "")),
+        )
+
+    async def _sandbox_rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Issue one non-turn sandbox RPC over ``…/rpc`` and return its terminal
+        ``result``. Shaped like ``registerDriver``: a synchronous utility call.
+        """
+        frames = self._transport.stream(
+            "POST",
+            self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
+            headers=self._session_auth(),
+            json=self._rpc_request(method, params),
+        )
+        async for frame in frames:
+            _raise_for_rpc_error(frame)
+            if _is_terminal(frame):
+                return frame.get("result") or {}
+        raise RpcError(-32603, "stream ended without a terminal response")
 
     async def subscribe(
         self,
@@ -320,6 +455,10 @@ class Session:
         if self._closed:
             return
         self._closed = True
+        # Stop any still-running local sandboxes this session started (reporting
+        # ``stopped`` for each), mirroring how the server stops its own remote
+        # sandbox at session close.
+        await self._sandbox.stop_all_local()
         try:
             resp = await self._transport.request(
                 "DELETE",

@@ -127,6 +127,13 @@ Auth: **client key**.
         "properties": {}
       }
     }
+  ],
+  "sandbox_tools": [
+    {
+      "name": "run_shell_command",
+      "description": "Run an arbitrary shell command inside the configured sandbox.",
+      "input_schema": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] }
+    }
   ]
 }
 ```
@@ -136,6 +143,19 @@ Auth: **client key**.
   harness can execute. Every declared tool name must be in the profile's
   `allowed_tools`; an empty `allowed_tools` on the profile means no tools are
   allowed. `description` and `input_schema` are optional per tool.
+- `sandbox_tools` — optional, default `[]`. **Auto-mode** sandbox tool
+  declarations (see [Sandboxes guide — Auto vs. manual remote
+  dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)): the
+  server dispatches these directly against the session's remote sandbox
+  inside `run_turn`, without ever pausing the loop or involving the client.
+  Stored per-client, sibling to (never merged with) `tools`. **Not** validated
+  against the profile's `allowed_tools` — that check governs client-dispatched
+  tools only; the sandbox trust boundary is `available_sandboxes`, enforced
+  at [`session.startRemoteSandbox`](#sessionstartremotesandbox) time. Each
+  entry's `input_schema` must require a string `command` property (the server
+  execs `input.command`). Omit the key entirely when no Auto-mode tool is
+  registered — this keeps a pre-work-item-0006 session-open body
+  byte-identical.
 
 At session creation, BAE also connects to any MCP servers named in the
 profile's `mcp_servers` list, runs the MCP `initialize` handshake, and merges
@@ -363,8 +383,12 @@ Content-Type: application/x-ndjson
 {"jsonrpc":"2.0","id":1,"result":{…}}\n
 ```
 
-The four supported `method` values are `session.registerDriver`,
-`session.sendMessage`, `session.subscribe`, `session.unsubscribe`.
+The eight supported `method` values are `session.registerDriver`,
+`session.sendMessage`, `session.subscribe`, `session.unsubscribe`,
+`session.startRemoteSandbox`, `session.stopRemoteSandbox`,
+`session.execRemoteSandbox`, `session.reportLocalSandbox` (the last four are
+documented in [Sandboxes](#sandboxes) below; see the
+[Sandboxes guide](../guides/sandboxes.md) for a walkthrough).
 
 ---
 
@@ -575,6 +599,189 @@ End all active `session.subscribe` streams for this session.
   "result": { "unsubscribed": true }
 }
 ```
+
+---
+
+## Sandboxes
+
+The four methods below implement the remote-sandbox lifecycle and
+client-originated local-sandbox telemetry described in the
+[Sandboxes guide](../guides/sandboxes.md). All four require prior driver
+registration (`session.registerDriver`), the same `-32001` gate
+`session.sendMessage` uses.
+
+### `session.startRemoteSandbox`
+
+Ask the server to start this session's one remote sandbox from an image in
+the session's own profile's `available_sandboxes`.
+
+**Params:**
+
+```json
+{ "image": "python:3.12" }
+```
+
+- `image` — required, non-empty string.
+
+**Terminal result:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "sandbox_id": "…",
+    "image": "python:3.12",
+    "started_at": "2026-07-06T18:26:10.000Z"
+  }
+}
+```
+
+`started_at` is the `session.sandbox.running` event's `created_at`, or `null`
+if that log write itself failed.
+
+**Events:** `session.sandbox.start` (`{"image", "dispatch":"remote"}`), then
+either `session.sandbox.running` (`{"image", "sandbox_id", "dispatch":"remote"}`)
+or `session.sandbox.error` (`{"image", "phase":"start", "detail", "dispatch":"remote"}`).
+
+**JSON-RPC errors:**
+- `-32001` — caller is not a registered driver.
+- `-32602` — missing or blank `image`.
+- `-32000` — session not open, the profile was deleted, or **a sandbox is
+  already running for this session** (one sandbox per session — see
+  [Sandboxes guide — Session-wide, not per-driver](../guides/sandboxes.md#session-wide-not-per-driver)).
+- `-32011 sandbox_image_not_allowed` — `image` is not in **this session's
+  own** profile's `available_sandboxes`, including an image declared only on
+  a *different* profile. No container is started.
+- `-32012 sandbox_start_failed` — the driver's `ensure_image`/`start` call
+  failed (a `session.sandbox.error` event, phase `start`, carries the
+  detail).
+
+---
+
+### `session.stopRemoteSandbox`
+
+Stop this session's one remote sandbox.
+
+**Params:** `{}`
+
+**Terminal result:**
+
+```json
+{ "jsonrpc": "2.0", "id": 4, "result": { "stopped": true, "image": "python:3.12", "sandbox_id": "…" } }
+```
+
+**Events:** `session.sandbox.stop` (`{"image", "sandbox_id", "reason":"explicit", "dispatch":"remote"}`),
+then `session.sandbox.stopped` (same shape) on success, or
+`session.sandbox.error` (`phase:"stop"`) on failure. The handle is removed
+from server state **before** the driver call, so a failed stop never leaves
+a phantom sandbox other calls could still dispatch against.
+
+**JSON-RPC errors:**
+- `-32001` — caller is not a registered driver.
+- `-32013 sandbox_not_running` — no sandbox is currently running for this
+  session.
+- `-32000` — `"sandbox stop failed: <detail>"` when the driver's `stop` call
+  itself errors. This is a generic code (there is no dedicated slug for a
+  stop failure) — the authoritative signal is the `session.sandbox.error`
+  event; the handle is removed either way, so this response can be treated
+  as "the sandbox is gone" regardless.
+
+A session close ([`DELETE /api/v1/sessions/{id}`](#delete-apiv1sessionsid--close-a-session))
+triggers the identical stop sequence for any still-running remote sandbox,
+with `"reason": "session_close"` instead of `"explicit"`.
+
+---
+
+### `session.execRemoteSandbox`
+
+Run one shell command in the session's already-started remote sandbox and
+return the raw result. This is a **manual-dispatch utility call**, not part
+of the turn loop — see [Sandboxes guide — Auto vs. manual remote
+dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch). The caller
+(the client harness) builds its own `tool_result` from the response and
+sends it via an ordinary `session.sendMessage` continuation.
+
+**Params:**
+
+```json
+{ "command": "python --version" }
+```
+
+**Terminal result:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "result": { "stdout": "Python 3.12.3\n", "stderr": "", "exit_code": 0 }
+}
+```
+
+A non-zero `exit_code` is still a **successful** RPC result, not an error —
+the command ran and returned a result, whatever that result was.
+
+**Events (failure only):** `session.sandbox.error` (`{"image", "sandbox_id",
+"phase":"exec", "detail", "dispatch":"remote"}`). There is no lifecycle
+event on success — this is a utility call, not a turn.
+
+**JSON-RPC errors:**
+- `-32001` — caller is not a registered driver.
+- `-32602` — missing `command`.
+- `-32013 sandbox_not_running` — no remote sandbox is running for this
+  session; call `session.startRemoteSandbox` first.
+- `-32000` — `"sandbox exec failed: <detail>"` when the driver's `exec` call
+  itself errors.
+
+---
+
+### `session.reportLocalSandbox`
+
+Report a lifecycle transition for a **local** sandbox — one the calling
+client harness started against its own Docker/Apple Containers engine,
+invisible to the server otherwise. Every SDK's builtin sandbox tools call
+this automatically; see [Sandboxes guide — Local sandboxes report their own
+lifecycle](../guides/sandboxes.md#local-sandboxes-report-their-own-lifecycle).
+
+**Params:**
+
+```json
+{
+  "state": "running",
+  "image": "python:3.12",
+  "container_id": "…",
+  "detail": null
+}
+```
+
+- `state` — required, one of `"running"`, `"stopped"`, `"error"`.
+- `image` — required string.
+- `container_id` — optional, `null` if not applicable.
+- `detail` — optional, `null` unless `state` is `"error"`.
+
+**Terminal result:**
+
+```json
+{ "jsonrpc": "2.0", "id": 6, "result": { "reported": true } }
+```
+
+**Events:** `state` maps to `session.sandbox.running`/`stopped`/`error`,
+payload `{"dispatch":"local", "image", "container_id", "detail"}`, attributed
+to the caller's `client_key_id`.
+
+- **No `available_sandboxes` validation is performed** — an arbitrary,
+  unregistered image name is accepted and logged as-is. This is deliberate:
+  a local sandbox is the harness developer's own local trust decision, never
+  a server-governed resource. This method can also never forge a **remote**
+  lifecycle event — there is no `"scope"` parameter — the remote lifecycle
+  stays exclusively server-authored via the three methods above.
+- Any registered driver may call this — it does not need to be the current
+  turn's owner, since local sandbox lifecycle is orthogonal to turn
+  ownership.
+
+**JSON-RPC errors:**
+- `-32001` — caller is not a registered driver.
+- `-32602` — invalid `state`, or missing `image`.
 
 ---
 

@@ -1,9 +1,11 @@
 //! reference-assistant — the canonical BAE example agent (Rust).
 //!
-//! Mirrors the TypeScript and Python examples exactly: it registers one simple
-//! client-side tool (`get_current_time`), opens a session, sends a message, and
-//! drives the harness loop to a final answer — exercising every hook point on
-//! the way. See `aspec/genai/agents.md` (Agent 1) and `api-contract.md` §9.
+//! Mirrors the TypeScript and Python examples exactly: it registers a simple
+//! client-side tool (`get_current_time`), a builtin **local sandbox** shell
+//! tool, and the three builtin **file tools** scoped to this example's own
+//! `workspace/` directory, opens a session, sends a message, and drives the
+//! harness loop to a final answer — exercising every hook point on the way.
+//! See `aspec/genai/agents.md` (Agent 1) and `api-contract.md` §9.
 //!
 //! Documentation first, product second: this is the readable end-to-end tour of
 //! the harness surface.
@@ -21,13 +23,24 @@
 //! the profile's `${ANTHROPIC_API_KEY}` server-side, but the example checks it
 //! up front so a missing key fails fast with a clear message instead of a
 //! provider-unavailable turn buried in the session events.
+//!
+//! The `run_shell_command` tool is bound to a **local** sandbox: the model can
+//! ask to run a shell command and this harness executes it via `docker exec`
+//! (or `container exec` on macOS) against a throwaway `alpine:3.19` container.
+//! That requires a local `docker`/`container` binary; the model only reaches
+//! for this tool if the prompt calls for running a shell command, so a
+//! default `"What time is it?"` run never touches it.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bae_rs::{Config, Harness, Hooks, McpRequestPayload, McpResponsePayload, Tool};
+use bae_rs::{
+    explore_files_tool, read_file_tool, run_shell_command, write_file_tool, Config, FileToolConfig,
+    Harness, Hooks, McpRequestPayload, McpResponsePayload, RemoteMode, SandboxTarget, Tool,
+};
 use serde_json::json;
 
 /// Env var naming the provider key the configured profile references. The
@@ -73,8 +86,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
         "get_current_time",
         "Return the current UTC time as an ISO-8601 string.",
         json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        |_input| Ok(json!(now_iso8601())),
+        |_input| async move { Ok(json!(now_iso8601())) },
     );
+
+    // --- 2b. Builtin file tools, scoped to this example's own workspace ----
+    // `allowed_dirs` is required and an empty list permits nothing, so every
+    // path outside `workspace/` is rejected in-band rather than opening up the
+    // whole filesystem. `.env` is denied even though no `allowed_extensions`
+    // restriction is set, to show `denied_extensions` winning unconditionally.
+    let workspace_dir = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/reference-assistant/workspace"
+    ));
+    std::fs::create_dir_all(&workspace_dir)?;
+    let file_config = FileToolConfig::new([workspace_dir]).denied_extensions(["env"]);
+    let read_file = read_file_tool(file_config.clone());
+    let write_file = write_file_tool(file_config.clone());
+    let explore_files = explore_files_tool(file_config);
 
     // --- 3. Hooks: exercise every customization point at least once --------
     // A shared counter proves each point actually fired by the end of the run.
@@ -154,8 +182,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
         });
 
     // --- 4. Open a session and run the loop --------------------------------
-    let mut session = Harness::new(config)
+    // Sandbox tools need a live Session (for local lifecycle reporting and, for
+    // a remote target, `session.execRemoteSandbox`), so — unlike the file tools
+    // above, which need no session and could be built before this point too —
+    // they are built from a handle obtained *before* `connect()` but only
+    // actually usable *after* it returns. See `bae_rs::sandbox`'s module docs.
+    let harness = Harness::new(config);
+    let sandbox_session = harness.sandbox_session();
+    let run_shell = run_shell_command(
+        &sandbox_session,
+        SandboxTarget::Local {
+            image: "alpine:3.19".to_string(),
+        },
+        // Ignored for a `Local` target (only meaningful for `Remote`).
+        RemoteMode::Auto,
+    );
+
+    let mut session = harness
         .with_tool(get_current_time)
+        .with_tool(read_file)
+        .with_tool(write_file)
+        .with_tool(explore_files)
+        .with_sandbox_tool(run_shell)
         .with_hooks(hooks)
         .connect()
         .await

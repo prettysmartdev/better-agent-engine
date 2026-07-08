@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -30,6 +31,10 @@ use serde_json::json;
 use crate::config::Config;
 use crate::error::Error;
 use crate::hooks::Hooks;
+use crate::sandbox::{
+    ExecResult, LocalSandboxReport, RemoteSandboxStarted, RemoteSandboxStopped, SandboxFuture,
+    SandboxRpc, SandboxSession, SandboxTool, SandboxToolDef,
+};
 use crate::tool::Tool;
 use crate::types::{
     Content, ContentBlock, EventView, JsonRpcFrame, JsonRpcRequest, Message, Profile,
@@ -123,6 +128,7 @@ pub(crate) async fn run_loop<T: Transport>(
                 .ok_or_else(|| Error::UnknownTool(call.name.clone()))?;
             let output = tool
                 .call(call.input.clone())
+                .await
                 .map_err(|source| Error::Tool {
                     name: call.name.clone(),
                     source,
@@ -324,6 +330,121 @@ impl Transport for HttpTransport {
     }
 }
 
+impl HttpTransport {
+    /// `session.execRemoteSandbox`: run `command` in the session's live remote
+    /// sandbox and return its `{stdout, stderr, exit_code}`. A synchronous
+    /// utility call (no turn-loop involvement), like `registerDriver`.
+    async fn exec_remote_sandbox_rpc(&self, command: &str) -> Result<ExecResult, Error> {
+        let req = JsonRpcRequest::new(
+            self.next_id(),
+            "session.execRemoteSandbox",
+            json!({ "command": command }),
+        );
+        let mut reader = self.open_rpc(&req).await?;
+        let mut terminal: Option<serde_json::Value> = None;
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if frame.id.is_some() {
+                terminal = Some(
+                    frame
+                        .result
+                        .ok_or_else(|| rpc_protocol_error("execRemoteSandbox missing `result`"))?,
+                );
+                break;
+            }
+        }
+        let result = terminal
+            .ok_or_else(|| rpc_protocol_error("execRemoteSandbox stream ended without a result"))?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `session.reportLocalSandbox`: record a local sandbox lifecycle event in
+    /// the session's event log.
+    async fn report_local_sandbox_rpc(&self, report: &LocalSandboxReport) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.reportLocalSandbox", report);
+        let mut reader = self.open_rpc(&req).await?;
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if frame.id.is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// `session.startRemoteSandbox`: ask the server to start the session's one
+    /// remote sandbox from `image` (validated against the profile's
+    /// `available_sandboxes`) and return its `{sandbox_id, image, started_at}`.
+    /// A control-plane call, like `registerDriver` — no turn-loop involvement.
+    async fn start_remote_sandbox_rpc(&self, image: &str) -> Result<RemoteSandboxStarted, Error> {
+        let req = JsonRpcRequest::new(
+            self.next_id(),
+            "session.startRemoteSandbox",
+            json!({ "image": image }),
+        );
+        let result = self.rpc_terminal(&req, "startRemoteSandbox").await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `session.stopRemoteSandbox`: stop the session's one remote sandbox and
+    /// return `{stopped, image, sandbox_id}`.
+    async fn stop_remote_sandbox_rpc(&self) -> Result<RemoteSandboxStopped, Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.stopRemoteSandbox", json!({}));
+        let result = self.rpc_terminal(&req, "stopRemoteSandbox").await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Drive a single non-turn JSON-RPC request to its terminal frame and return
+    /// the raw `result` value, surfacing an error frame as [`Error::Rpc`]. Shared
+    /// by the control-plane sandbox calls.
+    async fn rpc_terminal(
+        &self,
+        req: &JsonRpcRequest<serde_json::Value>,
+        label: &str,
+    ) -> Result<serde_json::Value, Error> {
+        let mut reader = self.open_rpc(req).await?;
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if frame.id.is_some() {
+                return frame
+                    .result
+                    .ok_or_else(|| rpc_protocol_error(&format!("{label} missing `result`")));
+            }
+        }
+        Err(rpc_protocol_error(&format!(
+            "{label} stream ended without a result"
+        )))
+    }
+}
+
+impl SandboxRpc for HttpTransport {
+    fn exec_remote_sandbox(&self, command: String) -> SandboxFuture<'_, Result<ExecResult, Error>> {
+        Box::pin(async move { self.exec_remote_sandbox_rpc(&command).await })
+    }
+
+    fn report_local_sandbox(
+        &self,
+        report: LocalSandboxReport,
+    ) -> SandboxFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.report_local_sandbox_rpc(&report).await })
+    }
+}
+
 /// Does this turn's event list mark an all-providers-failed outcome? The server
 /// no longer returns a `502`: the failure turn arrives as a normal terminal
 /// result, distinguished only by a `session.error`/`all_providers_failed` event.
@@ -416,6 +537,10 @@ fn parse_problem(status: u16, bytes: &[u8]) -> crate::types::ApiError {
 struct OpenRequest {
     client_version: String,
     tools: Vec<serde_json::Value>,
+    /// Auto-mode sandbox tool declarations (part D); omitted when none are
+    /// registered, so the field is invisible to servers/harnesses not using it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sandbox_tools: Vec<serde_json::Value>,
 }
 
 /// `POST /api/v1/sessions` success body.
@@ -437,7 +562,7 @@ struct OpenResponse {
 ///
 /// # async fn run() -> Result<(), bae_rs::Error> {
 /// let mut session = Harness::new(Config::new("http://localhost:8080", "bae_…"))
-///     .with_tool(Tool::new("noop", "does nothing", json!({}), |_| Ok(json!("ok"))))
+///     .with_tool(Tool::new("noop", "does nothing", json!({}), |_| async move { Ok(json!("ok")) }))
 ///     .connect()
 ///     .await?;
 /// let reply = session.send("hello").await?;
@@ -451,6 +576,12 @@ pub struct Harness {
     http: reqwest::Client,
     tools: HashMap<String, Tool>,
     hooks: Hooks,
+    /// The late-bound sandbox handle shared with every sandbox tool and the
+    /// eventual [`Session`]; its transport is filled in [`Harness::open`].
+    sandbox: SandboxSession,
+    /// Auto-mode sandbox tool declarations, sent in the session-open
+    /// `sandbox_tools` array.
+    sandbox_defs: Vec<SandboxToolDef>,
 }
 
 impl Harness {
@@ -462,7 +593,42 @@ impl Harness {
             http: reqwest::Client::new(),
             tools: HashMap::new(),
             hooks: Hooks::default(),
+            sandbox: SandboxSession::new(),
+            sandbox_defs: Vec::new(),
         }
+    }
+
+    /// A handle to this harness's sandbox capability, for building sandbox tools
+    /// **before** `connect()`. Its transport is late-bound at connect; see
+    /// [`crate::sandbox`] for the required ordering. Pass the handle to
+    /// [`run_shell_command`](crate::sandbox::run_shell_command) /
+    /// [`run_shell_named`](crate::sandbox::run_shell_named), then register the
+    /// result with [`with_sandbox_tool`](Harness::with_sandbox_tool).
+    pub fn sandbox_session(&self) -> SandboxSession {
+        self.sandbox.clone()
+    }
+
+    /// Register a builtin sandbox tool, routing it to the correct place: a
+    /// client-dispatched [`SandboxTool::Tool`] joins the ordinary tool registry;
+    /// an Auto-mode [`SandboxTool::Def`] joins the session-open `sandbox_tools`
+    /// list. Builder-style; returns `self`.
+    pub fn with_sandbox_tool(mut self, tool: SandboxTool) -> Self {
+        self.register_sandbox_tool(tool);
+        self
+    }
+
+    /// Register a builtin sandbox tool in place (non-consuming). See
+    /// [`with_sandbox_tool`](Harness::with_sandbox_tool).
+    pub fn register_sandbox_tool(&mut self, tool: SandboxTool) -> &mut Self {
+        match tool {
+            SandboxTool::Tool(t) => {
+                self.tools.insert(t.name.clone(), t);
+            }
+            SandboxTool::Def(d) => {
+                self.sandbox_defs.push(d);
+            }
+        }
+        self
     }
 
     /// Register a client-side tool. A later tool with the same name replaces an
@@ -531,11 +697,17 @@ impl Harness {
             http,
             tools,
             hooks,
+            sandbox,
+            sandbox_defs,
         } = self;
 
         let body = OpenRequest {
             client_version: config.client_version.clone(),
             tools: tools.values().map(Tool::declaration).collect(),
+            sandbox_tools: sandbox_defs
+                .iter()
+                .map(SandboxToolDef::declaration)
+                .collect(),
         };
 
         let resp = http
@@ -552,13 +724,18 @@ impl Harness {
         }
         let open: OpenResponse = serde_json::from_slice(&bytes)?;
 
-        let transport = HttpTransport {
+        let transport = Arc::new(HttpTransport {
             http,
             base: config.base().to_string(),
             session_id: open.session_id.clone(),
             session_key: open.session_key,
             next_id: AtomicU64::new(1),
-        };
+        });
+
+        // Late-bind the sandbox transport now that the session exists, so any
+        // sandbox tool built pre-connect can reach `session.execRemoteSandbox` /
+        // `session.reportLocalSandbox` the first time it fires.
+        sandbox.bind(transport.clone() as Arc<dyn SandboxRpc>);
 
         // Register as a driver before any send: session.sendMessage requires it
         // (a `-32001` error otherwise). Application code never calls this.
@@ -570,6 +747,7 @@ impl Harness {
             profile: open.profile,
             tools,
             hooks,
+            sandbox,
         })
     }
 }
@@ -579,11 +757,12 @@ impl Harness {
 /// The session key is held internally and never exposed; drive the agent with
 /// [`send`](Session::send) and release it with [`close`](Session::close).
 pub struct Session {
-    transport: HttpTransport,
+    transport: Arc<HttpTransport>,
     session_id: String,
     profile: Profile,
     tools: HashMap<String, Tool>,
     hooks: Hooks,
+    sandbox: SandboxSession,
 }
 
 impl Session {
@@ -604,12 +783,80 @@ impl Session {
     /// becomes a user text turn.
     pub async fn send(&mut self, message: impl Into<Message>) -> Result<Message, Error> {
         run_loop(
-            &self.transport,
+            &*self.transport,
             &self.tools,
             &mut self.hooks,
             message.into(),
         )
         .await
+    }
+
+    /// A clone of this session's [`SandboxSession`] handle — for building
+    /// sandbox tools **after** connect (an alternative to
+    /// [`Harness::sandbox_session`]). Tools built from it must be registered on
+    /// this session with [`register_tool`](Session::register_tool); Auto-mode
+    /// declarations cannot be added post-open and must instead be registered on
+    /// the [`Harness`] before connect.
+    pub fn sandbox_session(&self) -> SandboxSession {
+        self.sandbox.clone()
+    }
+
+    /// Register an additional client-dispatched tool on the live session (e.g. a
+    /// local or remote-manual sandbox tool built after connect). A later tool
+    /// with the same name replaces an earlier one.
+    pub fn register_tool(&mut self, tool: Tool) -> &mut Self {
+        self.tools.insert(tool.name.clone(), tool);
+        self
+    }
+
+    /// Run `command` in the session's remote sandbox via
+    /// `session.execRemoteSandbox`. Available to any tool handler or application
+    /// code holding a [`SandboxSession`].
+    pub async fn exec_remote_sandbox(&self, command: &str) -> Result<ExecResult, Error> {
+        self.sandbox.exec_remote_sandbox(command).await
+    }
+
+    /// Report a local sandbox lifecycle transition via
+    /// `session.reportLocalSandbox` (`state` ∈ `running`/`stopped`/`error`).
+    pub async fn report_local_sandbox(
+        &self,
+        state: &str,
+        image: &str,
+        container_id: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<(), Error> {
+        self.sandbox
+            .report_local_sandbox(state, image, container_id, detail)
+            .await
+    }
+
+    /// Eagerly start a local sandbox for `image` (otherwise it starts lazily on
+    /// the first local-target tool call), reporting `running` to the server.
+    pub async fn start_local_sandbox(&self, image: &str) -> Result<(), Error> {
+        self.sandbox.start_local(image).await.map(|_| ())
+    }
+
+    /// Stop every local sandbox this session started, reporting `stopped`.
+    pub async fn stop_local_sandbox(&self) {
+        self.sandbox.stop_all_local().await
+    }
+
+    /// Ask the server to start this session's **remote** sandbox from `image`
+    /// (`session.startRemoteSandbox`). `image` must be in the session profile's
+    /// `available_sandboxes`, or the call fails with [`Error::Rpc`] code
+    /// `-32011`. One sandbox per session: a second start while one is running
+    /// fails with `-32000`. Required before any `Remote`-target tool
+    /// (Auto-dispatched or [`exec_remote_sandbox`](Session::exec_remote_sandbox))
+    /// can run.
+    pub async fn start_remote_sandbox(&self, image: &str) -> Result<RemoteSandboxStarted, Error> {
+        self.transport.start_remote_sandbox_rpc(image).await
+    }
+
+    /// Stop this session's remote sandbox (`session.stopRemoteSandbox`). Fails
+    /// with [`Error::Rpc`] code `-32013` if none is running. (Session close also
+    /// stops a still-running remote sandbox server-side.)
+    pub async fn stop_remote_sandbox(&self) -> Result<RemoteSandboxStopped, Error> {
+        self.transport.stop_remote_sandbox_rpc().await
     }
 
     /// Subscribe to this session's live `session.event` feed via the
@@ -643,7 +890,12 @@ impl Session {
 
     /// Close the session on the server (idempotent from the caller's view; a
     /// second close returns a `session_closed` [`Error::Api`]).
+    ///
+    /// Before releasing the session, stops any still-running **local** sandboxes
+    /// this session started — reporting `stopped` for each — mirroring how the
+    /// server stops its own remote sandbox at session close.
     pub async fn close(&mut self) -> Result<(), Error> {
+        self.sandbox.stop_all_local().await;
         self.transport.close().await
     }
 }
@@ -752,9 +1004,12 @@ mod tests {
     }
 
     fn time_tool() -> Tool {
-        Tool::new("get_current_time", "current time", json!({}), |_input| {
-            Ok(json!("2026-07-06T00:00:00Z"))
-        })
+        Tool::new(
+            "get_current_time",
+            "current time",
+            json!({}),
+            |_input| async move { Ok(json!("2026-07-06T00:00:00Z")) },
+        )
     }
 
     fn registry(tools: Vec<Tool>) -> HashMap<String, Tool> {
@@ -930,7 +1185,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_handler_error_propagates() {
-        let failing = Tool::new("boom", "always fails", json!({}), |_| {
+        let failing = Tool::new("boom", "always fails", json!({}), |_| async move {
             Err("handler exploded".into())
         });
         let transport = MockTransport::new(vec![Ok(assistant_tool_use("tu_1", "boom", json!({})))]);
@@ -1280,5 +1535,232 @@ mod tests {
         let join_payload: crate::SessionJoinPayload = serde_json::from_value(join.payload).unwrap();
         assert_eq!(join_payload.client_version.as_deref(), Some("9.9.9"));
         assert_eq!(join_payload.tools, vec!["get_current_time".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-SDK sandbox dispatch parity (WI 0006)
+    //
+    // The three client SDKs must observe an IDENTICAL ordered live event
+    // sequence for the same scripted sandbox turn, for both the AUTO
+    // (server-dispatched, structurally identical to an MCP round-trip) and
+    // MANUAL (client-dispatched, two turns) paths. The canonical sequences below
+    // MUST stay byte-for-byte identical to the arrays in the TS and Python SDK
+    // sandbox parity tests:
+    //   - client-typescript/src/sandbox.test.ts   (SANDBOX_AUTO_PARITY_SEQUENCE /
+    //                                               SANDBOX_MANUAL_PARITY_SEQUENCE)
+    //   - client-python/tests/test_sandbox_parity.py (same two names)
+    // -----------------------------------------------------------------------
+
+    /// Auto dispatch: one server-dispatched turn. Mirrors `MCP_PARITY_SEQUENCE`
+    /// exactly, with `sandbox.request`/`sandbox.response` in place of the MCP
+    /// events — the two dispatch paths look structurally identical in the log.
+    const SANDBOX_AUTO_PARITY_SEQUENCE: [&str; 9] = [
+        "provider.request",
+        "provider.response",
+        "tool.call",
+        "sandbox.request",
+        "sandbox.response",
+        "tool.result",
+        "provider.request",
+        "provider.response",
+        "server.message.send",
+    ];
+
+    /// Manual dispatch: the assistant turn pauses with a `tool_use`, the client
+    /// harness runs the tool (issuing `session.execRemoteSandbox` out of band —
+    /// which emits no lifecycle event on success), then sends the `tool_result`
+    /// back for a second turn. Two turns' worth of broadcast events.
+    const SANDBOX_MANUAL_PARITY_SEQUENCE: [&str; 7] = [
+        "provider.request",
+        "provider.response",
+        "server.message.send",
+        "client.message.send",
+        "provider.request",
+        "provider.response",
+        "server.message.send",
+    ];
+
+    /// The scripted AUTO turn: the live notifications, then a terminal text turn.
+    fn sandbox_auto_outcome() -> SendOutcome {
+        let notifications = vec![
+            parity_event("provider.request", json!({ "attempt": 0 })),
+            parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+            parity_event(
+                "tool.call",
+                json!({ "dispatch": "sandbox", "name": "run_shell_command", "input": { "command": "echo hi" } }),
+            ),
+            parity_event(
+                "sandbox.request",
+                json!({ "tool": "run_shell_command", "input": { "command": "echo hi" }, "command": "echo hi" }),
+            ),
+            parity_event(
+                "sandbox.response",
+                json!({ "sandbox_id": "cid-1", "ok": true, "result": { "stdout": "hi\n", "stderr": "", "exit_code": 0 } }),
+            ),
+            parity_event(
+                "tool.result",
+                json!({ "tool_use_id": "tu_sbx", "dispatch": "sandbox", "is_error": false, "content": [{ "type": "text", "text": "hi\n" }] }),
+            ),
+            parity_event("provider.request", json!({ "attempt": 0 })),
+            parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+            parity_event(
+                "server.message.send",
+                json!({ "role": "assistant", "content": [{ "type": "text", "text": "ran it" }] }),
+            ),
+        ];
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::Text {
+                    text: "ran it".into(),
+                }]),
+                events: vec![],
+            },
+            notifications,
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_auto_scenario_matches_canonical_sequence() {
+        let transport = MockTransport::new(vec![Ok(sandbox_auto_outcome())]);
+        let tools = registry(vec![]);
+
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = observed.clone();
+        let mut hooks = Hooks::default().on_event(move |ev| {
+            sink.lock().unwrap().push(ev.event_type.clone());
+            Ok(())
+        });
+
+        // Auto sandbox tools are dispatched server-side, so the loop ends after
+        // one turn — never pausing, never reaching the client.
+        let out = run_loop(&transport, &tools, &mut hooks, Message::user("run it"))
+            .await
+            .unwrap();
+        assert_eq!(out.text(), "ran it");
+        assert_eq!(
+            transport.sent.borrow().len(),
+            1,
+            "server-dispatched: single turn"
+        );
+
+        let guard = observed.lock().unwrap();
+        let seq: Vec<&str> = guard.iter().map(String::as_str).collect();
+        assert_eq!(seq, SANDBOX_AUTO_PARITY_SEQUENCE);
+    }
+
+    /// A recording [`SandboxRpc`] for the manual path: records each
+    /// `execRemoteSandbox` command and returns a scripted result.
+    struct RecordingSandboxRpc {
+        execs: Mutex<Vec<String>>,
+    }
+
+    impl crate::sandbox::SandboxRpc for RecordingSandboxRpc {
+        fn exec_remote_sandbox(
+            &self,
+            command: String,
+        ) -> crate::sandbox::SandboxFuture<'_, Result<crate::sandbox::ExecResult, Error>> {
+            self.execs.lock().unwrap().push(command);
+            Box::pin(async {
+                Ok(crate::sandbox::ExecResult {
+                    stdout: "manual-out".into(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            })
+        }
+        fn report_local_sandbox(
+            &self,
+            _report: crate::sandbox::LocalSandboxReport,
+        ) -> crate::sandbox::SandboxFuture<'_, Result<(), Error>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn sandbox_manual_turn1() -> SendOutcome {
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::ToolUse {
+                    id: "tu_manual".into(),
+                    name: "run_shell_command".into(),
+                    input: json!({ "command": "ls -la" }),
+                }]),
+                events: vec![],
+            },
+            notifications: vec![
+                parity_event("provider.request", json!({ "attempt": 0 })),
+                parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                parity_event(
+                    "server.message.send",
+                    json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "tu_manual", "name": "run_shell_command", "input": { "command": "ls -la" } }] }),
+                ),
+            ],
+        }
+    }
+
+    fn sandbox_manual_turn2() -> SendOutcome {
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]),
+                events: vec![],
+            },
+            notifications: vec![
+                parity_event(
+                    "client.message.send",
+                    json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu_manual" }] }),
+                ),
+                parity_event("provider.request", json!({ "attempt": 0 })),
+                parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                parity_event(
+                    "server.message.send",
+                    json!({ "role": "assistant", "content": [{ "type": "text", "text": "done" }] }),
+                ),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_manual_scenario_matches_canonical_sequence_and_dispatches_client_side() {
+        let transport =
+            MockTransport::new(vec![Ok(sandbox_manual_turn1()), Ok(sandbox_manual_turn2())]);
+
+        // A remote-manual sandbox tool, built from a session bound to a recorder.
+        let session = crate::sandbox::SandboxSession::new();
+        let rpc = Arc::new(RecordingSandboxRpc {
+            execs: Mutex::new(Vec::new()),
+        });
+        session.bind(rpc.clone() as Arc<dyn crate::sandbox::SandboxRpc>);
+        let tool = crate::sandbox::run_shell_command(
+            &session,
+            crate::sandbox::SandboxTarget::Remote,
+            crate::sandbox::RemoteMode::manual(|r| json!(r.stdout)),
+        )
+        .into_tool()
+        .expect("remote+manual yields a client-dispatched tool");
+        let tools = registry(vec![tool]);
+
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = observed.clone();
+        let mut hooks = Hooks::default().on_event(move |ev| {
+            sink.lock().unwrap().push(ev.event_type.clone());
+            Ok(())
+        });
+
+        let out = run_loop(&transport, &tools, &mut hooks, Message::user("list files"))
+            .await
+            .unwrap();
+        assert_eq!(out.text(), "done");
+        // Manual dispatch pauses: two turns (tool_use, then tool_result).
+        assert_eq!(transport.sent.borrow().len(), 2);
+
+        let guard = observed.lock().unwrap();
+        let seq: Vec<&str> = guard.iter().map(String::as_str).collect();
+        assert_eq!(seq, SANDBOX_MANUAL_PARITY_SEQUENCE);
+        drop(guard);
+
+        // The client harness actually dispatched the tool, issuing the fully
+        // interpolated command over `session.execRemoteSandbox`.
+        assert_eq!(*rpc.execs.lock().unwrap(), vec!["ls -la".to_string()]);
     }
 }

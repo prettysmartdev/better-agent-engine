@@ -3,8 +3,8 @@
 A **profile** packages everything the server needs to run a session on behalf
 of an agent: which LLM provider to call (by name, from the registry declared
 in `bae-config.toml`), which fallback providers to try if the primary fails,
-which MCP servers are available, and which client-side tools agents are
-allowed to declare.
+which MCP servers are available, which sandbox container images the agent
+may launch, and which client-side tools agents are allowed to declare.
 
 Profiles are managed via the admin API — see [admin-api.md](reference/admin-api.md).
 
@@ -153,6 +153,72 @@ schema.
 
 ---
 
+## Available sandboxes
+
+`available_sandboxes` opts this profile into a set of container images its
+sessions may launch as **remote sandboxes** via `session.startRemoteSandbox`.
+It is an **array of image name strings**:
+
+```json
+"available_sandboxes": ["python:3.12", "node:22"]
+```
+
+The instant a profile is created or replaced with a non-empty
+`available_sandboxes`, the server spawns a background task (never on the
+request's critical path) that ensures every named image is present locally —
+inspecting, then pulling on a miss — logging success or failure per image and
+recording each image's status (`pending`/`available`/`error`) in memory. A
+session opened against this profile, once its client key registers as a
+driver, receives a `session.sandbox.available` notification listing exactly
+these images and their current status — never any other profile's images,
+even ones known and successfully pulled on the same running server. See
+[Sandboxes guide](guides/sandboxes.md) for the full walkthrough (declaring
+the field, the background provisioning task, the driver-connect
+notification, starting/stopping a remote sandbox, and binding
+`run_shell_command`/`run_shell_named` in a client harness) and
+[Configuration — Sandbox driver](reference/configuration.md#sandbox-driver)
+for the server-wide `BAE_SANDBOX_DRIVER` selection this sits on top of.
+
+Behavior:
+
+- `session.startRemoteSandbox` validates its requested `image` against
+  **this session's own profile's** `available_sandboxes` only — an image
+  declared on a different profile is rejected exactly like an image unknown
+  anywhere on the server (`sandbox_image_not_allowed`). A profile is a hard
+  trust boundary for what its sessions may launch, the same guarantee
+  `allowed_tools` provides for client-side tools.
+- **An empty `available_sandboxes` list (`[]`, the default) permits no
+  remote sandbox at all** — every `session.startRemoteSandbox` call on such a
+  profile's sessions fails with `sandbox_image_not_allowed`, regardless of
+  image name.
+- This field governs the **remote** sandbox lifecycle only. A client
+  harness's own **local** sandbox (its local Docker/Apple Containers engine)
+  is never validated against `available_sandboxes` — see
+  [Sandboxes — Local sandboxes report their own
+  lifecycle](guides/sandboxes.md#local-sandboxes-report-their-own-lifecycle).
+
+### Example: no remote sandboxes
+
+```json
+{
+  "name": "text-only-assistant",
+  "primary_provider": "anthropic-sonnet",
+  "available_sandboxes": []
+}
+```
+
+### Example: two images available
+
+```json
+{
+  "name": "sandboxed-assistant",
+  "primary_provider": "anthropic-sonnet",
+  "available_sandboxes": ["python:3.12", "node:22"]
+}
+```
+
+---
+
 ## Tool allowlists
 
 `allowed_tools` lists the names of client-side tools agents are permitted to
@@ -208,6 +274,7 @@ is accepted. A client declaring an additional tool not in the list is rejected.
   "primary_provider": "anthropic-sonnet",
   "fallback_providers": ["anthropic-haiku"],
   "mcp_servers": ["filesystem"],
+  "available_sandboxes": ["python:3.12"],
   "allowed_tools": ["get_current_time", "read_file"]
 }
 ```

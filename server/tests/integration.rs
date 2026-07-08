@@ -101,6 +101,18 @@ async fn mock_handler(req: Request) -> Response {
             json!({ "role": "assistant", "content": [
                 { "type": "tool_use", "id": "tu_mcp", "name": "remote_search", "input": { "q": "x" } }] })
         }
+    } else if path.starts_with("/sandbox") {
+        // Drives the Auto-mode sandbox dispatch path: a `tool_use` for
+        // `run_shell_command` carrying the fully-formed `command` the server
+        // executes against the session's remote sandbox, until a tool_result
+        // comes back — then a final text turn.
+        if has_tool_result {
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "after sandbox exec" }] })
+        } else {
+            json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_sbx", "name": "run_shell_command",
+                  "input": { "command": "echo hi" } }] })
+        }
     } else {
         json!({ "role": "assistant", "stop_reason": "end_turn",
                 "content": [{ "type": "text", "text": "Hello from mock" }] })
@@ -160,6 +172,7 @@ fn default_provider_registry(
         entry("text", "text", "test-token"),
         entry("tool", "tool", "test-token"),
         entry("mcp", "mcp", "test-token"),
+        entry("sandbox", "sandbox", "test-token"),
         entry("fail", "fail", "test-token"),
         entry("badenv", "text", "${BAE_TEST_DEFINITELY_UNSET_XYZ}"),
     ]
@@ -215,6 +228,25 @@ async fn boot_server(
     provider_registry: std::collections::HashMap<String, baesrv::engine::provider::ProviderConfig>,
     turn_timeout: Option<Duration>,
 ) -> TestServer {
+    boot_server_capture(mcp_registry, provider_registry, turn_timeout, None)
+        .await
+        .0
+}
+
+/// Like [`boot_server`], but additionally allows overriding the host-wide
+/// [`baesrv::engine::sandbox::SandboxDriver`] and returns a **clone of the live
+/// `AppState`** alongside the running server. `AppState` is `Clone` over shared
+/// `Arc`s, so the returned handle observes the same `sandboxes` / `sandbox_status`
+/// maps the server mutates — the seam the sandbox tests use to assert
+/// server-owned state directly (mirroring how `state.turn_timeout` and
+/// `state.sandbox_driver` are the documented override seams). Passing `None`
+/// leaves the default `DockerDriver` in place.
+async fn boot_server_capture(
+    mcp_registry: std::collections::HashMap<String, baesrv::config_file::McpServerConfig>,
+    provider_registry: std::collections::HashMap<String, baesrv::engine::provider::ProviderConfig>,
+    turn_timeout: Option<Duration>,
+    sandbox_driver: Option<Arc<dyn baesrv::engine::sandbox::SandboxDriver>>,
+) -> (TestServer, AppState) {
     let dir = std::env::temp_dir().join(format!("baesrv-it-{}", generate_id("")));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("test.db");
@@ -226,6 +258,12 @@ async fn boot_server(
         // `turn_timeout` is a pub field; overriding it here is the documented
         // seam for short-timeout tests (see notes-multi-client.md).
         state.turn_timeout = t;
+    }
+    if let Some(driver) = sandbox_driver {
+        // The sandbox driver is a pub field constructed once at startup; the
+        // integration harness swaps in an offline mock exactly the way
+        // `cli::build_sandbox_driver` installs the real one at boot.
+        state.sandbox_driver = driver;
     }
 
     let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -249,7 +287,25 @@ async fn boot_server(
         dir,
     };
     ts.wait_ready().await;
-    ts
+    (ts, state)
+}
+
+/// Boot a server pointed at the default mock provider registry (so `text` /
+/// `tool` / `mcp` / `sandbox` primaries all resolve) with an offline mock
+/// [`baesrv::engine::sandbox::SandboxDriver`] installed, returning the running
+/// server and a live `AppState` handle. The workhorse for the sandbox suite.
+async fn start_server_with_sandbox(
+    driver: Arc<dyn baesrv::engine::sandbox::SandboxDriver>,
+) -> (TestServer, AppState) {
+    let mock = start_mock().await;
+    let providers = default_provider_registry(&mock);
+    boot_server_capture(
+        std::collections::HashMap::new(),
+        providers,
+        None,
+        Some(driver),
+    )
+    .await
 }
 
 impl TestServer {
@@ -3299,4 +3355,1054 @@ async fn mixed_kind_fallback_chain_either_direction() {
             responses[1]
         );
     }
+}
+
+// ===========================================================================
+// WI 0006 — Sandbox lifecycle, dispatch, and cross-profile scoping
+// ===========================================================================
+//
+// Every test here drives the **real** routers against an **offline** mock
+// `SandboxDriver` (below): no `docker`/`container` binary or daemon is ever
+// required, exactly as the MCP tests use a trivial stdio fixture rather than a
+// real MCP server. `start_server_with_sandbox` returns a live `AppState` handle
+// so server-owned state (`AppState.sandboxes`, `AppState.sandbox_status`) can be
+// asserted directly, alongside the persisted/broadcast event log.
+
+use baesrv::engine::sandbox::{
+    BoxFuture, EnsureOutcome, ExecResult, SandboxDriver, SandboxError, SandboxHandle,
+    SandboxImageStatus,
+};
+use std::collections::HashSet;
+
+/// Scripted behaviour for the mock driver, set once at construction.
+#[derive(Default, Clone)]
+struct MockConfig {
+    /// Images whose `ensure_image` fails with `SandboxError::Image`.
+    fail_ensure: HashSet<String>,
+    /// Make `start` fail with `SandboxError::Runtime`.
+    fail_start: bool,
+    /// Make `stop` fail with `SandboxError::Runtime`.
+    fail_stop: bool,
+    /// Make `exec` fail with `SandboxError::Runtime` (a broken sandbox).
+    fail_exec: bool,
+    /// Artificial delay applied to every `ensure_image` call — proves the
+    /// profile-create provisioning task is truly detached (the HTTP handler
+    /// returns before this elapses).
+    ensure_delay: Duration,
+    /// Scripted `exec` output (defaults to a clean `stdout="sbx-out"`, exit 0).
+    exec_stdout: String,
+    exec_stderr: String,
+    exec_exit: i32,
+}
+
+struct MockInner {
+    cfg: MockConfig,
+    /// Every driver call, recorded as `"ensure:<image>"` / `"start:<image>"` /
+    /// `"exec:<id>|<command>"` / `"stop:<id>"`, in order.
+    calls: Mutex<Vec<String>>,
+    /// Monotonic counter for deterministic container ids.
+    next_id: Mutex<u64>,
+}
+
+/// An offline `SandboxDriver` that records every call and returns scripted
+/// results — the sandbox equivalent of the MCP tests' fixture server. Cloneable
+/// over a shared `Arc<MockInner>`, so a test keeps an inspection handle while
+/// the `Arc<dyn SandboxDriver>` on `AppState` drives the same recorder.
+#[derive(Clone)]
+struct MockSandboxDriver {
+    inner: Arc<MockInner>,
+}
+
+impl MockSandboxDriver {
+    fn new() -> Self {
+        Self::with_config(MockConfig {
+            exec_stdout: "sbx-out".into(),
+            ..MockConfig::default()
+        })
+    }
+
+    fn with_config(cfg: MockConfig) -> Self {
+        MockSandboxDriver {
+            inner: Arc::new(MockInner {
+                cfg,
+                calls: Mutex::new(Vec::new()),
+                next_id: Mutex::new(0),
+            }),
+        }
+    }
+
+    fn record(&self, s: String) {
+        self.inner.calls.lock().unwrap().push(s);
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.inner.calls.lock().unwrap().clone()
+    }
+
+    /// How many recorded calls start with `prefix` (e.g. `"start:node:22"`).
+    fn count(&self, prefix: &str) -> usize {
+        self.inner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with(prefix))
+            .count()
+    }
+}
+
+impl SandboxDriver for MockSandboxDriver {
+    fn ensure_image<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<EnsureOutcome, SandboxError>> {
+        self.record(format!("ensure:{image}"));
+        let cfg = self.inner.cfg.clone();
+        let image = image.to_owned();
+        Box::pin(async move {
+            if !cfg.ensure_delay.is_zero() {
+                tokio::time::sleep(cfg.ensure_delay).await;
+            }
+            if cfg.fail_ensure.contains(&image) {
+                Err(SandboxError::Image {
+                    image: image.clone(),
+                    detail: "mock: image pull failed".into(),
+                })
+            } else {
+                Ok(EnsureOutcome::Pulled)
+            }
+        })
+    }
+
+    fn start<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<SandboxHandle, SandboxError>> {
+        self.record(format!("start:{image}"));
+        let fail = self.inner.cfg.fail_start;
+        let image = image.to_owned();
+        let id = {
+            let mut n = self.inner.next_id.lock().unwrap();
+            *n += 1;
+            format!("mock-container-{n}")
+        };
+        Box::pin(async move {
+            if fail {
+                Err(SandboxError::Runtime {
+                    detail: "mock: start failed".into(),
+                })
+            } else {
+                Ok(SandboxHandle { id, image })
+            }
+        })
+    }
+
+    fn exec<'a>(
+        &'a self,
+        handle: &'a SandboxHandle,
+        command: &'a str,
+    ) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
+        self.record(format!("exec:{}|{command}", handle.id));
+        let cfg = self.inner.cfg.clone();
+        Box::pin(async move {
+            if cfg.fail_exec {
+                Err(SandboxError::Runtime {
+                    detail: "mock: exec failed".into(),
+                })
+            } else {
+                Ok(ExecResult {
+                    stdout: cfg.exec_stdout,
+                    stderr: cfg.exec_stderr,
+                    exit_code: cfg.exec_exit,
+                })
+            }
+        })
+    }
+
+    fn stop<'a>(&'a self, handle: &'a SandboxHandle) -> BoxFuture<'a, Result<(), SandboxError>> {
+        self.record(format!("stop:{}", handle.id));
+        let fail = self.inner.cfg.fail_stop;
+        Box::pin(async move {
+            if fail {
+                Err(SandboxError::Runtime {
+                    detail: "mock: stop failed".into(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+// --- Sandbox-specific TestServer helpers ------------------------------------
+
+impl TestServer {
+    /// Create a profile with an `available_sandboxes` image allowlist (and an
+    /// optional client-tool allowlist), returning its id.
+    async fn create_profile_with_sandboxes(
+        &self,
+        primary: &str,
+        available_sandboxes: Value,
+        allowed_tools: Value,
+    ) -> String {
+        let body = json!({
+            "name": format!("profile-{}", generate_id("")),
+            "primary_provider": primary,
+            "fallback_providers": [],
+            "allowed_tools": allowed_tools,
+            "available_sandboxes": available_sandboxes,
+        });
+        let (status, v, raw) = self.admin_post("/admin/v1/profiles", body).await;
+        assert_eq!(status, 201, "create profile (sandbox) failed: {raw}");
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    /// Open a session declaring `sandbox_tools` (Auto-mode) alongside ordinary
+    /// `tools`, then register as a driver. Returns `(session_id, session_key)`.
+    async fn open_session_with_sandbox_tools(
+        &self,
+        client_key: &str,
+        tools: Value,
+        sandbox_tools: Value,
+    ) -> (String, String) {
+        let (status, v, raw) = self
+            .client_post(
+                "/api/v1/sessions",
+                Some(client_key),
+                json!({ "client_version": "1.0.0", "tools": tools, "sandbox_tools": sandbox_tools }),
+            )
+            .await;
+        assert_eq!(status, 201, "open session (sandbox_tools) failed: {raw}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let skey = v["session_key"].as_str().unwrap().to_string();
+        self.register_driver(&sid, &skey).await;
+        (sid, skey)
+    }
+
+    /// The full persisted event list (each item includes `payload`), oldest
+    /// first, via `GET /api/v1/sessions/{id}/events`.
+    async fn session_events(&self, session_id: &str, session_key: &str) -> Vec<Value> {
+        let (_s, events, _r) = self
+            .client_get(
+                &format!("/api/v1/sessions/{session_id}/events"),
+                Some(session_key),
+            )
+            .await;
+        events["items"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Drive one terminating JSON-RPC method and return its terminal frame (the
+    /// object carrying `result` or `error`).
+    async fn rpc_terminal(
+        &self,
+        session_id: &str,
+        session_key: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let (status, frames, raw) = self
+            .rpc(
+                session_id,
+                session_key,
+                json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }),
+            )
+            .await;
+        assert_eq!(status, 200, "{method} http status: {raw}");
+        terminal_frames(&frames)
+            .last()
+            .map(|f| (*f).clone())
+            .unwrap_or_else(|| panic!("{method} produced no terminal frame: {raw}"))
+    }
+}
+
+/// The ordered `event_type` strings of a persisted event list.
+fn ev_types(evs: &[Value]) -> Vec<String> {
+    evs.iter()
+        .map(|e| e["event_type"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+/// The first event of type `t`, or a panic naming what was present.
+fn find_ev<'a>(evs: &'a [Value], t: &str) -> &'a Value {
+    evs.iter()
+        .find(|e| e["event_type"] == json!(t))
+        .unwrap_or_else(|| panic!("missing {t} event; present: {:?}", ev_types(evs)))
+}
+
+/// Assert `first` occurs strictly before `second` in an event-type sequence
+/// (both must be present).
+fn assert_ordered(evs: &[Value], first: &str, second: &str) {
+    let types = ev_types(evs);
+    let i = types
+        .iter()
+        .position(|t| t == first)
+        .unwrap_or_else(|| panic!("missing {first}: {types:?}"));
+    let j = types
+        .iter()
+        .position(|t| t == second)
+        .unwrap_or_else(|| panic!("missing {second}: {types:?}"));
+    assert!(i < j, "expected {first} before {second}: {types:?}");
+}
+
+/// Poll `AppState.sandbox_image_status` until `image` on `profile_id` leaves
+/// `Pending` (background provisioning finished), or give up after ~5s.
+async fn await_provisioned(state: &AppState, profile_id: &str, image: &str) -> SandboxImageStatus {
+    for _ in 0..250 {
+        let s = state.sandbox_image_status(profile_id, image);
+        if s != SandboxImageStatus::Pending {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("image {image} on {profile_id} never left Pending");
+}
+
+// --- A) single-profile allowlist enforcement (-32011) -----------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_image_allowlist_rejects_unlisted_image_without_starting() {
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+
+    // An image not in the profile's allowlist is rejected *before* any container
+    // is started — the admin-declared list is the sole trust boundary.
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "node:22" }),
+        )
+        .await;
+    assert_eq!(t["error"]["code"], json!(-32011), "not-allowed: {t}");
+    assert_eq!(
+        driver.count("start:"),
+        0,
+        "the driver's start must never be called for a disallowed image"
+    );
+
+    // The allowed image starts normally.
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "python:3.12" }),
+        )
+        .await;
+    assert!(t["result"]["sandbox_id"].is_string(), "started: {t}");
+    assert_eq!(t["result"]["image"], json!("python:3.12"));
+    assert_eq!(driver.count("start:python:3.12"), 1);
+}
+
+// --- B) cross-profile scoping (the key regression) --------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_scoping_is_per_profile_and_bidirectional() {
+    let driver = MockSandboxDriver::new();
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+
+    // Two profiles with DISJOINT image sets, both provisioned against the same
+    // mock driver, so `sandbox_status` genuinely holds entries for both.
+    let prof_a = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let prof_b = ts
+        .create_profile_with_sandboxes("text", json!(["node:22"]), json!([]))
+        .await;
+    let key_a = ts.create_key(&prof_a).await;
+    let key_b = ts.create_key(&prof_b).await;
+
+    // Wait until BOTH images are provisioned so the notification reports a real
+    // "available" status (not a transient "pending") — proving node:22 is a
+    // known, successfully-provisioned image server-wide, yet still absent from
+    // A's notification.
+    assert_eq!(
+        await_provisioned(&state, &prof_a, "python:3.12").await,
+        SandboxImageStatus::Available
+    );
+    assert_eq!(
+        await_provisioned(&state, &prof_b, "node:22").await,
+        SandboxImageStatus::Available
+    );
+
+    // Assert both directions with one closure: session on `own`, with `own_img`
+    // in its profile and `other_img` in the *other* profile's list only.
+    async fn assert_scoped(
+        ts: &TestServer,
+        driver: &MockSandboxDriver,
+        client_key: &str,
+        own_img: &str,
+        other_img: &str,
+    ) {
+        // Open + register (the notification fires on registerDriver).
+        let (sid, skey, _) = ts.open_session(client_key, json!([])).await;
+
+        // (1) The driver-connect notification lists ONLY this profile's image.
+        let evs = ts.session_events(&sid, &skey).await;
+        let avail = find_ev(&evs, "session.sandbox.available");
+        let names: Vec<String> = avail["payload"]["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![own_img.to_string()],
+            "notification must be scoped to this profile's own image only"
+        );
+        assert!(
+            !names.iter().any(|n| n == other_img),
+            "the other profile's image {other_img} must never leak into {names:?}"
+        );
+        assert_eq!(
+            avail["payload"]["images"][0]["status"],
+            json!("available"),
+            "the scoped image's real provisioning status is reported"
+        );
+
+        // (2) startRemoteSandbox with the OTHER profile's image → -32011,
+        // and the driver's start is never called for it.
+        let before = driver.count(&format!("start:{other_img}"));
+        let t = ts
+            .rpc_terminal(
+                &sid,
+                &skey,
+                "session.startRemoteSandbox",
+                json!({ "image": other_img }),
+            )
+            .await;
+        assert_eq!(
+            t["error"]["code"],
+            json!(-32011),
+            "cross-profile image must be rejected: {t}"
+        );
+        assert_eq!(
+            driver.count(&format!("start:{other_img}")),
+            before,
+            "start must never be called for a cross-profile image"
+        );
+
+        // The own image still starts.
+        let t = ts
+            .rpc_terminal(
+                &sid,
+                &skey,
+                "session.startRemoteSandbox",
+                json!({ "image": own_img }),
+            )
+            .await;
+        assert!(
+            t["result"]["sandbox_id"].is_string(),
+            "own image starts: {t}"
+        );
+    }
+
+    // Direction 1: session on A may launch python:3.12, never node:22.
+    assert_scoped(&ts, &driver, &key_a, "python:3.12", "node:22").await;
+    // Direction 2 (symmetric): session on B may launch node:22, never python:3.12.
+    assert_scoped(&ts, &driver, &key_b, "node:22", "python:3.12").await;
+}
+
+// --- C) background provisioning is detached; status reflects each outcome ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_provisioning_is_backgrounded_and_records_per_image_status() {
+    let logs = log_capture();
+    // Unique image names so this test's log lines are unambiguous in the shared
+    // capture buffer.
+    let good = format!("good-{}", generate_id(""));
+    let bad = format!("bad-{}", generate_id(""));
+
+    let mut fail = HashSet::new();
+    fail.insert(bad.clone());
+    let driver = MockSandboxDriver::with_config(MockConfig {
+        fail_ensure: fail,
+        // A pull slow enough that awaiting it would blow past the timing
+        // assertion below — so the handler returning fast proves it is detached.
+        ensure_delay: Duration::from_millis(400),
+        exec_stdout: "sbx-out".into(),
+        ..MockConfig::default()
+    });
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+
+    // The profile-create HTTP response must return BEFORE the artificially
+    // delayed pull completes — provisioning is spawned, never awaited.
+    let started = tokio::time::Instant::now();
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!([good, bad]), json!([]))
+        .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "profile create must return before the delayed pull (took {elapsed:?})"
+    );
+
+    // Each image resolves to its own terminal status.
+    assert_eq!(
+        await_provisioned(&state, &profile, &good).await,
+        SandboxImageStatus::Available,
+        "the good image ends Available"
+    );
+    match await_provisioned(&state, &profile, &bad).await {
+        SandboxImageStatus::Error(d) => assert!(d.contains("pull failed"), "detail: {d}"),
+        other => panic!("the bad image must end Error, got {other:?}"),
+    }
+
+    // Both images were actually ensured against the driver (sequentially).
+    assert_eq!(driver.count(&format!("ensure:{good}")), 1);
+    assert_eq!(driver.count(&format!("ensure:{bad}")), 1);
+
+    // The failure is logged at error level (the success path logs at info,
+    // which the shared error-level capture does not retain — the Available
+    // status above is the success-path assertion).
+    let text = captured_text(&logs);
+    assert!(
+        text.lines()
+            .any(|l| l.contains(&bad) && l.contains("failed to ensure sandbox image")),
+        "the failed pull must be logged:\n{text}"
+    );
+}
+
+// --- D) driver-connect notification: present, scoped, absent when empty -----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_available_notification_present_with_status_and_absent_when_empty() {
+    let driver = MockSandboxDriver::new();
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+
+    // A profile that declares an image → a scoped notification with real status.
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    assert_eq!(
+        await_provisioned(&state, &profile, "python:3.12").await,
+        SandboxImageStatus::Available
+    );
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+    let evs = ts.session_events(&sid, &skey).await;
+    // The notification fires immediately after the driver-registration event.
+    assert_ordered(&evs, "session.driver.register", "session.sandbox.available");
+    let avail = find_ev(&evs, "session.sandbox.available");
+    assert_eq!(
+        avail["payload"]["images"],
+        json!([{ "name": "python:3.12", "status": "available" }]),
+        "per-image status reported: {avail}"
+    );
+
+    // A profile with an EMPTY available_sandboxes emits no such event.
+    let empty_profile = ts
+        .create_profile_with_sandboxes("text", json!([]), json!([]))
+        .await;
+    let empty_key = ts.create_key(&empty_profile).await;
+    let (esid, eskey, _) = ts.open_session(&empty_key, json!([])).await;
+    let eevs = ts.session_events(&esid, &eskey).await;
+    assert!(
+        !ev_types(&eevs).contains(&"session.sandbox.available".to_string()),
+        "no sandbox notification for an empty allowlist: {:?}",
+        ev_types(&eevs)
+    );
+    // ...but the ordinary driver-registration event is still present.
+    assert!(ev_types(&eevs).contains(&"session.driver.register".to_string()));
+}
+
+// --- E) remote sandbox full lifecycle, success path -------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_sandbox_start_then_explicit_stop_lifecycle() {
+    let driver = MockSandboxDriver::new();
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+
+    // Start → ordered session.sandbox.start then session.sandbox.running.
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "python:3.12" }),
+        )
+        .await;
+    let sandbox_id = t["result"]["sandbox_id"].as_str().unwrap().to_string();
+    assert!(
+        t["result"]["started_at"].is_string(),
+        "started_at present: {t}"
+    );
+    assert!(state.sandbox(&sid).is_some(), "handle retained on AppState");
+
+    let evs = ts.session_events(&sid, &skey).await;
+    assert_ordered(&evs, "session.sandbox.start", "session.sandbox.running");
+    let start = find_ev(&evs, "session.sandbox.start");
+    assert_eq!(start["payload"]["dispatch"], json!("remote"));
+    let running = find_ev(&evs, "session.sandbox.running");
+    assert_eq!(running["payload"]["dispatch"], json!("remote"));
+    assert_eq!(running["payload"]["sandbox_id"], json!(sandbox_id));
+
+    // Stop → ordered session.sandbox.stop then session.sandbox.stopped, and the
+    // AppState entry is gone.
+    let t = ts
+        .rpc_terminal(&sid, &skey, "session.stopRemoteSandbox", json!({}))
+        .await;
+    assert_eq!(t["result"]["stopped"], json!(true), "stopped: {t}");
+    assert!(state.sandbox(&sid).is_none(), "handle removed after stop");
+    assert_eq!(driver.count(&format!("stop:{sandbox_id}")), 1);
+
+    let evs = ts.session_events(&sid, &skey).await;
+    assert_ordered(&evs, "session.sandbox.stop", "session.sandbox.stopped");
+    let stop = find_ev(&evs, "session.sandbox.stop");
+    assert_eq!(stop["payload"]["reason"], json!("explicit"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_close_implicitly_stops_running_remote_sandbox() {
+    let driver = MockSandboxDriver::new();
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "python:3.12" }),
+        )
+        .await;
+    let sandbox_id = t["result"]["sandbox_id"].as_str().unwrap().to_string();
+
+    // Close with no explicit stop → the same stop/stopped pair fires with
+    // reason "session_close", the driver's stop is called, and the entry clears.
+    let (status, _v, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&skey))
+        .await;
+    assert_eq!(status, 200, "close: {raw}");
+    assert_eq!(
+        driver.count(&format!("stop:{sandbox_id}")),
+        1,
+        "close stopped the sandbox"
+    );
+    assert!(
+        state.sandbox(&sid).is_none(),
+        "no lingering handle after close"
+    );
+
+    // The stop payload the *broadcaster* saw carried reason "session_close".
+    // (The session is closed now; assert via the mock's recorded stop above and
+    // the reason on the persisted event, read before close removed the channel.)
+    // Events are still persisted and readable after close via the session key.
+    let evs = ts.session_events(&sid, &skey).await;
+    let stop = find_ev(&evs, "session.sandbox.stop");
+    assert_eq!(stop["payload"]["reason"], json!("session_close"));
+    assert_ordered(&evs, "session.sandbox.stop", "session.sandbox.stopped");
+}
+
+// --- F) remote sandbox lifecycle, failure paths -----------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_sandbox_start_failure_retains_no_handle() {
+    let driver = MockSandboxDriver::with_config(MockConfig {
+        fail_start: true,
+        exec_stdout: "sbx-out".into(),
+        ..MockConfig::default()
+    });
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "python:3.12" }),
+        )
+        .await;
+    assert_eq!(t["error"]["code"], json!(-32012), "start_failed: {t}");
+    assert!(
+        state.sandbox(&sid).is_none(),
+        "no handle retained on failure"
+    );
+
+    let evs = ts.session_events(&sid, &skey).await;
+    assert_ordered(&evs, "session.sandbox.start", "session.sandbox.error");
+    let err = find_ev(&evs, "session.sandbox.error");
+    assert_eq!(err["payload"]["phase"], json!("start"));
+    assert_eq!(err["payload"]["dispatch"], json!("remote"));
+    // A failed start never logs a running event.
+    assert!(
+        !ev_types(&evs).contains(&"session.sandbox.running".to_string()),
+        "no running event when start failed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_sandbox_stop_failure_still_removes_the_handle() {
+    let driver = MockSandboxDriver::with_config(MockConfig {
+        fail_stop: true,
+        exec_stdout: "sbx-out".into(),
+        ..MockConfig::default()
+    });
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "python:3.12" }),
+    )
+    .await;
+    assert!(state.sandbox(&sid).is_some());
+
+    // A failed stop surfaces an error but MUST still remove the handle — no
+    // phantom handle other calls could dispatch against.
+    let t = ts
+        .rpc_terminal(&sid, &skey, "session.stopRemoteSandbox", json!({}))
+        .await;
+    assert!(
+        t.get("error").is_some(),
+        "stop failure surfaces an error: {t}"
+    );
+    assert!(
+        state.sandbox(&sid).is_none(),
+        "the handle is removed even when the driver stop failed"
+    );
+
+    let evs = ts.session_events(&sid, &skey).await;
+    assert_ordered(&evs, "session.sandbox.stop", "session.sandbox.error");
+    let err = find_ev(&evs, "session.sandbox.error");
+    assert_eq!(err["payload"]["phase"], json!("stop"));
+
+    // A second stop now reports nothing-running rather than dispatching again.
+    let t = ts
+        .rpc_terminal(&sid, &skey, "session.stopRemoteSandbox", json!({}))
+        .await;
+    assert_eq!(t["error"]["code"], json!(-32013), "no phantom handle: {t}");
+}
+
+// --- G) session.reportLocalSandbox ------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn report_local_sandbox_maps_state_skips_allowlist_and_gates_on_driver() {
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    // The profile declares only python:3.12; the local report uses a totally
+    // unrelated image name to prove no allowlist check happens on this path.
+    let profile = ts
+        .create_profile_with_sandboxes("text", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+
+    // Unregistered driver → same -32001 gate as sendMessage.
+    let (usid, uskey, _) = ts.open_session_no_register(&key, json!([])).await;
+    let t = ts
+        .rpc_terminal(
+            &usid,
+            &uskey,
+            "session.reportLocalSandbox",
+            json!({ "state": "running", "image": "anything:latest" }),
+        )
+        .await;
+    assert_eq!(
+        t["error"]["code"],
+        json!(-32001),
+        "driver-registration gate: {t}"
+    );
+
+    // Registered: each state maps to the matching lifecycle event, all with
+    // dispatch:"local", and an arbitrary (unlisted) image is accepted as-is.
+    let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+    for (state_str, event_type) in [
+        ("running", "session.sandbox.running"),
+        ("stopped", "session.sandbox.stopped"),
+        ("error", "session.sandbox.error"),
+    ] {
+        let t = ts
+            .rpc_terminal(
+                &sid,
+                &skey,
+                "session.reportLocalSandbox",
+                json!({
+                    "state": state_str,
+                    "image": "totally-unlisted:latest",
+                    "container_id": "local-abc",
+                    "detail": "from the harness",
+                }),
+            )
+            .await;
+        assert_eq!(t["result"]["reported"], json!(true), "{state_str}: {t}");
+        let evs = ts.session_events(&sid, &skey).await;
+        let ev = find_ev(&evs, event_type);
+        assert_eq!(ev["payload"]["dispatch"], json!("local"), "{state_str}");
+        assert_eq!(ev["payload"]["image"], json!("totally-unlisted:latest"));
+        assert_eq!(ev["payload"]["container_id"], json!("local-abc"));
+    }
+
+    // No sandbox was ever started server-side; the local report never touches
+    // the driver.
+    assert_eq!(driver.count("start:"), 0);
+    assert_eq!(driver.count("stop:"), 0);
+}
+
+// --- H) manual remote dispatch ----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_remote_dispatch_pauses_then_exec_then_client_continuation() {
+    let driver = MockSandboxDriver::with_config(MockConfig {
+        exec_stdout: "manual-out".into(),
+        exec_stderr: "manual-err".into(),
+        exec_exit: 7,
+        ..MockConfig::default()
+    });
+    let (ts, _state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    // Primary "tool" emits a client tool_use (get_current_time); the profile
+    // allows that client tool and the python:3.12 sandbox image.
+    let profile = ts
+        .create_profile_with_sandboxes("tool", json!(["python:3.12"]), json!(["get_current_time"]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session(
+            &key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+
+    // Start the remote sandbox the manual handler will exec against.
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "python:3.12" }),
+    )
+    .await;
+
+    // The turn pauses on the client tool_use (unchanged run_turn behaviour):
+    // the assistant message handed back carries a tool_use block.
+    let (status, resp, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "what time is it" }))
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    let has_tool_use = resp["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["type"] == json!("tool_use") && b["name"] == json!("get_current_time"));
+    assert!(
+        has_tool_use,
+        "paused turn returns the tool_use to the client: {raw}"
+    );
+
+    // The harness fetches raw output via the separate, non-turn RPC utility.
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.execRemoteSandbox",
+            json!({ "command": "date +%s" }),
+        )
+        .await;
+    assert_eq!(t["result"]["stdout"], json!("manual-out"));
+    assert_eq!(t["result"]["stderr"], json!("manual-err"));
+    assert_eq!(
+        t["result"]["exit_code"],
+        json!(7),
+        "raw exit passed through: {t}"
+    );
+    assert_eq!(
+        driver.count("exec:"),
+        1,
+        "manual exec dispatched to the driver"
+    );
+
+    // The harness constructs its OWN tool_result and continues the turn via the
+    // ordinary sendMessage continuation → the turn completes.
+    let (status, resp, raw) = ts
+        .send_message(
+            &sid,
+            &skey,
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": [{ "type": "text", "text": "manual-out" }],
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("tool round-trip complete"),
+        "client-constructed tool_result drove the turn to completion: {raw}"
+    );
+}
+
+// --- I) auto remote dispatch (structurally mirrors the MCP round trip) ------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_remote_dispatch_runs_server_side_without_pausing() {
+    let driver = MockSandboxDriver::with_config(MockConfig {
+        exec_stdout: "auto-out".into(),
+        ..MockConfig::default()
+    });
+    let (ts, _state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    // Primary "sandbox" emits a tool_use for `run_shell_command` carrying a
+    // fully-formed command; the client declares it as an Auto-mode sandbox tool.
+    let profile = ts
+        .create_profile_with_sandboxes("sandbox", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_session_with_sandbox_tools(
+            &key,
+            json!([]),
+            json!([{
+                "name": "run_shell_command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"],
+                },
+            }]),
+        )
+        .await;
+
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "python:3.12" }),
+    )
+    .await;
+
+    // One sendMessage → the whole turn completes server-side (never pauses,
+    // never reaches the client) with the provider's terminal text.
+    let (status, resp, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "run it" }))
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("after sandbox exec"),
+        "terminal Completed in one turn: {raw}"
+    );
+
+    let evs = resp["events"].as_array().unwrap();
+
+    // tool.call tagged as a sandbox dispatch (mirrors the MCP tool.call shape,
+    // minus server_name).
+    let call = find_ev(evs, "tool.call");
+    assert_eq!(call["payload"]["dispatch"], json!("sandbox"));
+    assert_eq!(call["payload"]["name"], json!("run_shell_command"));
+
+    // sandbox.request / sandbox.response bracket the driver exec — the sandbox
+    // twins of mcp.request / mcp.response.
+    let req = find_ev(evs, "sandbox.request");
+    assert_eq!(req["payload"]["tool"], json!("run_shell_command"));
+    assert_eq!(req["payload"]["command"], json!("echo hi"));
+    let res = find_ev(evs, "sandbox.response");
+    assert_eq!(res["payload"]["ok"], json!(true));
+    assert_eq!(res["payload"]["result"]["stdout"], json!("auto-out"));
+
+    // tool.result — sandbox dispatch, not an error, carrying the exec output.
+    let tr = find_ev(evs, "tool.result");
+    assert_eq!(tr["payload"]["dispatch"], json!("sandbox"));
+    assert_eq!(tr["payload"]["is_error"], json!(false));
+    assert_eq!(tr["payload"]["content"][0]["text"], json!("auto-out"));
+
+    // Ordering mirrors the MCP round trip exactly (call → request → response →
+    // result).
+    assert_ordered(evs, "tool.call", "sandbox.request");
+    assert_ordered(evs, "sandbox.request", "sandbox.response");
+    assert_ordered(evs, "sandbox.response", "tool.result");
+
+    // The command really reached the driver, and no lifecycle error fired.
+    assert_eq!(driver.count("exec:"), 1);
+    assert!(
+        !ev_types(evs).contains(&"session.sandbox.error".to_string()),
+        "a successful auto exec logs no session.sandbox.error"
+    );
+}
+
+// --- J) auto tool call with no started sandbox: reuse the no-server shape ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_dispatch_without_started_sandbox_reuses_error_tool_result_shape() {
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    let profile = ts
+        .create_profile_with_sandboxes("sandbox", json!(["python:3.12"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_session_with_sandbox_tools(
+            &key,
+            json!([]),
+            json!([{
+                "name": "run_shell_command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"],
+                },
+            }]),
+        )
+        .await;
+
+    // No startRemoteSandbox: the auto tool_use is handled exactly like the "no
+    // MCP server configured" case — an error-shaped tool.result, turn continues.
+    let (status, resp, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "run it" }))
+        .await;
+    assert_eq!(status, 200, "turn completes despite no sandbox: {raw}");
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("after sandbox exec"),
+        "the turn still reaches its terminal completion"
+    );
+
+    let evs = resp["events"].as_array().unwrap();
+    let res = find_ev(evs, "sandbox.response");
+    assert_eq!(res["payload"]["ok"], json!(false));
+    assert_eq!(res["payload"]["sandbox_id"], Value::Null);
+
+    let tr = find_ev(evs, "tool.result");
+    assert_eq!(tr["payload"]["dispatch"], json!("sandbox"));
+    assert_eq!(
+        tr["payload"]["is_error"],
+        json!(true),
+        "error-shaped result"
+    );
+    let text = tr["payload"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("no remote sandbox is running")
+            && text.contains("call session.startRemoteSandbox first"),
+        "reuses the no-server error posture verbatim: {text}"
+    );
+
+    // The driver was never touched, and no phantom lifecycle error fired (no
+    // driver call actually failed).
+    assert_eq!(driver.count("exec:"), 0);
+    assert!(!ev_types(evs).contains(&"session.sandbox.error".to_string()));
 }

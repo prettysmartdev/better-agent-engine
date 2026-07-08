@@ -161,7 +161,12 @@ class Profile:
 
 
 class EventType(str, Enum):
-    """The complete, closed set of ``session_events.event_type`` values (§8)."""
+    """The complete, closed set of ``session_events.event_type`` values (§8).
+
+    WI 0006 grew this from 14 to 22 with the sandbox lifecycle and dispatch
+    events; the ``SANDBOX_*`` members must be present or :meth:`SessionEvent.from_wire`
+    would raise on a sandbox event the server now legitimately emits.
+    """
 
     CLIENT_MESSAGE_SEND = "client.message.send"
     SERVER_MESSAGE_SEND = "server.message.send"
@@ -177,6 +182,17 @@ class EventType(str, Enum):
     SESSION_CLOSE = "session.close"
     SESSION_ERROR = "session.error"
     SESSION_COMPACTION = "session.compaction"
+    # Sandbox lifecycle (WI 0006); ``dispatch`` in the payload is ``remote`` or
+    # ``local`` for the running/stopped/error trio.
+    SANDBOX_AVAILABLE = "session.sandbox.available"
+    SANDBOX_START = "session.sandbox.start"
+    SANDBOX_RUNNING = "session.sandbox.running"
+    SANDBOX_STOP = "session.sandbox.stop"
+    SANDBOX_STOPPED = "session.sandbox.stopped"
+    SANDBOX_ERROR = "session.sandbox.error"
+    # Sandbox Auto-dispatch round-trip (unprefixed, mirroring mcp.request/response).
+    SANDBOX_REQUEST = "sandbox.request"
+    SANDBOX_RESPONSE = "sandbox.response"
 
 
 @dataclass(slots=True)
@@ -382,5 +398,21 @@ def describe_event(event: SessionEvent) -> str:
             return f"session error ({event.payload.get('reason')})"
         case EventType.SESSION_COMPACTION:
             return "session history compacted"
+        case EventType.SANDBOX_AVAILABLE:
+            return "sandbox images available"
+        case EventType.SANDBOX_START:
+            return f"sandbox starting ({event.payload.get('dispatch')})"
+        case EventType.SANDBOX_RUNNING:
+            return f"sandbox running ({event.payload.get('dispatch')})"
+        case EventType.SANDBOX_STOP:
+            return f"sandbox stopping ({event.payload.get('dispatch')})"
+        case EventType.SANDBOX_STOPPED:
+            return f"sandbox stopped ({event.payload.get('dispatch')})"
+        case EventType.SANDBOX_ERROR:
+            return f"sandbox error ({event.payload.get('dispatch')})"
+        case EventType.SANDBOX_REQUEST:
+            return f"sandbox request: {event.payload.get('tool')}"
+        case EventType.SANDBOX_RESPONSE:
+            return f"sandbox response (ok={event.payload.get('ok')})"
         case _:
             assert_never(et)

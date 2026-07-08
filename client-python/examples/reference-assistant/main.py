@@ -2,10 +2,12 @@
 """reference-assistant — the canonical example agent (per aspec/genai/agents.md),
 implemented identically across the Rust, TypeScript, and Python SDKs.
 
-It registers a single client-side tool (``get_current_time``), opens a session,
-sends one user turn, drives the harness loop (dispatching the tool call and
-sending the result back), and prints the final assistant text. Every hook point
-is exercised at least once — a counter proves it on exit.
+It registers a client-side tool (``get_current_time``), a builtin **local
+sandbox** shell tool, and the three builtin **file tools** scoped to this
+example's own ``workspace/`` directory, opens a session, sends one user turn,
+drives the harness loop (dispatching the tool call and sending the result
+back), and prints the final assistant text. Every hook point is exercised at
+least once — a counter proves it on exit.
 
 Configuration (all via environment):
   BAE_SERVER_URL       server base URL          (default http://localhost:8080)
@@ -19,6 +21,13 @@ server's "all providers failed" outcome (surfaced as ProvidersFailedError) and
 explain the likely cause.
 
 Run:  uv run python examples/reference-assistant/main.py "What time is it?"
+
+The ``run_shell_command`` tool is bound to a **local** sandbox: the model can
+ask to run a shell command and this harness executes it via ``docker exec``
+(or ``container exec`` on macOS) against a throwaway ``alpine:3.19``
+container. That requires a local ``docker``/``container`` binary; the model
+only reaches for this tool if the prompt calls for running a shell command,
+so a default "What time is it?" run never touches it.
 """
 
 from __future__ import annotations
@@ -27,21 +36,29 @@ import asyncio
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from bae_py import (
     ApiError,
     Config,
+    FileToolConfig,
     Harness,
     Hooks,
     Message,
     ProvidersFailedError,
+    RemoteMode,
+    SandboxTarget,
     SessionEvent,
     Tool,
     ToolResultBlock,
     ToolUseBlock,
     TransportError,
     describe_event,
+    explore_files_tool,
     random_hex,
+    read_file_tool,
+    run_shell_command,
+    write_file_tool,
 )
 
 DEFAULT_PROMPT = "What time is it?"
@@ -144,6 +161,30 @@ async def run() -> int:
 
     harness = Harness(config, tools=[time_tool], hooks=hooks)
 
+    # Builtin file tools, scoped to this example's own workspace/ directory.
+    # allowed_dirs is required and an empty list permits nothing, so any path
+    # outside workspace/ is rejected in-band. `.env` is denied even without an
+    # allowed_extensions restriction, showing denied_extensions always winning.
+    workspace_dir = Path(__file__).resolve().parent / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    file_config = FileToolConfig(allowed_dirs=[str(workspace_dir)], denied_extensions=["env"])
+    harness.register_tool(read_file_tool(file_config))
+    harness.register_tool(write_file_tool(file_config))
+    harness.register_tool(explore_files_tool(file_config))
+
+    # Builtin sandbox tool: a local Docker/Apple Containers shell. Sandbox
+    # tools need a live Session (for local lifecycle reporting), so unlike the
+    # file tools above (which need no session) they are built from a handle
+    # obtained *before* `connect()` but only actually usable *after* it returns.
+    harness.register_sandbox_tool(
+        run_shell_command(
+            harness.sandbox_session(),
+            SandboxTarget.local("alpine:3.19"),
+            # Ignored for a local target (only meaningful for remote).
+            RemoteMode.auto(),
+        )
+    )
+
     # A correlation tag using the secrets-backed RNG (never `random`).
     print(f"[run {random_hex(4)}] connecting to {server_url}", file=sys.stderr)
 
@@ -171,7 +212,9 @@ async def run() -> int:
             # bogus since_event_id forces a replay from the start; we stop after
             # the first event (returning False) so the demo terminates.
             if os.environ.get("BAE_SUBSCRIBE_DEMO"):
-                print("[subscribe] replaying session events (stopping after first)…", file=sys.stderr)
+                print(
+                    "[subscribe] replaying session events (stopping after first)…", file=sys.stderr
+                )
 
                 def _stop_after_first(event: SessionEvent) -> bool:
                     print(f"[subscribe] {describe_event(event)}", file=sys.stderr)

@@ -63,6 +63,13 @@ pub enum Error {
     #[error("hook aborted the loop: {0}")]
     Hook(BoxError),
 
+    /// A sandbox operation failed: a local container-engine (`docker`/
+    /// `container`) call errored, or a sandbox tool was used before its
+    /// [`Session`](crate::Session) was connected (so the transport it needs for
+    /// `session.execRemoteSandbox` / `session.reportLocalSandbox` is unbound).
+    #[error("sandbox error: {0}")]
+    Sandbox(String),
+
     /// A response body could not be decoded into the expected shape.
     #[error("failed to decode server response: {0}")]
     Decode(#[from] serde_json::Error),

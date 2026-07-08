@@ -34,8 +34,24 @@ pub struct ProfileRecord {
     pub fallback_configs: Value,
     pub mcp_servers: Value,
     pub allowed_tools: Value,
+    pub available_sandboxes: Value,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl ProfileRecord {
+    /// The profile's declared sandbox image names, as strings. A missing/null
+    /// column (rows written before migration 0006) reads as empty.
+    pub fn sandbox_image_names(&self) -> Vec<String> {
+        self.available_sandboxes
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Fields an admin supplies to create or replace a profile. JSON blobs are
@@ -47,6 +63,7 @@ pub struct ProfileInput {
     pub fallback_configs: Value,
     pub mcp_servers: Value,
     pub allowed_tools: Value,
+    pub available_sandboxes: Value,
 }
 
 /// A create/replace failed because another active profile already owns `name`
@@ -63,13 +80,18 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRecord> {
         fallback_configs: parse(row.get("fallback_configs")?),
         mcp_servers: parse(row.get("mcp_servers")?),
         allowed_tools: parse(row.get("allowed_tools")?),
+        // Nullable: rows written before migration 0006 read as an empty list.
+        available_sandboxes: row
+            .get::<_, Option<String>>("available_sandboxes")?
+            .map(parse)
+            .unwrap_or_else(|| serde_json::json!([])),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
 }
 
 const SELECT_COLS: &str = "id, name, provider_config, fallback_configs, mcp_servers, \
-     allowed_tools, created_at, updated_at";
+     allowed_tools, available_sandboxes, created_at, updated_at";
 
 /// Insert a new profile, returning the stored record. A UNIQUE-constraint
 /// violation on `name` maps to [`DuplicateName`]; any other SQLite error
@@ -79,8 +101,8 @@ pub fn create(conn: &Connection, input: &ProfileInput) -> Result<ProfileRecord, 
     let sql = format!(
         "INSERT INTO profiles \
          (id, name, provider_config, fallback_configs, mcp_servers, allowed_tools, \
-          created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, {NOW_SQL}, {NOW_SQL}) \
+          available_sandboxes, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW_SQL}, {NOW_SQL}) \
          RETURNING {SELECT_COLS}"
     );
     conn.query_row(
@@ -92,6 +114,7 @@ pub fn create(conn: &Connection, input: &ProfileInput) -> Result<ProfileRecord, 
             input.fallback_configs.to_string(),
             input.mcp_servers.to_string(),
             input.allowed_tools.to_string(),
+            input.available_sandboxes.to_string(),
         ],
         row_to_record,
     )
@@ -108,7 +131,8 @@ pub fn replace(
     let sql = format!(
         "UPDATE profiles SET \
            name = ?2, provider_config = ?3, fallback_configs = ?4, \
-           mcp_servers = ?5, allowed_tools = ?6, updated_at = {NOW_SQL} \
+           mcp_servers = ?5, allowed_tools = ?6, available_sandboxes = ?7, \
+           updated_at = {NOW_SQL} \
          WHERE id = ?1 AND deleted_at IS NULL \
          RETURNING {SELECT_COLS}"
     );
@@ -121,6 +145,7 @@ pub fn replace(
             input.fallback_configs.to_string(),
             input.mcp_servers.to_string(),
             input.allowed_tools.to_string(),
+            input.available_sandboxes.to_string(),
         ],
         row_to_record,
     )
@@ -159,6 +184,24 @@ pub fn list(
     let has_more = out.len() as i64 > limit;
     out.truncate(limit as usize);
     Ok((out, has_more))
+}
+
+/// Every active profile whose `available_sandboxes` is a non-empty array.
+/// Used at server startup to re-trigger image provisioning for each (the
+/// status map is in-memory only), and by the startup fail-fast check when an
+/// unusable sandbox driver is selected.
+pub fn list_with_sandboxes(conn: &Connection) -> rusqlite::Result<Vec<ProfileRecord>> {
+    let sql = format!("SELECT {SELECT_COLS} FROM profiles WHERE deleted_at IS NULL");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_record)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let record = r?;
+        if !record.sandbox_image_names().is_empty() {
+            out.push(record);
+        }
+    }
+    Ok(out)
 }
 
 /// Soft-delete a profile. Returns the outcome so the handler can distinguish

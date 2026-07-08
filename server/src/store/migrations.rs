@@ -56,10 +56,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "session_events",
         sql: include_str!("migrations/0005_session_events.sql"),
     },
+    Migration {
+        version: 6,
+        name: "profiles_sandboxes",
+        sql: include_str!("migrations/0006_profiles_sandboxes.sql"),
+    },
 ];
 
 /// The highest migration version this binary knows how to apply.
-pub const LATEST_VERSION: i64 = 5;
+pub const LATEST_VERSION: i64 = 6;
 
 /// A migration-runner failure.
 #[derive(Debug)]

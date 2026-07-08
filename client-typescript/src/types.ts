@@ -99,7 +99,7 @@ export interface Profile {
 // handling it here is a compile error.
 // ---------------------------------------------------------------------------
 
-/** The closed set of 14 event type strings. */
+/** The closed set of 22 event type strings. */
 export type EventType =
   | "client.message.send"
   | "server.message.send"
@@ -114,7 +114,15 @@ export type EventType =
   | "session.driver.register"
   | "session.close"
   | "session.error"
-  | "session.compaction";
+  | "session.compaction"
+  | "session.sandbox.available"
+  | "session.sandbox.start"
+  | "session.sandbox.running"
+  | "session.sandbox.stop"
+  | "session.sandbox.stopped"
+  | "session.sandbox.error"
+  | "sandbox.request"
+  | "sandbox.response";
 
 export interface ClientMessagePayload {
   role: "user";
@@ -156,15 +164,15 @@ export interface ToolCallPayload {
   id: string;
   name: string;
   input: Record<string, unknown>;
-  dispatch: "client" | "mcp";
+  dispatch: "client" | "sandbox" | "mcp";
 }
 export interface ToolResultPayload {
   tool_use_id: string;
-  dispatch: "client" | "mcp";
+  dispatch: "client" | "sandbox" | "mcp";
   content: unknown;
   /** Present on `mcp`-dispatched results: the server that produced it. */
   server_name?: string | null;
-  /** Present on `mcp`-dispatched results: whether the MCP call errored. */
+  /** Present on `mcp`/`sandbox`-dispatched results: whether the call errored. */
   is_error?: boolean;
 }
 /** Payload of an `mcp.request` event: the engine calling a configured server. */
@@ -195,6 +203,8 @@ export type McpResponsePayload =
 export interface SessionOpenPayload {
   client_version: string | null;
   tools: string[];
+  /** Names of the client's Auto-mode sandbox tools (server-dispatched). */
+  sandbox_tools: string[];
 }
 /**
  * Payload of a `session.join` event: a second (or further) client key minted a
@@ -204,6 +214,8 @@ export interface SessionOpenPayload {
 export interface SessionJoinPayload {
   client_version: string | null;
   tools: string[];
+  /** Names of the client's Auto-mode sandbox tools (server-dispatched). */
+  sandbox_tools: string[];
 }
 /**
  * Payload of a `session.driver.register` event: a client key registered as a
@@ -229,6 +241,80 @@ export interface SessionCompactionPayload {
   [key: string]: unknown;
 }
 
+// --- Sandbox lifecycle + dispatch payloads (§ sandboxes guide) --------------
+
+/**
+ * Payload of a `session.sandbox.available` event: the driver-connect
+ * notification listing the session's own profile's declared images and each
+ * one's provisioning status (never any other profile's).
+ */
+export interface SandboxAvailablePayload {
+  images: {
+    name: string;
+    status: "pending" | "available" | "error";
+    /** Present only on `error` entries. */
+    detail?: string;
+  }[];
+}
+/** Payload of a `session.sandbox.start` event (server-authored, remote only). */
+export interface SandboxStartPayload {
+  image: string;
+  dispatch: "remote";
+}
+/**
+ * Payload of a `session.sandbox.running`/`session.sandbox.stopped`/
+ * `session.sandbox.error` event — `dispatch` discriminates the server-authored
+ * remote lifecycle from client-reported (`session.reportLocalSandbox`,
+ * unverified telemetry) local lifecycle.
+ */
+export type SandboxLifecyclePayload =
+  | {
+      dispatch: "remote";
+      image: string;
+      /** Absent on a `phase: "start"` error (no container was created). */
+      sandbox_id?: string;
+      /** Present on `session.sandbox.error`: the driver call that failed. */
+      phase?: "start" | "stop" | "exec";
+      /** Present on `session.sandbox.error`: the failure message. */
+      detail?: string;
+      /** Present on stop-initiated events (`stopped`). */
+      reason?: "explicit" | "session_close";
+    }
+  | {
+      dispatch: "local";
+      image: string;
+      container_id: string | null;
+      detail: string | null;
+    };
+/** Payload of a `session.sandbox.stop` event (server-authored, remote only). */
+export interface SandboxStopPayload {
+  image: string;
+  sandbox_id: string;
+  reason: "explicit" | "session_close";
+  dispatch: "remote";
+}
+/** Payload of a `sandbox.request` event: one Auto-mode dispatch in run_turn. */
+export interface SandboxRequestPayload {
+  tool: string;
+  input: Record<string, unknown>;
+  /** The `input.command` string the server will exec, or null if missing. */
+  command: string | null;
+}
+/** Payload of a `sandbox.response` event. `ok` discriminates success vs failure. */
+export type SandboxResponsePayload =
+  | {
+      sandbox_id: string;
+      ok: boolean;
+      /** The raw exec result (`ok` is false when `exit_code` is non-zero). */
+      result: { stdout: string; stderr: string; exit_code: number };
+    }
+  | {
+      /** Null when no remote sandbox was started or `command` was missing. */
+      sandbox_id: string | null;
+      ok: false;
+      error: string;
+    };
+
 /** Maps each `event_type` to its payload shape. */
 interface EventPayloads {
   "client.message.send": ClientMessagePayload;
@@ -245,6 +331,14 @@ interface EventPayloads {
   "session.close": SessionClosePayload;
   "session.error": SessionErrorPayload;
   "session.compaction": SessionCompactionPayload;
+  "session.sandbox.available": SandboxAvailablePayload;
+  "session.sandbox.start": SandboxStartPayload;
+  "session.sandbox.running": SandboxLifecyclePayload;
+  "session.sandbox.stop": SandboxStopPayload;
+  "session.sandbox.stopped": SandboxLifecyclePayload;
+  "session.sandbox.error": SandboxLifecyclePayload;
+  "sandbox.request": SandboxRequestPayload;
+  "sandbox.response": SandboxResponsePayload;
 }
 
 /** The envelope every event is wrapped in (also the events-endpoint row shape). */
@@ -302,6 +396,22 @@ export function describeEvent(event: SessionEvent): string {
       return `session error (${event.payload.reason})`;
     case "session.compaction":
       return "session compaction";
+    case "session.sandbox.available":
+      return `sandbox images available (${event.payload.images.length})`;
+    case "session.sandbox.start":
+      return `sandbox start requested (${event.payload.image})`;
+    case "session.sandbox.running":
+      return `sandbox running (${event.payload.image}, ${event.payload.dispatch})`;
+    case "session.sandbox.stop":
+      return `sandbox stop requested (${event.payload.reason})`;
+    case "session.sandbox.stopped":
+      return `sandbox stopped (${event.payload.image}, ${event.payload.dispatch})`;
+    case "session.sandbox.error":
+      return `sandbox error (${event.payload.image}, ${event.payload.dispatch})`;
+    case "sandbox.request":
+      return `sandbox request ${event.payload.tool}`;
+    case "sandbox.response":
+      return `sandbox response (ok=${event.payload.ok})`;
     default:
       return assertNever(event);
   }
@@ -323,7 +433,11 @@ export type RpcMethod =
   | "session.sendMessage"
   | "session.registerDriver"
   | "session.subscribe"
-  | "session.unsubscribe";
+  | "session.unsubscribe"
+  | "session.execRemoteSandbox"
+  | "session.reportLocalSandbox"
+  | "session.startRemoteSandbox"
+  | "session.stopRemoteSandbox";
 
 /** A JSON-RPC 2.0 request envelope. */
 export interface JsonRpcRequest<P = unknown> {
