@@ -33,20 +33,33 @@ SESSION_KEY=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys
 echo "session: $SESSION_ID"
 ```
 
+### Register as a driver
+
+Required once per session key, before its first `session.sendMessage` (SDKs
+do this automatically inside `connect()`):
+
+```sh
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
+  -H "Authorization: Bearer $SESSION_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"session.registerDriver","params":{}}'
+# {"jsonrpc":"2.0","id":1,"result":{"registered":true}}
+```
+
 ### Send a message (`POST /rpc` with JSON-RPC)
 
 ```sh
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"session.sendMessage","params":{"message":{"role":"user","content":"Say hello."}}}' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"session.sendMessage","params":{"message":{"role":"user","content":"Say hello."}}}' \
 | while IFS= read -r line; do
     echo "$line"
   done
 ```
 
 Each line is a JSON object. Objects without `"id"` are live event
-notifications; the last line (carrying `"id":1`) is the terminal result.
+notifications; the last line (carrying `"id":2`) is the terminal result.
 
 Extract the assistant text from the terminal result:
 

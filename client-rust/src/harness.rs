@@ -57,6 +57,12 @@ pub(crate) trait Transport {
     /// [`Error::ProvidersFailed`]; a JSON-RPC error object as [`Error::Rpc`].
     async fn send_message(&self, params: &SendMessageParams) -> Result<SendOutcome, Error>;
 
+    /// Drive `session.registerDriver`: register the calling session key as a
+    /// driver so `session.sendMessage` is permitted. Issued once during
+    /// `connect()`/`join()`, before the caller's first send — application code
+    /// must never call it directly. Idempotent server-side.
+    async fn register_driver(&self) -> Result<(), Error>;
+
     /// Drive `session.subscribe`: stream `session.event` notifications to
     /// `on_event` until it returns `false`, the server ends the stream, or an
     /// error frame arrives.
@@ -167,10 +173,7 @@ impl HttpTransport {
 
     /// POST a JSON-RPC request to `…/rpc` and, on a `2xx`, hand back the NDJSON
     /// body reader. A non-2xx status is a pre-stream RFC 7807 error (e.g. `401`).
-    async fn open_rpc<P: Serialize>(
-        &self,
-        req: &JsonRpcRequest<P>,
-    ) -> Result<NdjsonReader, Error> {
+    async fn open_rpc<P: Serialize>(&self, req: &JsonRpcRequest<P>) -> Result<NdjsonReader, Error> {
         let resp = self
             .http
             .post(self.rpc_url())
@@ -238,6 +241,24 @@ impl Transport for HttpTransport {
             result,
             notifications,
         })
+    }
+
+    async fn register_driver(&self) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.registerDriver", json!({}));
+        let mut reader = self.open_rpc(&req).await?;
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            // The terminal `{registered: true}` result ends the stream.
+            if frame.id.is_some() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn subscribe(
@@ -468,23 +489,58 @@ impl Harness {
         self.tools.keys().map(String::as_str).collect()
     }
 
-    /// Open a session on the server and return a [`Session`] handle.
+    /// Open a new session on the server and return a [`Session`] handle.
     ///
     /// Sends the configured `client_version` and every registered tool's
     /// declaration; the server validates each name against the profile's
     /// `allowed_tools`. Consumes the harness, moving the tool registry and
-    /// hooks into the session.
+    /// hooks into the session. Registers this connection as a driver
+    /// (`session.registerDriver`) before returning, so the first
+    /// [`send`](Session::send) is permitted.
     pub async fn connect(self) -> Result<Session, Error> {
+        let url = format!("{}/api/v1/sessions", self.config.base());
+        self.open(url).await
+    }
+
+    /// Join an **existing** session as an additional driver and return a
+    /// [`Session`] handle shaped identically to [`connect`](Harness::connect)'s.
+    ///
+    /// POSTs to `/api/v1/sessions/{session_id}/join` with this harness's
+    /// `client_version` and registered tool declarations (a joining client
+    /// declares its own, independent tool set, validated against the *same*
+    /// profile's `allowed_tools`). The joining client key must resolve to the
+    /// same profile as the session, or the server rejects with
+    /// `403 profile_mismatch`. Like [`connect`](Harness::connect), registers
+    /// this connection as a driver before returning.
+    pub async fn join(self, session_id: impl AsRef<str>) -> Result<Session, Error> {
+        let url = format!(
+            "{}/api/v1/sessions/{}/join",
+            self.config.base(),
+            session_id.as_ref()
+        );
+        self.open(url).await
+    }
+
+    /// Shared body of [`connect`](Harness::connect) and [`join`](Harness::join):
+    /// POST the declared tools to `url` with client-key auth, then register as a
+    /// driver before handing back the [`Session`]. Both endpoints return the
+    /// identical `{session_id, session_key, profile}` shape.
+    async fn open(self, url: String) -> Result<Session, Error> {
+        let Harness {
+            config,
+            http,
+            tools,
+            hooks,
+        } = self;
+
         let body = OpenRequest {
-            client_version: self.config.client_version.clone(),
-            tools: self.tools.values().map(Tool::declaration).collect(),
+            client_version: config.client_version.clone(),
+            tools: tools.values().map(Tool::declaration).collect(),
         };
 
-        let url = format!("{}/api/v1/sessions", self.config.base());
-        let resp = self
-            .http
+        let resp = http
             .post(url)
-            .bearer_auth(&self.config.client_key)
+            .bearer_auth(&config.client_key)
             .json(&body)
             .send()
             .await?;
@@ -496,18 +552,24 @@ impl Harness {
         }
         let open: OpenResponse = serde_json::from_slice(&bytes)?;
 
+        let transport = HttpTransport {
+            http,
+            base: config.base().to_string(),
+            session_id: open.session_id.clone(),
+            session_key: open.session_key,
+            next_id: AtomicU64::new(1),
+        };
+
+        // Register as a driver before any send: session.sendMessage requires it
+        // (a `-32001` error otherwise). Application code never calls this.
+        transport.register_driver().await?;
+
         Ok(Session {
-            transport: HttpTransport {
-                http: self.http,
-                base: self.config.base().to_string(),
-                session_id: open.session_id.clone(),
-                session_key: open.session_key,
-                next_id: AtomicU64::new(1),
-            },
+            transport,
             session_id: open.session_id,
             profile: open.profile,
-            tools: self.tools,
-            hooks: self.hooks,
+            tools,
+            hooks,
         })
     }
 }
@@ -613,6 +675,9 @@ mod tests {
         responses: RefCell<Vec<Result<SendOutcome, Error>>>,
         sent: RefCell<Vec<SendMessageParams>>,
         closed: RefCell<bool>,
+        /// How many times `register_driver` was called — connect()/join() each
+        /// call it exactly once during setup.
+        driver_registrations: RefCell<usize>,
     }
 
     impl MockTransport {
@@ -621,6 +686,7 @@ mod tests {
                 responses: RefCell::new(responses),
                 sent: RefCell::new(Vec::new()),
                 closed: RefCell::new(false),
+                driver_registrations: RefCell::new(0),
             }
         }
     }
@@ -634,6 +700,11 @@ mod tests {
                 panic!("mock transport ran out of scripted responses");
             }
             self.responses.borrow_mut().remove(0)
+        }
+
+        async fn register_driver(&self) -> Result<(), Error> {
+            *self.driver_registrations.borrow_mut() += 1;
+            Ok(())
         }
 
         async fn subscribe(
@@ -998,9 +1069,14 @@ mod tests {
         });
 
         // MCP tools are dispatched server-side, so the loop ends after one turn.
-        let out = run_loop(&transport, &tools, &mut hooks, Message::user("search please"))
-            .await
-            .unwrap();
+        let out = run_loop(
+            &transport,
+            &tools,
+            &mut hooks,
+            Message::user("search please"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.text(), "after mcp");
 
         let events = observed.lock().unwrap();
@@ -1025,5 +1101,184 @@ mod tests {
         assert!(events
             .iter()
             .all(|(_, p)| p.get("status").and_then(|s| s.as_str()) != Some("stub")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-SDK two-driver parity (WI 0005)
+    //
+    // Two client keys attach to one session (driver A via connect, driver B via
+    // join, same profile), both register as drivers, both send a message. Every
+    // driver observes the SAME ordered broadcast event sequence — including the
+    // other driver's `session.join` / `session.driver.register` and, in FIFO
+    // order, both turns' messages. The canonical sequence below MUST stay
+    // byte-for-byte identical to the arrays in the TypeScript and Python SDK
+    // two-driver parity tests:
+    //   - client-typescript/src/harness.test.ts   (TWO_DRIVER_PARITY_SEQUENCE)
+    //   - client-python/tests/test_two_driver_parity.py (TWO_DRIVER_PARITY_SEQUENCE)
+    // -----------------------------------------------------------------------
+
+    /// The canonical live-notification sequence every driver observes for the
+    /// scripted two-driver session.
+    const TWO_DRIVER_PARITY_SEQUENCE: [&str; 11] = [
+        "session.driver.register", // driver A registered (connect)
+        "session.join",            // driver B joined
+        "session.driver.register", // driver B registered (join)
+        "client.message.send",     // driver A's message (FIFO first)
+        "provider.request",
+        "provider.response",
+        "server.message.send",
+        "client.message.send", // driver B's message (FIFO second)
+        "provider.request",
+        "provider.response",
+        "server.message.send",
+    ];
+
+    const DRIVER_A_KEY: &str = "key_driver_a";
+    const DRIVER_B_KEY: &str = "key_driver_b";
+
+    fn attributed_event(
+        event_type: &str,
+        client_key_id: &str,
+        payload: serde_json::Value,
+    ) -> EventView {
+        EventView {
+            id: format!("evt_{event_type}_{client_key_id}"),
+            session_id: "ses_two_driver".into(),
+            client_key_id: Some(client_key_id.into()),
+            event_type: event_type.into(),
+            payload,
+            created_at: "t".into(),
+        }
+    }
+
+    /// One `session.sendMessage` outcome carrying the full two-driver broadcast
+    /// as live notifications, then a terminal assistant turn. Both drivers'
+    /// streams deliver this identical sequence (cross-visibility).
+    fn two_driver_outcome() -> SendOutcome {
+        let notifications = vec![
+            attributed_event("session.driver.register", DRIVER_A_KEY, json!({})),
+            attributed_event(
+                "session.join",
+                DRIVER_B_KEY,
+                json!({ "client_version": "9.9.9", "tools": ["get_current_time"] }),
+            ),
+            attributed_event("session.driver.register", DRIVER_B_KEY, json!({})),
+            attributed_event(
+                "client.message.send",
+                DRIVER_A_KEY,
+                json!({ "role": "user", "content": "from A" }),
+            ),
+            attributed_event("provider.request", DRIVER_A_KEY, json!({ "attempt": 0 })),
+            attributed_event(
+                "provider.response",
+                DRIVER_A_KEY,
+                json!({ "ok": true, "status": 200 }),
+            ),
+            attributed_event(
+                "server.message.send",
+                DRIVER_A_KEY,
+                json!({ "role": "assistant", "content": [{ "type": "text", "text": "reply A" }] }),
+            ),
+            attributed_event(
+                "client.message.send",
+                DRIVER_B_KEY,
+                json!({ "role": "user", "content": "from B" }),
+            ),
+            attributed_event("provider.request", DRIVER_B_KEY, json!({ "attempt": 0 })),
+            attributed_event(
+                "provider.response",
+                DRIVER_B_KEY,
+                json!({ "ok": true, "status": 200 }),
+            ),
+            attributed_event(
+                "server.message.send",
+                DRIVER_B_KEY,
+                json!({ "role": "assistant", "content": [{ "type": "text", "text": "reply B" }] }),
+            ),
+        ];
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::Text {
+                    text: "reply B".into(),
+                }]),
+                events: vec![],
+            },
+            notifications,
+        }
+    }
+
+    /// Collect the observed `(event_type, client_key_id)` pairs of one driver by
+    /// running its send loop against a transport delivering the shared broadcast.
+    async fn observe_two_driver_stream() -> (Vec<(String, Option<String>)>, MockTransport) {
+        let transport = MockTransport::new(vec![Ok(two_driver_outcome())]);
+        // Both connect() and join() register a driver once before the first
+        // send; model that here since the offline loop bypasses connect()/join().
+        transport.register_driver().await.unwrap();
+
+        let observed = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let sink = observed.clone();
+        let mut hooks = Hooks::default().on_event(move |ev| {
+            sink.lock()
+                .unwrap()
+                .push((ev.event_type.clone(), ev.client_key_id.clone()));
+            Ok(())
+        });
+        run_loop(
+            &transport,
+            &registry(vec![]),
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap();
+        let out = observed.lock().unwrap().clone();
+        (out, transport)
+    }
+
+    #[tokio::test]
+    async fn two_drivers_observe_identical_fifo_broadcast_and_register() {
+        let (observed_a, transport_a) = observe_two_driver_stream().await;
+        let (observed_b, transport_b) = observe_two_driver_stream().await;
+
+        let types_a: Vec<&str> = observed_a.iter().map(|(t, _)| t.as_str()).collect();
+        let types_b: Vec<&str> = observed_b.iter().map(|(t, _)| t.as_str()).collect();
+
+        // Both drivers observe the identical canonical sequence (cross-visibility).
+        assert_eq!(types_a, TWO_DRIVER_PARITY_SEQUENCE);
+        assert_eq!(types_b, TWO_DRIVER_PARITY_SEQUENCE);
+        assert_eq!(observed_a, observed_b);
+
+        // Each driver registered exactly once (connect / join issue it).
+        assert_eq!(*transport_a.driver_registrations.borrow(), 1);
+        assert_eq!(*transport_b.driver_registrations.borrow(), 1);
+
+        // Cross-visibility of client keys: an observer sees events attributed to
+        // BOTH drivers, not just its own.
+        let keys: Vec<&str> = observed_a
+            .iter()
+            .filter_map(|(_, k)| k.as_deref())
+            .collect();
+        assert!(keys.contains(&DRIVER_A_KEY));
+        assert!(keys.contains(&DRIVER_B_KEY));
+
+        // FIFO ordering: driver A's message turn precedes driver B's. Compare the
+        // two `client.message.send` events' positions and attribution.
+        let sends: Vec<&(String, Option<String>)> = observed_a
+            .iter()
+            .filter(|(t, _)| t == "client.message.send")
+            .collect();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].1.as_deref(), Some(DRIVER_A_KEY));
+        assert_eq!(sends[1].1.as_deref(), Some(DRIVER_B_KEY));
+
+        // The new event payloads parse to their real shapes.
+        let join = two_driver_outcome()
+            .notifications
+            .into_iter()
+            .find(|e| e.event_type == "session.join")
+            .unwrap();
+        let join_payload: crate::SessionJoinPayload = serde_json::from_value(join.payload).unwrap();
+        assert_eq!(join_payload.client_version.as_deref(), Some("9.9.9"));
+        assert_eq!(join_payload.tools, vec!["get_current_time".to_string()]);
     }
 }

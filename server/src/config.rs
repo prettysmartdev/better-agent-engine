@@ -29,6 +29,10 @@ pub const DEFAULT_DB_PATH: &str = "/var/lib/bae/bae.db";
 pub const DEFAULT_LOG: &str = "info";
 /// Default graceful-shutdown drain timeout, in seconds.
 pub const DEFAULT_SHUTDOWN_SECS: u64 = 30;
+/// Default abandoned-turn timeout, in seconds: how long a paused turn's owner
+/// may stay away before the next `session.sendMessage` arrival treats the turn
+/// as abandoned and releases the session's FIFO gate.
+pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 120;
 
 /// Fully-validated server configuration.
 #[derive(Debug, Clone)]
@@ -43,6 +47,9 @@ pub struct Config {
     pub log: String,
     /// How long to drain in-flight requests on shutdown (`BAE_SHUTDOWN_TIMEOUT`).
     pub shutdown_timeout: Duration,
+    /// How long a paused turn may await its owner's continuation before being
+    /// treated as abandoned (`BAE_TURN_TIMEOUT`).
+    pub turn_timeout: Duration,
 }
 
 /// A configuration problem detected at startup.
@@ -119,6 +126,11 @@ impl Config {
             "BAE_SHUTDOWN_TIMEOUT",
             DEFAULT_SHUTDOWN_SECS,
         )?);
+        let turn_timeout = Duration::from_secs(parse_secs(
+            get,
+            "BAE_TURN_TIMEOUT",
+            DEFAULT_TURN_TIMEOUT_SECS,
+        )?);
 
         Ok(Config {
             addr,
@@ -126,6 +138,7 @@ impl Config {
             db_path,
             log,
             shutdown_timeout,
+            turn_timeout,
         })
     }
 }
@@ -176,6 +189,7 @@ mod tests {
         assert_eq!(cfg.db_path.to_str().unwrap(), DEFAULT_DB_PATH);
         assert_eq!(cfg.log, "info");
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.turn_timeout, Duration::from_secs(120));
     }
 
     #[test]
@@ -186,12 +200,14 @@ mod tests {
             ("BAE_DB_PATH", "/data/x.db"),
             ("BAE_LOG", "debug"),
             ("BAE_SHUTDOWN_TIMEOUT", "5"),
+            ("BAE_TURN_TIMEOUT", "7"),
         ]))
         .unwrap();
         assert_eq!(cfg.addr.to_string(), "127.0.0.1:9000");
         assert_eq!(cfg.db_path.to_str().unwrap(), "/data/x.db");
         assert_eq!(cfg.log, "debug");
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.turn_timeout, Duration::from_secs(7));
     }
 
     #[test]

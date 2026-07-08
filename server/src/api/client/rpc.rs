@@ -4,14 +4,22 @@
 //! client-port route stays plain REST/JSON with RFC 7807 errors. It carries
 //! exactly the live, session-bound message/event loop:
 //!
+//! - `session.registerDriver` (`{}`) — registers the calling client key as a
+//!   driver for this session. Registration is a prerequisite for
+//!   `session.sendMessage` (an unregistered caller gets `-32001`) and logs a
+//!   broadcast `session.driver.register` event so other participants see who
+//!   is driving. SDK harnesses call this once during `connect()`/`join()`.
 //! - `session.sendMessage` (`{message}`) — replaces the old
 //!   `POST /api/v1/sessions/{id}/messages`. Streams a `session.event`
 //!   notification for every event the turn produces, in order as it happens,
 //!   then one terminal response carrying the same `{message, events}` body the
-//!   old route returned.
-//! - `session.subscribe` (`{since_event_id?}`) — a non-driving observer feed:
-//!   replay persisted events after `since_event_id`, then live notifications
-//!   indefinitely. No terminal response while active.
+//!   old route returned. Concurrent turns on one session are serialized by a
+//!   per-session FIFO gate (see [`drive_send_message`]): a queued driver's
+//!   NDJSON response stays open with zero bytes written until it is dequeued.
+//! - `session.subscribe` (`{since_event_id?}`) — a non-driving observer feed
+//!   (subscribing **is** the observer registration act; no driver registration
+//!   needed): replay persisted events after `since_event_id`, then live
+//!   notifications indefinitely. No terminal response while active.
 //! - `session.unsubscribe` (`{}`) — ends any active `session.subscribe` streams
 //!   for this session cleanly.
 //!
@@ -44,10 +52,8 @@ use super::sessions::{auth_session, event_view, tool_result_blocks, MessageBody}
 use crate::api::AppState;
 use crate::engine::{broadcast, session};
 use crate::events::EventType;
-use crate::store::sessions::{
-    self, rowid_of_event, SessionRecord, STATE_ERROR, STATE_OPEN,
-};
 use crate::store::profiles;
+use crate::store::sessions::{self, rowid_of_event, SessionRecord, STATE_ERROR, STATE_OPEN};
 
 /// How many persisted events to page at a time during `session.subscribe`
 /// replay (matches the list endpoint's hard cap).
@@ -70,10 +76,14 @@ pub async fn rpc(
     // Auth is a transport-level gate: a bad/missing session key is rejected as
     // the usual RFC 7807 401 *before* the NDJSON stream is opened, exactly as on
     // the other session-scoped routes.
-    let (session, _key) = match auth_session(&state, &headers, &id) {
+    let (session, key) = match auth_session(&state, &headers, &id) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    // The acting client key behind this session key: a session key's
+    // `client_id` records the client key it was minted for (creator or
+    // joiner). This is what driver registration and per-turn ownership track.
+    let acting_client_key_id = key.client_id.clone().unwrap_or_default();
 
     // Parse the JSON-RPC envelope. Everything from here on is delivered as a
     // JSON-RPC object in the NDJSON stream, never an RFC 7807 body.
@@ -111,7 +121,11 @@ pub async fn rpc(
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return single_or_empty(
             id_present,
-            error_obj(req_id, -32600, "Invalid Request: missing or wrong \"jsonrpc\" version"),
+            error_obj(
+                req_id,
+                -32600,
+                "Invalid Request: missing or wrong \"jsonrpc\" version",
+            ),
         );
     }
     let method = match obj.get("method").and_then(Value::as_str) {
@@ -128,21 +142,59 @@ pub async fn rpc(
     // The id echoed on a terminal response, or `None` for a notification (which
     // gets no response). Streaming methods thread this through; single-response
     // arms use `single_or_empty`.
-    let resp_id = if id_present { Some(req_id.clone()) } else { None };
+    let resp_id = if id_present {
+        Some(req_id.clone())
+    } else {
+        None
+    };
 
     match method.as_str() {
-        "session.sendMessage" => spawn_stream(move |tx| {
-            drive_send_message(state, session, resp_id, params, tx)
-        }),
-        "session.subscribe" => {
-            spawn_stream(move |tx| drive_subscribe(state, session, params, tx))
+        "session.registerDriver" => {
+            // Record the caller as a driver and log it for every participant.
+            // Registration is idempotent: a repeat call succeeds without
+            // logging a duplicate event. A terminal session cannot gain
+            // drivers (mirroring sendMessage's state gate).
+            if session.state != STATE_OPEN {
+                let state_str = session.state.clone();
+                return single_or_empty(
+                    id_present,
+                    error_obj(req_id, -32000, format!("session is {state_str}, not open")),
+                );
+            }
+            if state.register_driver(&session.id, &acting_client_key_id) {
+                if let Err(e) = broadcast::insert_and_publish(
+                    &state.store,
+                    &state.broadcaster,
+                    &session.id,
+                    Some(&acting_client_key_id),
+                    EventType::SessionDriverRegistered,
+                    &json!({}),
+                ) {
+                    tracing::error!("database error in /rpc: {e}");
+                    return single_or_empty(
+                        id_present,
+                        error_obj(req_id, -32603, "Internal error"),
+                    );
+                }
+            }
+            single_or_empty(
+                id_present,
+                result_obj(req_id, json!({ "registered": true })),
+            )
         }
+        "session.sendMessage" => spawn_stream(move |tx| {
+            drive_send_message(state, session, acting_client_key_id, resp_id, params, tx)
+        }),
+        "session.subscribe" => spawn_stream(move |tx| drive_subscribe(state, session, params, tx)),
         "session.unsubscribe" => {
             // Ends active session.subscribe streams for this session. The
             // cancellation side effect happens even for a notification; only the
             // terminal response is suppressed when there is no `id`.
             state.broadcaster.cancel_subscriptions(&session.id);
-            single_or_empty(id_present, result_obj(req_id, json!({ "unsubscribed": true })))
+            single_or_empty(
+                id_present,
+                result_obj(req_id, json!({ "unsubscribed": true })),
+            )
         }
         _ => single_or_empty(
             id_present,
@@ -155,20 +207,41 @@ pub async fn rpc(
 // session.sendMessage
 // ---------------------------------------------------------------------------
 
-/// Drive one `session.sendMessage`: subscribe to the session feed, record the
-/// client turn, run the loop while forwarding its events live, then write the
+/// Drive one `session.sendMessage`: check driver registration, take the
+/// session's FIFO turn gate, subscribe to the session feed, record the client
+/// turn, run the loop while forwarding its events live, then write the
 /// terminal `{message, events}` response.
+///
+/// **Turn ownership.** The gate serializes entire *logical turns*, not single
+/// HTTP requests: a turn that ends [`session::Outcome::Paused`] (a client-side
+/// tool call in flight) parks its gate guard in `pending_turns`, so only the
+/// same client key can resume without queuing — any other driver's message
+/// blocks on `lock_owned()` (its NDJSON response stays open with zero bytes
+/// written) until the owner completes or abandons the turn. An owner that
+/// stays away past `BAE_TURN_TIMEOUT` is treated as abandoned by the next
+/// arrival: a `session.error` (`driver_turn_abandoned`) is logged and the gate
+/// is released to the next FIFO waiter; the session stays `open`.
 async fn drive_send_message(
     state: AppState,
     session: SessionRecord,
+    acting_client_key_id: String,
     resp_id: Option<Value>,
     params: Value,
     tx: mpsc::Sender<Bytes>,
 ) {
-    // Subscribe *before* running the turn so no event the turn produces slips
-    // past us. The client's own `client.message.send` / client-dispatch
-    // `tool.result` are filtered out of the broadcast, so they are never echoed.
-    let (mut rx, _cancel) = state.broadcaster.subscribe(&session.id);
+    // Explicit driver registration is the gate on sending — checked before the
+    // turn lock or broadcast subscription is touched. Never auto-registers.
+    if !state.is_registered_driver(&session.id, &acting_client_key_id) {
+        emit_terminal(&tx, &resp_id, |id| {
+            error_obj(
+                id,
+                -32001,
+                "call session.registerDriver before session.sendMessage",
+            )
+        })
+        .await;
+        return;
+    }
 
     if session.state != STATE_OPEN {
         let state_str = session.state.clone();
@@ -179,7 +252,9 @@ async fn drive_send_message(
         return;
     }
 
-    // `params.message` is required and must carry `content`.
+    // `params.message` is required and must carry `content`. Validated before
+    // queuing on the gate so a malformed request fails fast instead of waiting
+    // its turn.
     let message: MessageBody = match params.get("message").cloned() {
         Some(m) => match serde_json::from_value(m) {
             Ok(m) => m,
@@ -200,15 +275,110 @@ async fn drive_send_message(
         }
     };
 
-    // Record the incoming client turn (and any returned tool_result blocks).
-    // These go through the publish choke point but are filtered from broadcast.
+    // --- FIFO single-active-message mutex ---
+    // (1) A paused turn owned by this caller is resumed by reclaiming its
+    // parked guard — no queuing; ownership is checked by client key id, not by
+    // the message's shape, so the owner may also abandon its pending tool call
+    // voluntarily by sending anything. (2) A paused turn whose owner stayed
+    // away past the deadline is abandoned: drop the parked guard (releasing
+    // the gate to the next FIFO waiter) and log the abandonment. (3) Otherwise
+    // queue on the gate; `tokio::sync::Mutex` grants `lock_owned()` in request
+    // order, which is the FIFO queue.
+    let mut abandoned_owner: Option<String> = None;
+    let reclaimed = {
+        let mut pending = state
+            .pending_turns
+            .lock()
+            .expect("pending_turns mutex poisoned");
+        let (caller_owns, expired) = match pending.get(&session.id) {
+            Some(pt) => (
+                pt.owner_client_key_id == acting_client_key_id,
+                tokio::time::Instant::now() > pt.deadline,
+            ),
+            None => (false, false),
+        };
+        if caller_owns {
+            pending.remove(&session.id).map(|pt| pt.guard)
+        } else {
+            if expired {
+                if let Some(pt) = pending.remove(&session.id) {
+                    abandoned_owner = Some(pt.owner_client_key_id);
+                    // Dropping pt (and its parked guard) releases the gate.
+                }
+            }
+            None
+        }
+    };
+    if let Some(owner) = abandoned_owner {
+        // Logged through the broadcast choke point so live watchers see the
+        // abandonment; the session stays open (unlike a provider failure).
+        if let Err(e) = broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            &session.id,
+            Some(&owner),
+            EventType::SessionError,
+            &json!({ "reason": "driver_turn_abandoned", "owner_client_key_id": owner }),
+        ) {
+            tracing::error!("failed to log driver_turn_abandoned: {e}");
+        }
+    }
+    let gate_guard = match reclaimed {
+        Some(g) => g,
+        // The point where a second driver's message genuinely waits its turn.
+        None => state.turn_gate(&session.id).lock_owned().await,
+    };
+    // Held for the rest of this call; on a Paused outcome it is parked in
+    // `pending_turns` instead of dropped. Every other exit path (completion,
+    // error, client disconnect) drops it, releasing the next FIFO waiter.
+    let mut gate_guard = Some(gate_guard);
+
+    // Re-read the session now that the gate is held: while this message was
+    // queued, the previous turn may have moved the session to `error`, or a
+    // close/revocation may have ended it — a dequeued message must never drive
+    // a terminal session. The fresh record also carries any `client_tools`
+    // entries added by joins since this request authenticated.
+    let session = match state
+        .store
+        .with_conn(|c| sessions::get_session(c, &session.id))
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            emit_terminal(&tx, &resp_id, |id| {
+                error_obj(id, -32000, "session no longer exists")
+            })
+            .await;
+            return;
+        }
+        Err(e) => return emit_internal(&tx, &resp_id, e).await,
+    };
+    if session.state != STATE_OPEN {
+        let state_str = session.state.clone();
+        emit_terminal(&tx, &resp_id, |id| {
+            error_obj(id, -32000, format!("session is {state_str}, not open"))
+        })
+        .await;
+        return;
+    }
+
+    // Subscribe *before* running the turn so no event the turn produces slips
+    // past us — but only after the gate is held, so a queued caller's stream
+    // stays silent while another driver's turn is in flight. The client's own
+    // `client.message.send` / client-dispatch `tool.result` are filtered out
+    // of the broadcast, so they are never echoed.
+    let (mut rx, _cancel) = state.broadcaster.subscribe(&session.id);
+
+    // Record the incoming client turn (and any returned tool_result blocks),
+    // attributed to the acting client key (the driver sending this message,
+    // not necessarily the session's creator). These go through the publish
+    // choke point but are filtered from broadcast.
     let mut all_events = Vec::new();
     let msg_payload = json!({ "role": message.role, "content": message.content });
     match broadcast::insert_and_publish(
         &state.store,
         &state.broadcaster,
         &session.id,
-        Some(&session.client_key_id),
+        Some(&acting_client_key_id),
         EventType::ClientMessageSend,
         &msg_payload,
     ) {
@@ -220,7 +390,7 @@ async fn drive_send_message(
             &state.store,
             &state.broadcaster,
             &session.id,
-            Some(&session.client_key_id),
+            Some(&acting_client_key_id),
             EventType::ToolResult,
             &block,
         ) {
@@ -230,14 +400,17 @@ async fn drive_send_message(
     }
 
     // The profile could have been deleted mid-session.
-    let profile = match state.store.with_conn(|c| profiles::get(c, &session.profile_id)) {
+    let profile = match state
+        .store
+        .with_conn(|c| profiles::get(c, &session.profile_id))
+    {
         Ok(Some(p)) => p,
         Ok(None) => {
             let _ = broadcast::insert_and_publish(
                 &state.store,
                 &state.broadcaster,
                 &session.id,
-                Some(&session.client_key_id),
+                Some(&acting_client_key_id),
                 EventType::SessionError,
                 &json!({ "reason": "profile_unavailable", "profile_id": session.profile_id }),
             );
@@ -258,6 +431,9 @@ async fn drive_send_message(
     };
 
     // Run the loop concurrently with forwarding its events as notifications.
+    // The acting client key scopes the turn: only its declared tools (plus
+    // session-wide MCP tools) are advertised, and every event the turn logs is
+    // attributed to it.
     let mcp = state.mcp_session(&session.id);
     let turn_fut = session::run_turn(
         &state.store,
@@ -265,7 +441,9 @@ async fn drive_send_message(
         &state.broadcaster,
         &session,
         &profile,
+        &state.provider_registry,
         mcp,
+        &acting_client_key_id,
     );
     tokio::pin!(turn_fut);
 
@@ -301,6 +479,27 @@ async fn drive_send_message(
 
     match turn_result {
         Ok(turn) => {
+            // A Paused turn (client-side tool call in flight) keeps holding the
+            // FIFO gate across requests: park the guard so only this caller's
+            // continuation resumes without queuing. Completed/ProvidersFailed
+            // turns let the guard drop at the end of this call, releasing the
+            // next FIFO waiter.
+            if turn.outcome == session::Outcome::Paused {
+                if let Some(guard) = gate_guard.take() {
+                    state
+                        .pending_turns
+                        .lock()
+                        .expect("pending_turns mutex poisoned")
+                        .insert(
+                            session.id.clone(),
+                            crate::api::PendingTurn {
+                                owner_client_key_id: acting_client_key_id.clone(),
+                                guard,
+                                deadline: tokio::time::Instant::now() + state.turn_timeout,
+                            },
+                        );
+                }
+            }
             // The terminal result is the exact `{message, events}` body the old
             // `POST /messages` returned — a provider failure (session moved to
             // `error`) surfaces here too, in `result.message`, rather than as a
@@ -312,9 +511,13 @@ async fn drive_send_message(
         }
         Err(e) => {
             tracing::error!("session loop failed: {e}");
-            emit_terminal(&tx, &resp_id, |id| error_obj(id, -32000, "session loop failed")).await;
+            emit_terminal(&tx, &resp_id, |id| {
+                error_obj(id, -32000, "session loop failed")
+            })
+            .await;
         }
     }
+    drop(gate_guard);
 }
 
 // ---------------------------------------------------------------------------

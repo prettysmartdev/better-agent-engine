@@ -53,7 +53,7 @@ def test_message_from_wire_and_to_wire() -> None:
 
 
 def test_event_type_is_closed_and_complete() -> None:
-    # The exact twelve strings from the wire contract (§8).
+    # The exact fourteen strings from the wire contract (§8).
     assert {e.value for e in EventType} == {
         "client.message.send",
         "server.message.send",
@@ -64,6 +64,8 @@ def test_event_type_is_closed_and_complete() -> None:
         "mcp.request",
         "mcp.response",
         "session.open",
+        "session.join",
+        "session.driver.register",
         "session.close",
         "session.error",
         "session.compaction",

@@ -1,13 +1,17 @@
 //! Profile persistence.
 //!
 //! A profile is the admin-managed configuration a client key is bound to: the
-//! primary LLM provider, ordered fallbacks, the opt-in list of MCP server names
-//! (a JSON array of strings, each naming a `bae-config.toml` registry entry),
-//! and the allowlist of client-side tools a session may declare. Complex fields
+//! primary LLM provider name, ordered fallback provider names, the opt-in list
+//! of MCP server names (each naming a `bae-config.toml` registry entry), and
+//! the allowlist of client-side tools a session may declare. Complex fields
 //! are stored as JSON blobs (see migration 0003) and surfaced here as parsed
 //! [`serde_json::Value`]s. (`mcp_servers` changed from an opaque blob to an
-//! array of name strings in work item 0003 — an application-layer contract
-//! change, not a schema change: the column stays `TEXT`.)
+//! array of name strings in work item 0003; `provider_config` /
+//! `fallback_configs` changed from inline config objects to a JSON string /
+//! string-array of `[providers]` registry names in work item 0005 — both are
+//! application-layer contract changes, not schema changes: the columns stay
+//! `TEXT`. In the admin API those two surface as `primary_provider` /
+//! `fallback_providers`.)
 //!
 //! Soft-delete only: [`soft_delete`] stamps `deleted_at`; rows are never removed.
 //! Every query here filters `deleted_at IS NULL` so a deleted profile is

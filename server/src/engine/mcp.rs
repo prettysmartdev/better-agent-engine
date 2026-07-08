@@ -179,11 +179,9 @@ impl McpSession {
     /// connection surfaces as [`McpError::Transport`]; the caller synthesizes an
     /// error `tool.result` and continues the turn without reconnecting.
     pub async fn call_tool(&mut self, tool_name: &str, input: &Value) -> Result<Value, McpError> {
-        let server = self
-            .routes
-            .get(tool_name)
-            .cloned()
-            .ok_or_else(|| McpError::Protocol(format!("no MCP server advertises tool {tool_name:?}")))?;
+        let server = self.routes.get(tool_name).cloned().ok_or_else(|| {
+            McpError::Protocol(format!("no MCP server advertises tool {tool_name:?}"))
+        })?;
         let conn = self
             .servers
             .get_mut(&server)
@@ -394,8 +392,8 @@ impl HttpConn {
         // Resolve `${ENV_VAR}` tokens in header values immediately before use.
         let mut headers = Vec::with_capacity(cfg.headers.len());
         for (k, v) in &cfg.headers {
-            let resolved = resolve_tokens(v)
-                .map_err(|e| McpError::Connect(format!("header {k:?}: {e}")))?;
+            let resolved =
+                resolve_tokens(v).map_err(|e| McpError::Connect(format!("header {k:?}: {e}")))?;
             headers.push((k.clone(), resolved));
         }
         Ok(HttpConn {
@@ -570,7 +568,8 @@ mod tests {
 
     #[test]
     fn interpret_response_maps_error() {
-        let err = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32601, "message": "no" } });
+        let err =
+            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32601, "message": "no" } });
         let e = interpret_response(&err).unwrap_err();
         assert!(matches!(e, McpError::Protocol(m) if m.contains("-32601") && m.contains("no")));
     }

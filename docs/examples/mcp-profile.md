@@ -23,18 +23,15 @@ curl http://127.0.0.1:8081/admin/v1/mcp-servers
 
 ## Create a profile with `mcp_servers`
 
+Assumes `bae-config.toml` also declares an `anthropic-sonnet` `[providers]`
+entry (see [Configuration — `[providers]`](../reference/configuration.md#providers)).
+
 ```sh
 PROFILE=$(curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "fs-assistant",
-    "provider_config": {
-      "provider":   "anthropic",
-      "base_url":   "https://api.anthropic.com",
-      "model":      "claude-sonnet-4-6",
-      "auth_token": "${ANTHROPIC_API_KEY}",
-      "max_tokens": 8096
-    },
+    "primary_provider": "anthropic-sonnet",
     "mcp_servers":    ["filesystem"],
     "allowed_tools":  []
   }')
@@ -66,13 +63,22 @@ SESSION_KEY=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys
 
 ## Send a message that triggers the filesystem tool
 
+Register as a driver first (once per session key):
+
+```sh
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
+  -H "Authorization: Bearer $SESSION_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"session.registerDriver","params":{}}'
+```
+
 ```sh
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
-    "id": 1,
+    "id": 2,
     "method": "session.sendMessage",
     "params": {
       "message": {

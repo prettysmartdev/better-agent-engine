@@ -23,6 +23,13 @@ pub const STATE_CLOSED: &str = "closed";
 pub const STATE_ERROR: &str = "error";
 
 /// A session row, with `client_tools` parsed from its JSON blob.
+///
+/// `client_tools` is a JSON **object keyed by client key id** — each
+/// participating client's declared tool list lives under its own
+/// `client_key_id` key (`{"key_abc": [{tool def}, …], "key_def": […]}`), so
+/// per-client tool sets are never merged. `client_key_id` remains the key
+/// that *created* the session; further participants are recorded by their
+/// session keys and `session.join` events.
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub id: String,
@@ -66,7 +73,11 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     })
 }
 
-/// Create a session row.
+/// Create a session row. `client_tools` is the creating client's declared tool
+/// list; it is stored under the creator's own `client_key_id` key in the
+/// per-client `client_tools` object (see [`SessionRecord`]), never as a bare
+/// array — further participants add their own entries via
+/// [`set_client_tools`].
 #[allow(clippy::too_many_arguments)]
 pub fn create_session(
     conn: &Connection,
@@ -77,6 +88,7 @@ pub fn create_session(
     client_tools: &Value,
 ) -> rusqlite::Result<SessionRecord> {
     let id = generate_id(SESSION_ID_PREFIX);
+    let tools_by_client = serde_json::json!({ client_key_id: client_tools });
     let sql = format!(
         "INSERT INTO sessions \
            (id, client_key_id, profile_id, state, client_version, client_tools, created_at) \
@@ -91,10 +103,39 @@ pub fn create_session(
             profile_id,
             state,
             client_version,
-            client_tools.to_string(),
+            tools_by_client.to_string(),
         ],
         row_to_session,
     )
+}
+
+/// Upsert **one** client's entry in a session's per-client `client_tools`
+/// object. Only `client_key_id`'s own entry is written: other clients' entries
+/// are never read into the new value, merged, or overwritten, and a second
+/// call for the same client *replaces* (does not merge with) that client's
+/// prior list. A stored value that is not an object (pre-multi-client rows)
+/// is replaced by a fresh object holding only this client's entry.
+pub fn set_client_tools(
+    conn: &Connection,
+    session_id: &str,
+    client_key_id: &str,
+    tools: &Value,
+) -> rusqlite::Result<()> {
+    let current: Option<String> = conn.query_row(
+        "SELECT client_tools FROM sessions WHERE id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    let mut by_client = current
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    by_client.insert(client_key_id.to_owned(), tools.clone());
+    conn.execute(
+        "UPDATE sessions SET client_tools = ?2 WHERE id = ?1",
+        params![session_id, Value::Object(by_client).to_string()],
+    )?;
+    Ok(())
 }
 
 /// Fetch a session by id (any state).
@@ -249,4 +290,95 @@ pub fn list_events(
     let has_more = out.len() as i64 > limit;
     out.truncate(limit as usize);
     Ok((out, has_more))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use serde_json::json;
+
+    /// Insert the `profiles`/`keys` parent rows the `sessions` foreign keys
+    /// require (`profile_id → profiles(id)`, `client_key_id → keys(id)`).
+    fn seed_parents(c: &Connection) {
+        c.execute_batch(
+            "INSERT INTO profiles (id, name) VALUES ('pro_1', 'p');\n\
+             INSERT INTO keys (id, role) VALUES ('key_a', 'client');",
+        )
+        .unwrap();
+    }
+
+    /// `set_client_tools` writes exactly one client's entry in the per-client
+    /// `client_tools` object: other clients' entries are left byte-for-byte
+    /// untouched, and a second call for the same client *replaces* (does not
+    /// merge with) that client's own prior list.
+    #[test]
+    fn set_client_tools_upserts_only_the_target_client_and_replaces_on_repeat() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            seed_parents(c);
+            // The creator ("key_a") declares one tool; create_session stores it
+            // under key_a inside the per-client object.
+            let session = create_session(
+                c,
+                "key_a",
+                "pro_1",
+                STATE_OPEN,
+                Some("1.0.0"),
+                &json!([{ "name": "only_a" }]),
+            )
+            .unwrap();
+
+            // A joiner ("key_b") upserts its own, independent entry.
+            set_client_tools(c, &session.id, "key_b", &json!([{ "name": "only_b" }])).unwrap();
+            let row = get_session(c, &session.id).unwrap().unwrap();
+            // Both entries are present, each under its own key; nothing merged.
+            assert_eq!(row.client_tools["key_a"], json!([{ "name": "only_a" }]));
+            assert_eq!(row.client_tools["key_b"], json!([{ "name": "only_b" }]));
+
+            // Snapshot key_a's raw JSON to prove the next call leaves it identical.
+            let key_a_before = row.client_tools["key_a"].clone();
+
+            // A second call for key_b REPLACES its list — no merge with the prior
+            // ["only_b"] — and never touches key_a.
+            set_client_tools(c, &session.id, "key_b", &json!([{ "name": "replaced_b" }])).unwrap();
+            let row = get_session(c, &session.id).unwrap().unwrap();
+            assert_eq!(
+                row.client_tools["key_b"],
+                json!([{ "name": "replaced_b" }]),
+                "a repeat call replaces, does not merge, the client's own list"
+            );
+            assert_eq!(
+                row.client_tools["key_a"], key_a_before,
+                "another client's entry is left byte-for-byte untouched"
+            );
+        });
+    }
+
+    /// A stored non-object `client_tools` value (a pre-multi-client row) is
+    /// replaced by a fresh object holding only this client's entry.
+    #[test]
+    fn set_client_tools_replaces_a_legacy_non_object_blob() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            seed_parents(c);
+            let id = generate_id(SESSION_ID_PREFIX);
+            // Simulate a legacy row whose client_tools is a bare array.
+            c.execute(
+                &format!(
+                    "INSERT INTO sessions (id, client_key_id, profile_id, state, client_tools, created_at) \
+                     VALUES (?1, 'key_a', 'pro_1', '{STATE_OPEN}', ?2, {NOW_SQL})"
+                ),
+                params![id, json!([{ "name": "legacy" }]).to_string()],
+            )
+            .unwrap();
+
+            set_client_tools(c, &id, "key_b", &json!([{ "name": "only_b" }])).unwrap();
+            let row = get_session(c, &id).unwrap().unwrap();
+            assert!(row.client_tools.is_object(), "legacy blob is replaced by an object");
+            assert_eq!(row.client_tools["key_b"], json!([{ "name": "only_b" }]));
+            // The legacy bare array did not survive as a stray key.
+            assert_eq!(row.client_tools.as_object().unwrap().len(), 1);
+        });
+    }
 }

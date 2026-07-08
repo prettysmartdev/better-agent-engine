@@ -16,9 +16,9 @@ pub mod client;
 pub mod error;
 pub mod pagination;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::Request;
 use axum::middleware::Next;
@@ -27,6 +27,7 @@ use axum::response::Response;
 use crate::config_file::McpServerConfig;
 use crate::engine::broadcast::EventBroadcaster;
 use crate::engine::mcp::McpSession;
+use crate::engine::provider::ProviderConfig;
 use crate::store::Store;
 
 /// Request-logging middleware shared by both routers: one line per request with
@@ -57,6 +58,27 @@ pub async fn log_requests(request: Request, next: Next) -> Response {
 /// `tools/call` dispatch holds it across `.await`.
 type McpSessions = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<McpSession>>>>>;
 
+/// A paused turn whose FIFO-gate guard is parked between HTTP requests.
+///
+/// Created when a `session.sendMessage` turn ends [`Paused`]
+/// (crate::engine::session::Outcome::Paused): the owner keeps holding the
+/// session's turn gate — across requests — until it returns with the
+/// continuation, so no other driver's message can interleave with its
+/// in-flight tool round trip. If the owner stays away past `deadline`
+/// (`BAE_TURN_TIMEOUT`), the next `session.sendMessage` arrival treats the
+/// turn as abandoned: it drops the parked guard (releasing the gate to the
+/// next FIFO waiter) and logs a `session.error` with reason
+/// `driver_turn_abandoned`.
+pub struct PendingTurn {
+    /// The client key that owns the paused turn — only it may resume without
+    /// queuing.
+    pub owner_client_key_id: String,
+    /// The session's turn-gate guard, held across HTTP requests.
+    pub guard: tokio::sync::OwnedMutexGuard<()>,
+    /// When the paused turn becomes abandonable.
+    pub deadline: tokio::time::Instant,
+}
+
 /// Shared state handed to both routers. Cloneable and cheap (the [`Store`] is an
 /// `Arc` internally, the [`reqwest::Client`] is itself an `Arc` of a connection
 /// pool, and the MCP registry is behind an `Arc`).
@@ -72,6 +94,12 @@ pub struct AppState {
     /// provided; never persisted (rebuilt on restart). Profiles opt in to a
     /// subset of these by name, resolved at session-creation time.
     pub mcp_registry: Arc<HashMap<String, McpServerConfig>>,
+    /// Configured LLM providers, keyed by name, parsed from `bae-config.toml`
+    /// at startup. Same lifecycle as [`AppState::mcp_registry`]: read-only
+    /// after startup, empty without a config file, never persisted. Profiles
+    /// reference providers by name (`primary_provider` / `fallback_providers`),
+    /// resolved at session-creation and message time.
+    pub provider_registry: Arc<HashMap<String, ProviderConfig>>,
     /// Live per-session MCP connections. Populated at session creation and torn
     /// down at session close; keyed by session id. See [`McpSessions`].
     pub mcp_sessions: McpSessions,
@@ -80,26 +108,56 @@ pub struct AppState {
     /// `session.subscribe` watchers. Channels are created lazily on first
     /// subscribe and dropped on session close.
     pub broadcaster: EventBroadcaster,
+    /// Registered drivers, keyed by session id: the client key ids that have
+    /// called `session.registerDriver` and may therefore call
+    /// `session.sendMessage`. In-memory only (lost on restart, like
+    /// [`AppState::mcp_sessions`]); torn down on session close.
+    pub drivers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Per-session FIFO turn gates, created lazily on first
+    /// `session.sendMessage`. `tokio::sync::Mutex` grants `lock_owned()`
+    /// acquisitions in request order, which is the whole FIFO queue. In-memory
+    /// only; torn down on session close.
+    pub turn_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The currently-parked paused turn per session (set only while a turn is
+    /// `Paused` awaiting its owner's continuation). In-memory only; torn down
+    /// on session close.
+    pub pending_turns: Arc<Mutex<HashMap<String, PendingTurn>>>,
+    /// How long a paused turn may await its owner's continuation before being
+    /// treated as abandoned (`BAE_TURN_TIMEOUT`).
+    pub turn_timeout: Duration,
 }
 
 impl AppState {
     /// Build application state from the store, with a default provider HTTP
-    /// client and an **empty** MCP registry.
+    /// client and **empty** MCP/provider registries.
     pub fn new(store: Store) -> Self {
-        Self::with_mcp_registry(store, HashMap::new())
+        Self::with_registries(store, HashMap::new(), HashMap::new())
     }
 
-    /// Build application state with a preloaded MCP server registry.
-    pub fn with_mcp_registry(
+    /// Build application state with a preloaded MCP server registry and an
+    /// empty provider registry.
+    pub fn with_mcp_registry(store: Store, mcp_registry: HashMap<String, McpServerConfig>) -> Self {
+        Self::with_registries(store, mcp_registry, HashMap::new())
+    }
+
+    /// Build application state with preloaded MCP server and provider
+    /// registries (both parsed from `bae-config.toml` at startup).
+    pub fn with_registries(
         store: Store,
         mcp_registry: HashMap<String, McpServerConfig>,
+        provider_registry: HashMap<String, ProviderConfig>,
     ) -> Self {
         AppState {
             store,
             http: reqwest::Client::new(),
             mcp_registry: Arc::new(mcp_registry),
+            provider_registry: Arc::new(provider_registry),
             mcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             broadcaster: EventBroadcaster::new(),
+            drivers: Arc::new(Mutex::new(HashMap::new())),
+            turn_gates: Arc::new(Mutex::new(HashMap::new())),
+            pending_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_timeout: Duration::from_secs(crate::config::DEFAULT_TURN_TIMEOUT_SECS),
         }
     }
 
@@ -109,7 +167,10 @@ impl AppState {
         self.mcp_sessions
             .lock()
             .expect("mcp_sessions mutex poisoned")
-            .insert(session_id.to_owned(), Arc::new(tokio::sync::Mutex::new(session)));
+            .insert(
+                session_id.to_owned(),
+                Arc::new(tokio::sync::Mutex::new(session)),
+            );
     }
 
     /// The live MCP connections for a session, if any were retained.
@@ -122,10 +183,76 @@ impl AppState {
     }
 
     /// Remove and return a session's MCP connections (for teardown at close).
-    pub fn take_mcp_session(&self, session_id: &str) -> Option<Arc<tokio::sync::Mutex<McpSession>>> {
+    pub fn take_mcp_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<McpSession>>> {
         self.mcp_sessions
             .lock()
             .expect("mcp_sessions mutex poisoned")
             .remove(session_id)
+    }
+
+    /// Record a `session.registerDriver` call. Returns whether the client key
+    /// was newly registered (false on a repeat registration).
+    pub fn register_driver(&self, session_id: &str, client_key_id: &str) -> bool {
+        self.drivers
+            .lock()
+            .expect("drivers mutex poisoned")
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(client_key_id.to_owned())
+    }
+
+    /// Whether `client_key_id` has registered as a driver for `session_id`.
+    pub fn is_registered_driver(&self, session_id: &str, client_key_id: &str) -> bool {
+        self.drivers
+            .lock()
+            .expect("drivers mutex poisoned")
+            .get(session_id)
+            .is_some_and(|set| set.contains(client_key_id))
+    }
+
+    /// The client key ids currently registered as drivers for a session,
+    /// sorted for a deterministic response shape.
+    pub fn registered_drivers(&self, session_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .drivers
+            .lock()
+            .expect("drivers mutex poisoned")
+            .get(session_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// The session's FIFO turn gate, created lazily on first use.
+    pub fn turn_gate(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.turn_gates
+            .lock()
+            .expect("turn_gates mutex poisoned")
+            .entry(session_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Tear down a session's in-memory multi-client state — its driver
+    /// registrations, turn gate, and any parked paused turn (whose dropped
+    /// guard releases the gate to any queued waiter). Called at session close
+    /// alongside the broadcaster/MCP teardown; idempotent.
+    pub fn remove_session_runtime(&self, session_id: &str) {
+        self.drivers
+            .lock()
+            .expect("drivers mutex poisoned")
+            .remove(session_id);
+        self.turn_gates
+            .lock()
+            .expect("turn_gates mutex poisoned")
+            .remove(session_id);
+        self.pending_turns
+            .lock()
+            .expect("pending_turns mutex poisoned")
+            .remove(session_id);
     }
 }

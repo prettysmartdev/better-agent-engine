@@ -73,17 +73,41 @@ class Harness:
         return self
 
     async def connect(self) -> "Session":
-        """Exchange the client key for a session, returning a :class:`Session`.
+        """Open a new session, returning a :class:`Session`.
 
         POSTs ``/api/v1/sessions`` with the declared tools; on success the
         server returns a session id, a one-time session key, and the sanitized
-        profile.
+        profile. Registers this connection as a driver
+        (``session.registerDriver``) before returning, so the first
+        :meth:`Session.send` is permitted.
+        """
+        return await self._open(self.config.url("/api/v1/sessions"))
+
+    async def join(self, session_id: str) -> "Session":
+        """Join an **existing** session as an additional driver, returning a
+        :class:`Session` shaped identically to :meth:`connect`'s.
+
+        POSTs to ``/api/v1/sessions/{session_id}/join`` with this harness's
+        ``client_version`` and declared tools (a joining client declares its own,
+        independent tool set, validated against the *same* profile's
+        ``allowed_tools``). The joining client key must resolve to the same
+        profile as the session, or the server rejects with
+        ``403 profile_mismatch``. Like :meth:`connect`, registers this
+        connection as a driver before returning.
+        """
+        return await self._open(self.config.url(f"/api/v1/sessions/{session_id}/join"))
+
+    async def _open(self, url: str) -> "Session":
+        """Shared body of :meth:`connect` and :meth:`join`: POST the declared
+        tools to ``url`` with client-key auth, build the :class:`Session`, then
+        register it as a driver before handing it back. Both endpoints return the
+        identical ``{session_id, session_key, profile}`` shape.
         """
         transport = self._transport or HttpxTransport()
         try:
             resp = await transport.request(
                 "POST",
-                self.config.url("/api/v1/sessions"),
+                url,
                 headers=self._client_auth(),
                 json={
                     "client_version": self.config.client_version,
@@ -92,7 +116,7 @@ class Harness:
             )
             _raise_for_status(resp)
             body = resp.body or {}
-            return Session(
+            session = Session(
                 config=self.config,
                 transport=transport,
                 registry=self._registry,
@@ -102,6 +126,10 @@ class Harness:
                 profile=Profile.from_wire(body["profile"]),
                 owns_transport=self._owns_transport,
             )
+            # Register as a driver before any send: session.sendMessage requires
+            # it (a -32001 error otherwise). Application code never calls this.
+            await session._register_driver()
+            return session
         except BaseException:
             if self._owns_transport:
                 await transport.aclose()
@@ -202,7 +230,9 @@ class Session:
         the connection ends the subscription server-side), or call
         :meth:`unsubscribe` from elsewhere. Returns once the stream ends.
         """
-        params: dict[str, Any] = {} if since_event_id is None else {"since_event_id": since_event_id}
+        params: dict[str, Any] = (
+            {} if since_event_id is None else {"since_event_id": since_event_id}
+        )
         frames = self._transport.stream(
             "POST",
             self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
@@ -232,9 +262,26 @@ class Session:
             if _is_terminal(frame):
                 break
 
-    async def _send_message(
-        self, message: Message
-    ) -> tuple[SendMessageResult, list[SessionEvent]]:
+    async def _register_driver(self) -> None:
+        """Issue the one-time ``session.registerDriver`` JSON-RPC call over
+        ``…/rpc``, consuming its single terminal ``{registered: true}`` frame.
+
+        Called by :meth:`Harness.connect` / :meth:`Harness.join` during setup;
+        application code never triggers it. A ``-32001`` from ``sendMessage``
+        means this step was skipped.
+        """
+        frames = self._transport.stream(
+            "POST",
+            self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
+            headers=self._session_auth(),
+            json=self._rpc_request("session.registerDriver", {}),
+        )
+        async for frame in frames:
+            _raise_for_rpc_error(frame)
+            if _is_terminal(frame):
+                break
+
+    async def _send_message(self, message: Message) -> tuple[SendMessageResult, list[SessionEvent]]:
         """Drive one ``session.sendMessage`` turn: stream the NDJSON reply,
         collecting ``session.event`` notifications and resolving on the terminal
         frame. An all-providers-failed turn raises :class:`ProvidersFailedError`;

@@ -32,8 +32,13 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}",
             axum::routing::delete(sessions::close),
         )
+        .route("/api/v1/sessions/{id}/join", post(sessions::join))
         .route("/api/v1/sessions/{id}/rpc", post(rpc::rpc))
         .route("/api/v1/sessions/{id}/events", get(sessions::get_events))
+        .route(
+            "/api/v1/sessions/{id}/participants",
+            get(sessions::participants),
+        )
         .layer(axum::middleware::from_fn(crate::api::log_requests))
         .with_state(state)
 }

@@ -11,9 +11,9 @@
 //!
 //! # Shape
 //!
-//! MCP servers are **not** top-level entries; they live under a top-level
-//! `[mcp]` table so future top-level sections (e.g. `[logging]`, `[providers]`,
-//! `[limits]`) can be added without restructuring:
+//! MCP servers and LLM providers are **not** top-level entries; they live
+//! under top-level `[mcp]` / `[providers]` tables so further sections (e.g.
+//! `[logging]`, `[limits]`) can be added without restructuring:
 //!
 //! ```toml
 //! [mcp]
@@ -29,24 +29,36 @@
 //! transport = "sse"
 //! url = "https://mcp.example.com/sse"
 //! headers = { Authorization = "Bearer ${SEARCH_MCP_TOKEN}" }
+//!
+//! [providers]
+//!
+//! [[providers.entries]]
+//! name       = "anthropic-sonnet"
+//! provider   = "anthropic"
+//! model      = "claude-sonnet-4-6"
+//! auth_token = "${ANTHROPIC_API_KEY}"
+//! max_tokens = 8096
 //! ```
 //!
-//! A file with no `[mcp]` table at all is valid and yields an empty registry,
-//! exactly like a missing file.
+//! A file with no `[mcp]` (or `[providers]`) table at all is valid and yields
+//! an empty registry for that section, exactly like a missing file. The two
+//! sections are **separate registries** with no shared namespace: an MCP
+//! server and a provider may safely share a name.
 //!
 //! # Secrets
 //!
-//! `headers` (and any other auth value) may carry `${ENV_VAR}` tokens using the
-//! same syntax as provider `auth_token`. They are **not** resolved here: the
-//! raw tokens are preserved on [`McpServerConfig`] and resolved immediately
-//! before connecting (a later work item), via
-//! [`crate::engine::provider::resolve_tokens`], so the resolved secret is never
-//! persisted.
+//! `headers` and provider `auth_token` values may carry `${ENV_VAR}` tokens.
+//! They are **not** resolved here: the raw tokens are preserved on
+//! [`McpServerConfig`] / [`ProviderConfig`] and resolved immediately before
+//! connecting/calling, via [`crate::engine::provider::resolve_tokens`], so the
+//! resolved secret is never persisted.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::engine::provider::ProviderConfig;
 
 /// The parsed contents of a `bae-config.toml`.
 ///
@@ -61,6 +73,9 @@ pub struct BaeConfig {
     /// The optional MCP server section. Absent → no configured MCP servers.
     #[serde(default)]
     pub mcp: Option<McpConfig>,
+    /// The optional LLM provider section. Absent → no configured providers.
+    #[serde(default)]
+    pub providers: Option<ProvidersConfig>,
 }
 
 /// The `[mcp]` section: a list of configured MCP servers.
@@ -97,6 +112,35 @@ pub struct McpServerConfig {
     /// `${ENV_VAR}` tokens, resolved only at connect time — never persisted.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+}
+
+/// The `[providers]` section: a list of configured LLM providers.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvidersConfig {
+    /// Every `[[providers.entries]]` entry. May be empty.
+    #[serde(default)]
+    pub entries: Vec<NamedProviderConfig>,
+}
+
+/// One configured provider (`[[providers.entries]]`): a registry name plus the
+/// call configuration itself, which is the engine's own [`ProviderConfig`]
+/// flattened in (no duplicated field definitions). An unsupported `provider`
+/// value is rejected at parse time as an unknown [`ProviderKind`] variant,
+/// exactly like an unsupported MCP `transport`.
+///
+/// [`ProviderKind`]: crate::engine::provider::ProviderKind
+// NOTE: no `deny_unknown_fields` here — serde does not support it together
+// with `#[serde(flatten)]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedProviderConfig {
+    /// Unique name; profiles reference providers by this name. Unique within
+    /// `providers.entries` (but independent of `mcp.servers` names).
+    pub name: String,
+    /// The call configuration. `${ENV_VAR}` tokens in `auth_token` are
+    /// preserved raw here and resolved only at call time.
+    #[serde(flatten)]
+    pub config: ProviderConfig,
 }
 
 /// Supported MCP transports. Any other value is rejected at parse time with a
@@ -147,6 +191,10 @@ pub enum ConfigFileError {
     DuplicateServer(String),
     /// An `[[mcp.servers]]` entry has a blank `name`.
     EmptyName,
+    /// Two `[[providers.entries]]` entries share a `name`.
+    DuplicateProvider(String),
+    /// A `[[providers.entries]]` entry has a blank `name`.
+    EmptyProviderName,
     /// An entry is missing a field its transport requires.
     MissingField {
         server: String,
@@ -176,6 +224,12 @@ impl std::fmt::Display for ConfigFileError {
             }
             ConfigFileError::EmptyName => {
                 write!(f, "an [[mcp.servers]] entry has an empty name")
+            }
+            ConfigFileError::DuplicateProvider(name) => {
+                write!(f, "duplicate provider name {name:?} in [providers.entries]")
+            }
+            ConfigFileError::EmptyProviderName => {
+                write!(f, "a [[providers.entries]] entry has an empty name")
             }
             ConfigFileError::MissingField {
                 server,
@@ -273,6 +327,34 @@ impl BaeConfig {
                 .is_some()
             {
                 return Err(ConfigFileError::DuplicateServer(server.name.clone()));
+            }
+        }
+        Ok(registry)
+    }
+
+    /// Build the `name -> config` provider registry, validating structure.
+    ///
+    /// Fails startup (usage error, exit 2) on a duplicate or blank name,
+    /// mirroring [`BaeConfig::mcp_registry`]. A config with no `[providers]`
+    /// table yields an empty registry. Names are checked only *within* this
+    /// section — a name shared with an `[[mcp.servers]]` entry is fine, since
+    /// the two registries have no shared namespace.
+    pub fn provider_registry(&self) -> Result<HashMap<String, ProviderConfig>, ConfigFileError> {
+        let mut registry: HashMap<String, ProviderConfig> = HashMap::new();
+        let entries = self
+            .providers
+            .as_ref()
+            .map(|p| p.entries.as_slice())
+            .unwrap_or(&[]);
+        for entry in entries {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigFileError::EmptyProviderName);
+            }
+            if registry
+                .insert(entry.name.clone(), entry.config.clone())
+                .is_some()
+            {
+                return Err(ConfigFileError::DuplicateProvider(entry.name.clone()));
             }
         }
         Ok(registry)
@@ -385,7 +467,13 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, ConfigFileError::MissingField { field: "command", .. }));
+        assert!(matches!(
+            err,
+            ConfigFileError::MissingField {
+                field: "command",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -398,7 +486,10 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, ConfigFileError::MissingField { field: "url", .. }));
+        assert!(matches!(
+            err,
+            ConfigFileError::MissingField { field: "url", .. }
+        ));
     }
 
     #[test]
@@ -448,6 +539,137 @@ mod tests {
             err.to_string().contains("SEARCH_MCP_TOKEN"),
             "error must name the missing variable: {err}"
         );
+    }
+
+    // -- [providers] ----------------------------------------------------------
+
+    /// Parse a TOML string and build its provider registry in one step.
+    fn provider_registry_from(
+        toml_str: &str,
+    ) -> Result<HashMap<String, crate::engine::provider::ProviderConfig>, ConfigFileError> {
+        let cfg: BaeConfig = toml::from_str(toml_str).unwrap();
+        cfg.provider_registry()
+    }
+
+    #[test]
+    fn absent_providers_table_is_empty_registry() {
+        assert!(provider_registry_from("").unwrap().is_empty());
+        assert!(provider_registry_from("[providers]\n").unwrap().is_empty());
+        // A missing file also yields an empty provider registry.
+        let cfg = BaeConfigFile::load(None).unwrap();
+        assert!(cfg.provider_registry().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_provider_entries_with_and_without_base_url() {
+        use crate::engine::provider::ProviderKind;
+        let reg = provider_registry_from(
+            r#"
+            [providers]
+            [[providers.entries]]
+            name = "anthropic-sonnet"
+            provider = "anthropic"
+            model = "claude-sonnet-4-6"
+            auth_token = "${ANTHROPIC_API_KEY}"
+            max_tokens = 8096
+
+            [[providers.entries]]
+            name = "self-hosted-openai"
+            provider = "openai"
+            base_url = "https://llm-gateway.internal.example.com"
+            model = "gpt-5"
+            auth_token = "${INTERNAL_GATEWAY_TOKEN}"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(reg.len(), 2);
+        let anth = &reg["anthropic-sonnet"];
+        assert_eq!(anth.provider, ProviderKind::Anthropic);
+        assert_eq!(anth.base_url, None);
+        assert_eq!(anth.effective_base_url(), "https://api.anthropic.com");
+        assert_eq!(anth.max_tokens, 8096);
+        // ${ENV_VAR} tokens are preserved raw, never resolved at parse time.
+        assert_eq!(anth.auth_token, "${ANTHROPIC_API_KEY}");
+        let gw = &reg["self-hosted-openai"];
+        assert_eq!(gw.provider, ProviderKind::OpenAi);
+        // An explicit base_url is used verbatim regardless of kind.
+        assert_eq!(
+            gw.effective_base_url(),
+            "https://llm-gateway.internal.example.com"
+        );
+        // max_tokens omitted → the schema default.
+        assert_eq!(gw.max_tokens, 4096);
+    }
+
+    #[test]
+    fn duplicate_provider_name_is_rejected() {
+        let err = provider_registry_from(
+            r#"
+            [[providers.entries]]
+            name = "dup"
+            provider = "anthropic"
+            model = "m"
+            auth_token = "t"
+            [[providers.entries]]
+            name = "dup"
+            provider = "openai"
+            model = "m"
+            auth_token = "t"
+            "#,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(err, ConfigFileError::DuplicateProvider(n) if n == "dup"));
+    }
+
+    #[test]
+    fn blank_provider_name_is_rejected() {
+        let err = provider_registry_from(
+            r#"
+            [[providers.entries]]
+            name = "  "
+            provider = "anthropic"
+            model = "m"
+            auth_token = "t"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigFileError::EmptyProviderName));
+    }
+
+    #[test]
+    fn unsupported_provider_kind_is_rejected_at_parse_time() {
+        // Rejected as an unknown enum variant, like an unsupported transport.
+        let cfg: Result<BaeConfig, _> = toml::from_str(
+            r#"
+            [[providers.entries]]
+            name = "x"
+            provider = "cohere"
+            model = "m"
+            auth_token = "t"
+            "#,
+        );
+        assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn provider_and_mcp_names_may_collide_across_sections() {
+        // Separate registries, no shared namespace.
+        let toml_str = r#"
+            [[mcp.servers]]
+            name = "shared"
+            transport = "stdio"
+            command = "npx"
+
+            [[providers.entries]]
+            name = "shared"
+            provider = "anthropic"
+            model = "m"
+            auth_token = "t"
+        "#;
+        let cfg: BaeConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.mcp_registry().unwrap().contains_key("shared"));
+        assert!(cfg.provider_registry().unwrap().contains_key("shared"));
     }
 
     #[test]

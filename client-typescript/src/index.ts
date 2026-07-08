@@ -67,4 +67,6 @@ export {
   type SendMessageResult,
   type McpRequestPayload,
   type McpResponsePayload,
+  type SessionJoinPayload,
+  type SessionDriverRegisterPayload,
 } from "./types.js";

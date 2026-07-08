@@ -11,6 +11,7 @@ Start here. Guides walk you through real tasks end to end.
 - [Quickstart](guides/quickstart.md) — run the server, create a profile and key, open a session, and send your first message.
 - [MCP Servers](guides/mcp-servers.md) — connect a real MCP server (filesystem, fetch) to a profile using `bae-config.toml`.
 - [Event Streaming](guides/event-streaming.md) — consume live `session.event` notifications as a turn runs, subscribe as an observer, and resume after a disconnect.
+- [Multi-Client Sessions](guides/multi-client-sessions.md) — join a session as a second driver, observe FIFO turn ordering and cross-visibility between participants.
 - [Building a Client](guides/building-a-client.md) — short per-SDK walkthrough (Rust, TypeScript, Python) covering the harness API, the JSON-RPC transport, and the `on_event` hook.
 
 ---
@@ -20,10 +21,10 @@ Start here. Guides walk you through real tasks end to end.
 Precise specification of every API surface and configuration option.
 
 - [Client API](reference/client-api.md) — REST session management plus `POST /api/v1/sessions/{id}/rpc` JSON-RPC methods.
-- [Wire Protocol](reference/wire-protocol.md) — JSON-RPC 2.0 envelope conventions, NDJSON framing, and error codes.
-- [Admin API](reference/admin-api.md) — profile and key management, `GET /admin/v1/mcp-servers`.
-- [Message Types](reference/message-types.md) — all twelve `event_type` values and their payload shapes.
-- [Configuration](reference/configuration.md) — every `BAE_*` env var, the `--config` flag, and the `bae-config.toml` schema.
+- [Wire Protocol](reference/wire-protocol.md) — JSON-RPC 2.0 envelope conventions, NDJSON framing, error codes, and FIFO turn ownership.
+- [Admin API](reference/admin-api.md) — profile and key management, `GET /admin/v1/mcp-servers`, `GET /admin/v1/providers`.
+- [Message Types](reference/message-types.md) — all fourteen `event_type` values and their payload shapes.
+- [Configuration](reference/configuration.md) — every `BAE_*` env var, the `--config` flag, and the `bae-config.toml` schema (`[mcp]`, `[providers]`).
 
 ---
 

@@ -16,11 +16,28 @@ All three SDKs expose the same conceptual surface:
 3. **Set hooks** — optional callbacks at each stage of the loop.
 4. **Connect** — open a session (`POST /api/v1/sessions`); returns a `Session`
    object.
-5. **Send** — `session.send(message)` runs the full JSON-RPC turn loop until a
+5. **Join** (optional, multi-driver) — `harness.join(sessionId)` attaches a
+   *second* client key (same profile) to a session another driver already
+   opened (`POST /api/v1/sessions/{id}/join`); returns a `Session` object
+   shaped identically to `connect()`'s. See
+   [Multi-Client Sessions](multi-client-sessions.md).
+6. **Send** — `session.send(message)` runs the full JSON-RPC turn loop until a
    final text response, dispatching tool calls as needed.
-6. **Subscribe** — `session.subscribe(callback, since_event_id?)` opens an
-   observer stream on the session.
-7. **Close** — `session.close()` (or `DELETE /api/v1/sessions/{id}`).
+7. **Subscribe** — `session.subscribe(callback, since_event_id?)` registers
+   this connection as an **observer** and opens a live event stream on the
+   session. Subscribing *is* the observer registration act — there is no
+   separate call, and (unlike driver registration) nothing is logged for it.
+8. **Close** — `session.close()` (or `DELETE /api/v1/sessions/{id}`).
+
+### Driver registration is automatic
+
+Both `connect()` and `join()` call `session.registerDriver` internally, once,
+before returning the `Session` — application code never calls it directly.
+This is required before `session.send()`: a `session.sendMessage` call from a
+client key that skipped registration is rejected with JSON-RPC `-32001`. The
+harness's automatic call means you'll only ever see `-32001` if you bypass
+the harness and drive the raw `/rpc` transport yourself. See
+[Client API — `session.registerDriver`](../reference/client-api.md#sessionregisterdriver).
 
 ---
 
@@ -70,6 +87,19 @@ session.close().await?;
    each to the registered handler, fire `before_tool_call`/`after_tool_call`,
    and POST `session.sendMessage` with the `tool_result` blocks.
 4. Repeat until a final text response.
+
+### `join` — attach a second driver
+
+A different client key (same profile) attaches to A's already-open session
+by id. `join` calls `session.registerDriver` internally, same as `connect`:
+
+```rust
+// Using driver B's own client key against the session id driver A opened.
+let harness_b = HarnessBuilder::new(config_b).build();
+let mut session_b = harness_b.join(&session_id).await?;
+
+let reply = session_b.send("Say hello from B.").await?;
+```
 
 ### `subscribe` / `unsubscribe`
 
@@ -128,6 +158,20 @@ await session.subscribe(
 await session.close();
 ```
 
+### `join` — attach a second driver
+
+```typescript
+// Driver B — a different Harness built from a different client key, but the
+// same profile — attaches to the session driver A already opened.
+const harnessB = new Harness(new Config({ serverUrl, clientKey: clientKeyB }));
+const sessionB = await harnessB.join(session.id);
+
+const replyB = await sessionB.send("Say hello from B.");
+```
+
+`join`, like `connect`, calls `session.registerDriver` internally before
+returning — no separate call is needed before `sessionB.send(...)`.
+
 ### Running the reference example
 
 ```sh
@@ -182,6 +226,21 @@ await session.subscribe(observe, since_event_id="evt_…")
 await session.close()
 ```
 
+### `join` — attach a second driver
+
+```python
+# Driver B — a different Harness built from a different client key, but the
+# same profile — attaches to the session driver A already opened.
+config_b = Config(server_url="http://localhost:8080", client_key="bae_…b")
+harness_b = Harness(config_b)
+session_b = await harness_b.join(session.id)
+
+reply_b = await session_b.send("Say hello from B.")
+```
+
+`join`, like `connect`, calls `session.registerDriver` internally before
+returning — no separate call is needed before `session_b.send(...)`.
+
 ### Running the reference example
 
 ```sh
@@ -217,6 +276,8 @@ in TS/Python, throwing an error does the same.
 | Non-2xx HTTP response (auth, 404, etc.) | `ApiError` (all SDKs) |
 | JSON-RPC error object in stream | `RpcError` (all SDKs) |
 | Session not open (sent to closed session) | `RpcError(-32000)` — raised on `session.send` |
+| Driver not registered (`session.sendMessage` before `session.registerDriver`) | `RpcError(-32001)` — should not normally occur through the harness, since `connect`/`join` register automatically; only reachable via a custom/raw transport |
+| Different profile attempted `join` | `ApiError(403, "profile_mismatch")` — raised on `harness.join(sessionId)` |
 | All providers failed | `ProvidersFailedError` — detected from `session.error` event in `result.events` |
 | Network / transport failure | `TransportError` (all SDKs) |
 
@@ -224,10 +285,11 @@ in TS/Python, throwing an error does the same.
 
 ## JSON-RPC transport overview
 
-`session.send` and `session.subscribe` both POST to
-`/api/v1/sessions/{id}/rpc` with a JSON-RPC 2.0 request body. The response is
-`application/x-ndjson` — one JSON object per line. Objects without `"id"` are
-`session.event` notifications; the object carrying the request `"id"` is the
+`session.send`, `session.subscribe`, and the harness's automatic
+`session.registerDriver` call all POST to `/api/v1/sessions/{id}/rpc` with a
+JSON-RPC 2.0 request body. The response is `application/x-ndjson` — one JSON
+object per line. Objects without `"id"` are `session.event` notifications;
+the object carrying the request `"id"` is the
 terminal response.
 
 The SDK handles all NDJSON framing internally. You never interact with raw

@@ -34,6 +34,11 @@ class RecordedRequest:
 class MockTransport:
     script: list[Any]
     requests: list[RecordedRequest] = field(default_factory=list)
+    #: ``session.registerDriver`` calls, recorded separately and answered with a
+    #: canned ``{registered: true}`` frame. connect()/join() each issue one
+    #: during setup; keeping them out of ``script``/``requests`` leaves the
+    #: ordered queue of the REST + sendMessage exchange untouched.
+    register_driver_calls: list[RecordedRequest] = field(default_factory=list)
     closed: bool = False
 
     async def request(
@@ -60,6 +65,12 @@ class MockTransport:
         headers: Mapping[str, str],
         json: Any | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # Driver registration is auto-answered and tracked separately, so the
+        # script queue stays aligned with the ordinary REST + sendMessage calls.
+        if isinstance(json, dict) and json.get("method") == "session.registerDriver":
+            self.register_driver_calls.append(RecordedRequest(method, url, dict(headers), json))
+            yield {"jsonrpc": "2.0", "id": json.get("id", 1), "result": {"registered": True}}
+            return
         self.requests.append(RecordedRequest(method, url, dict(headers), json))
         if not self.script:
             raise AssertionError(f"unexpected stream: {method} {url}")

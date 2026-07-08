@@ -103,11 +103,15 @@ pub async fn list(
 
 /// `DELETE /admin/v1/keys/:id`
 ///
-/// Revokes the key and invalidates its open sessions, logging a `session.close`
-/// event on each. Each forced close also publishes through the broadcast choke
-/// point (so a live `session.subscribe` observer sees the session end) and frees
-/// the session's in-memory resources — its broadcast channel and any live MCP
-/// connections — mirroring the client `DELETE /api/v1/sessions/{id}` path.
+/// Revokes the key and invalidates its session keys. A session is force-closed
+/// (with a `session.close` event) only when the revoked key's session key was
+/// the **last** active one for it — a shared multi-client session whose other
+/// participants still hold valid session keys stays open. Each forced close
+/// also publishes through the broadcast choke point (so a live
+/// `session.subscribe` observer sees the session end) and frees the session's
+/// in-memory resources — its broadcast channel, any live MCP connections, and
+/// its driver/turn-gate state — mirroring the client
+/// `DELETE /api/v1/sessions/{id}` path.
 pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -130,13 +134,15 @@ pub async fn delete(
             &payload,
         )
         .map_err(ApiError::from_db)?;
-        // Drop the broadcast channel (ending any live observer's stream) and tear
-        // down any live MCP connections, so a revocation-forced close doesn't leak
-        // subprocesses or channel entries.
+        // Drop the broadcast channel (ending any live observer's stream), tear
+        // down any live MCP connections, and clear the session's driver/turn-gate
+        // state, so a revocation-forced close doesn't leak subprocesses, channel
+        // entries, or a parked turn guard.
         state.broadcaster.remove(session_id);
         if let Some(mcp) = state.take_mcp_session(session_id) {
             mcp.lock().await.shutdown().await;
         }
+        state.remove_session_runtime(session_id);
     }
     Ok(StatusCode::NO_CONTENT)
 }

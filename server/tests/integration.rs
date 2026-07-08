@@ -140,8 +140,52 @@ impl Drop for TestServer {
     }
 }
 
+/// The default provider registry every test server starts with: one entry per
+/// mock behaviour, named after the mock path it targets ("text", "tool",
+/// "mcp", "fail"), plus "badenv" whose `auth_token` references an env var
+/// guaranteed to be unset. Built from a `bae-config.toml` `[providers]`
+/// section through the **real** loader + validator, exactly as startup would.
+/// Profiles opt in by these names via `primary_provider`/`fallback_providers`.
+fn default_provider_registry(
+    mock: &str,
+) -> HashMap<String, baesrv::engine::provider::ProviderConfig> {
+    let entry = |name: &str, path: &str, auth_token: &str| {
+        format!(
+            "[[providers.entries]]\nname = {name:?}\nprovider = \"anthropic\"\n\
+             base_url = \"{mock}/{path}\"\nmodel = \"claude-mock-1\"\n\
+             auth_token = {auth_token:?}\n\n"
+        )
+    };
+    let toml = [
+        entry("text", "text", "test-token"),
+        entry("tool", "tool", "test-token"),
+        entry("mcp", "mcp", "test-token"),
+        entry("fail", "fail", "test-token"),
+        entry("badenv", "text", "${BAE_TEST_DEFINITELY_UNSET_XYZ}"),
+    ]
+    .concat();
+    provider_registry_from_toml(&toml)
+}
+
+/// Build a provider registry from a `bae-config.toml` string through the real
+/// loader, exactly as startup would (mirrors [`registry_from_toml`] for MCP).
+fn provider_registry_from_toml(
+    toml: &str,
+) -> HashMap<String, baesrv::engine::provider::ProviderConfig> {
+    let dir = std::env::temp_dir().join(format!("baecfg-{}", generate_id("")));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bae-config.toml");
+    std::fs::write(&path, toml).unwrap();
+    let cfg = BaeConfigFile::load(Some(&path)).expect("load bae-config.toml");
+    let reg = cfg.provider_registry().expect("build provider registry");
+    let _ = std::fs::remove_dir_all(&dir);
+    reg
+}
+
 /// Boot the real routers on an ephemeral client/admin port pair with a fresh
 /// temp-file database, exactly as `baesrv::serve` would (minus signal handling).
+/// Also starts the mock provider and preloads the default provider registry
+/// pointing at it.
 async fn start_server() -> TestServer {
     start_server_with_registry(std::collections::HashMap::new()).await
 }
@@ -149,9 +193,27 @@ async fn start_server() -> TestServer {
 /// Like [`start_server`], but with a preloaded MCP server registry (as
 /// `bae-config.toml` would supply at startup). Used by the MCP integration
 /// tests, which build the registry from a fixture `bae-config.toml` through the
-/// real loader.
+/// real loader. The default provider registry is loaded in every case.
 async fn start_server_with_registry(
     registry: std::collections::HashMap<String, baesrv::config_file::McpServerConfig>,
+) -> TestServer {
+    // The mock provider must exist before the server: the provider registry is
+    // read-only after startup and its entries carry the mock's base URL.
+    let mock = start_mock().await;
+    let providers = default_provider_registry(&mock);
+    boot_server(registry, providers, None).await
+}
+
+/// Boot the real routers with an explicit provider registry (whose entries the
+/// caller has already pointed at whatever mock server(s) the test owns) and an
+/// optional `turn_timeout` override (for the FIFO/abandonment tests, which need
+/// a short `BAE_TURN_TIMEOUT` rather than the 120 s default). Unlike
+/// [`start_server_with_registry`] this does **not** start the default mock — the
+/// caller supplies a registry pointing at its own mocks.
+async fn boot_server(
+    mcp_registry: std::collections::HashMap<String, baesrv::config_file::McpServerConfig>,
+    provider_registry: std::collections::HashMap<String, baesrv::engine::provider::ProviderConfig>,
+    turn_timeout: Option<Duration>,
 ) -> TestServer {
     let dir = std::env::temp_dir().join(format!("baesrv-it-{}", generate_id("")));
     std::fs::create_dir_all(&dir).unwrap();
@@ -159,7 +221,12 @@ async fn start_server_with_registry(
 
     // A real file-backed store exercises the migration runner on a fresh DB.
     let store = Store::open(&db_path).expect("open temp store");
-    let state = AppState::with_mcp_registry(store, registry);
+    let mut state = AppState::with_registries(store, mcp_registry, provider_registry);
+    if let Some(t) = turn_timeout {
+        // `turn_timeout` is a pub field; overriding it here is the documented
+        // seam for short-timeout tests (see notes-multi-client.md).
+        state.turn_timeout = t;
+    }
 
     let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -341,33 +408,19 @@ impl TestServer {
         .await
     }
 
-    /// Create a profile bound to `base_url`, returning its id.
+    /// Create a profile whose `primary_provider` is `primary` (a provider
+    /// registry name — see [`default_provider_registry`]) and whose
+    /// `fallback_providers` is `fallbacks` (an array of names), returning its id.
     async fn create_profile(
         &self,
-        base_url: &str,
-        fallbacks: Value,
-        allowed_tools: Value,
-    ) -> String {
-        self.create_profile_with_token(base_url, "test-token", fallbacks, allowed_tools)
-            .await
-    }
-
-    async fn create_profile_with_token(
-        &self,
-        base_url: &str,
-        auth_token: &str,
+        primary: &str,
         fallbacks: Value,
         allowed_tools: Value,
     ) -> String {
         let body = json!({
             "name": format!("profile-{}", generate_id("")),
-            "provider_config": {
-                "provider": "anthropic",
-                "base_url": base_url,
-                "model": "claude-mock-1",
-                "auth_token": auth_token,
-            },
-            "fallback_configs": fallbacks,
+            "primary_provider": primary,
+            "fallback_providers": fallbacks,
             "allowed_tools": allowed_tools,
         });
         let (status, v, raw) = self.admin_post("/admin/v1/profiles", body).await;
@@ -388,6 +441,10 @@ impl TestServer {
     }
 
     /// Open a session; returns `(session_id, session_key, full_json)`.
+    ///
+    /// Also registers the caller as a driver (`session.registerDriver`),
+    /// mirroring what every SDK's `connect()` does as part of session setup,
+    /// so `session.sendMessage` is permitted (WI 0005's `-32001` gate).
     async fn open_session(&self, client_key: &str, tools: Value) -> (String, String, Value) {
         let (status, v, raw) = self
             .client_post(
@@ -397,11 +454,28 @@ impl TestServer {
             )
             .await;
         assert_eq!(status, 201, "open session failed: {raw}");
-        (
-            v["session_id"].as_str().unwrap().to_string(),
-            v["session_key"].as_str().unwrap().to_string(),
-            v,
-        )
+        let session_id = v["session_id"].as_str().unwrap().to_string();
+        let session_key = v["session_key"].as_str().unwrap().to_string();
+        self.register_driver(&session_id, &session_key).await;
+        (session_id, session_key, v)
+    }
+
+    /// Register the session key's client as a driver via `session.registerDriver`.
+    async fn register_driver(&self, session_id: &str, session_key: &str) {
+        let (status, frames, raw) = self
+            .rpc(
+                session_id,
+                session_key,
+                json!({ "jsonrpc": "2.0", "id": 1,
+                        "method": "session.registerDriver", "params": {} }),
+            )
+            .await;
+        assert_eq!(status, 200, "registerDriver failed: {raw}");
+        assert_eq!(
+            frames[0]["result"]["registered"],
+            json!(true),
+            "registerDriver result: {raw}"
+        );
     }
 }
 
@@ -454,12 +528,9 @@ async fn admin_routes_absent_from_client_port() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_profile_and_key_crud_lifecycle() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
     // --- Create + read a profile ---
     let profile_id = ts
-        .create_profile(&base, json!([]), json!(["get_current_time"]))
+        .create_profile("text", json!([]), json!(["get_current_time"]))
         .await;
 
     let (status, prof, raw) = ts
@@ -468,8 +539,14 @@ async fn admin_profile_and_key_crud_lifecycle() {
     assert_eq!(status, 200, "get profile: {raw}");
     assert_eq!(prof["id"], json!(profile_id));
     assert_eq!(prof["allowed_tools"], json!(["get_current_time"]));
-    // The admin surface *does* return the literal auth_token template.
-    assert_eq!(prof["provider_config"]["auth_token"], json!("test-token"));
+    // Provider references are registry *names*; no auth material is stored on
+    // (or returned by) a profile — tokens live only in bae-config.toml.
+    assert_eq!(prof["primary_provider"], json!("text"));
+    assert_eq!(prof["fallback_providers"], json!([]));
+    assert!(
+        !raw.contains("auth_token"),
+        "profiles must not carry auth_token: {raw}"
+    );
 
     let (status, list, raw) = ts.admin_get("/admin/v1/profiles").await;
     assert_eq!(status, 200);
@@ -478,8 +555,8 @@ async fn admin_profile_and_key_crud_lifecycle() {
     // --- Replace (PUT) bumps updated_at and swaps fields ---
     let put_body = json!({
         "name": prof["name"],
-        "provider_config": prof["provider_config"],
-        "fallback_configs": [],
+        "primary_provider": prof["primary_provider"],
+        "fallback_providers": [],
         "allowed_tools": [],
     });
     let (status, replaced, raw) = ts
@@ -541,11 +618,8 @@ async fn admin_profile_and_key_crud_lifecycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_pagination_returns_correct_cursor() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
     for _ in 0..3 {
-        ts.create_profile(&base, json!([]), json!([])).await;
+        ts.create_profile("text", json!([]), json!([])).await;
     }
 
     // First page of 2 → a non-null cursor.
@@ -580,10 +654,7 @@ async fn list_pagination_returns_correct_cursor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_lifecycle_exact_event_sequence_and_replay() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
 
     // Open: exchange client key for a session id + session key.
@@ -666,6 +737,7 @@ async fn session_lifecycle_exact_event_sequence_and_replay() {
         event_types(&events["items"]),
         vec![
             "session.open",
+            "session.driver.register",
             "client.message.send",
             "provider.request",
             "provider.response",
@@ -685,10 +757,7 @@ async fn session_lifecycle_exact_event_sequence_and_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_rejection_cases() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
 
     // Missing bearer → 401.
@@ -774,16 +843,8 @@ async fn auth_rejection_cases() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_fallback_failure_then_success() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-
-    // Primary is broken (/fail → 500); the single fallback works (/text).
-    let primary = format!("{mock}/fail");
-    let fallback = format!("{mock}/text");
-    let fallbacks = json!([{
-        "provider": "anthropic", "base_url": fallback,
-        "model": "claude-mock-1", "auth_token": "test-token",
-    }]);
-    let profile_id = ts.create_profile(&primary, fallbacks, json!([])).await;
+    // Primary is broken ("fail" → 500); the single fallback works ("text").
+    let profile_id = ts.create_profile("fail", json!(["text"]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -830,10 +891,7 @@ async fn provider_fallback_failure_then_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn all_providers_failed_returns_terminal_result_then_rejects() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let primary = format!("{mock}/fail");
-
-    let profile_id = ts.create_profile(&primary, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("fail", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -843,7 +901,10 @@ async fn all_providers_failed_returns_terminal_result_then_rejects() {
     // On /rpc the HTTP stream is 200; the provider failure rides in the terminal
     // response's result (message + events), session moved to error state.
     assert_eq!(status, 200, "rpc stream opens: {raw}");
-    assert!(resp["message"].is_object(), "terminal result carries a message: {raw}");
+    assert!(
+        resp["message"].is_object(),
+        "terminal result carries a message: {raw}"
+    );
     let types = event_types(&resp["events"]);
     assert!(types.contains(&"provider.response".to_string()));
     assert!(types.contains(&"session.error".to_string()));
@@ -861,22 +922,55 @@ async fn all_providers_failed_returns_terminal_result_then_rejects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_primary_provider_blocks_session_creation() {
+    let ts = start_server().await;
+
+    // A profile may reference a not-(yet-)configured provider at write time —
+    // resolution happens at session-creation time, like mcp_servers...
+    let profile_id = ts
+        .create_profile("ghost-provider", json!([]), json!([]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+
+    // ...but opening a session against it is refused outright, on every
+    // attempt: no session key is ever issued for an unresolvable primary.
+    for attempt in 0..2 {
+        let (status, err, raw) = ts
+            .client_post(
+                "/api/v1/sessions",
+                Some(&client_key),
+                json!({ "tools": [] }),
+            )
+            .await;
+        assert_eq!(status, 422, "attempt {attempt}: {raw}");
+        assert_eq!(err["type"], json!("primary_provider_unavailable"));
+        assert!(err["detail"].as_str().unwrap().contains("ghost-provider"));
+    }
+
+    // The admin registry view shows what IS configured — name, kind, model,
+    // and the *effective* base_url — never auth_token.
+    let (status, providers, raw) = ts.admin_get("/admin/v1/providers").await;
+    assert_eq!(status, 200, "{raw}");
+    let items = providers["items"].as_array().unwrap();
+    assert!(!items.iter().any(|i| i["name"] == json!("ghost-provider")));
+    let text = items
+        .iter()
+        .find(|i| i["name"] == json!("text"))
+        .expect("the default registry's \"text\" entry is listed");
+    assert_eq!(text["provider"], json!("anthropic"));
+    assert_eq!(text["model"], json!("claude-mock-1"));
+    assert!(text["base_url"].as_str().unwrap().ends_with("/text"));
+    assert!(!raw.contains("auth_token"), "no secrets: {raw}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_missing_env_var_fails_with_traced_response() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
-    // The auth_token references an environment variable guaranteed to be unset,
-    // so token resolution fails *before* any HTTP request and is recorded as a
-    // provider.response failure (secret never reaches the wire).
-    let profile_id = ts
-        .create_profile_with_token(
-            &base,
-            "${BAE_TEST_DEFINITELY_UNSET_XYZ}",
-            json!([]),
-            json!([]),
-        )
-        .await;
+    // The "badenv" registry entry's auth_token references an environment
+    // variable guaranteed to be unset, so token resolution fails *before* any
+    // HTTP request and is recorded as a provider.response failure (secret
+    // never reaches the wire).
+    let profile_id = ts.create_profile("badenv", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -911,11 +1005,8 @@ async fn provider_missing_env_var_fails_with_traced_response() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_side_tool_dispatch_round_trip() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/tool");
-
     let profile_id = ts
-        .create_profile(&base, json!([]), json!(["get_current_time"]))
+        .create_profile("tool", json!([]), json!(["get_current_time"]))
         .await;
     let client_key = ts.create_key(&profile_id).await;
     let tools = json!([{
@@ -928,7 +1019,11 @@ async fn client_side_tool_dispatch_round_trip() {
     // First turn: the provider asks for a client-side tool; the loop pauses and
     // hands the tool_use back to the harness.
     let (status, first, raw) = ts
-        .send_message(&session_id, &session_key, json!({ "content": "what time is it?" }))
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": "what time is it?" }),
+        )
         .await;
     assert_eq!(status, 200, "first turn: {raw}");
     let tool_use = first["message"]["content"]
@@ -985,17 +1080,18 @@ async fn client_side_tool_dispatch_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mcp_tool_dispatch_round_trip() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/mcp");
-
     // The client declares NO tools, so the provider's tool_use for `remote_search`
     // is dispatched server-side as an MCP stub and resolves within one call.
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("mcp", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
     let (status, resp, raw) = ts
-        .send_message(&session_id, &session_key, json!({ "content": "search please" }))
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": "search please" }),
+        )
         .await;
     assert_eq!(status, 200, "mcp turn: {raw}");
     assert_eq!(
@@ -1027,12 +1123,9 @@ async fn mcp_tool_dispatch_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_allowlist_validation() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
     // Profile allows exactly one tool.
     let allowed_profile = ts
-        .create_profile(&base, json!([]), json!(["get_current_time"]))
+        .create_profile("text", json!([]), json!(["get_current_time"]))
         .await;
     let allowed_key = ts.create_key(&allowed_profile).await;
 
@@ -1058,7 +1151,7 @@ async fn tool_allowlist_validation() {
     assert_eq!(err["type"], json!("tool_not_allowed"));
 
     // An empty allowlist permits no tools at all...
-    let empty_profile = ts.create_profile(&base, json!([]), json!([])).await;
+    let empty_profile = ts.create_profile("text", json!([]), json!([])).await;
     let empty_key = ts.create_key(&empty_profile).await;
     let (status, _v, _raw) = ts
         .client_post(
@@ -1083,10 +1176,7 @@ async fn tool_allowlist_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoke_client_key_invalidates_live_session() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -1129,22 +1219,18 @@ enum StopWhen {
 }
 
 impl TestServer {
-    /// Create a profile bound to `base_url` with an explicit `mcp_servers` list.
+    /// Create a profile whose `primary_provider` is `primary` with an explicit
+    /// `mcp_servers` list.
     async fn create_profile_with_mcp(
         &self,
-        base_url: &str,
+        primary: &str,
         mcp_servers: Value,
         allowed_tools: Value,
     ) -> String {
         let body = json!({
             "name": format!("profile-{}", generate_id("")),
-            "provider_config": {
-                "provider": "anthropic",
-                "base_url": base_url,
-                "model": "claude-mock-1",
-                "auth_token": "test-token",
-            },
-            "fallback_configs": [],
+            "primary_provider": primary,
+            "fallback_providers": [],
             "mcp_servers": mcp_servers,
             "allowed_tools": allowed_tools,
         });
@@ -1157,7 +1243,12 @@ impl TestServer {
     /// `frames` is every non-empty NDJSON line parsed as JSON. Suitable for
     /// methods that terminate (sendMessage, unsubscribe, envelope errors); NOT
     /// for an open-ended `session.subscribe` (use [`Self::subscribe_collect`]).
-    async fn rpc_raw(&self, session_id: &str, token: &str, body: String) -> (u16, Vec<Value>, String) {
+    async fn rpc_raw(
+        &self,
+        session_id: &str,
+        token: &str,
+        body: String,
+    ) -> (u16, Vec<Value>, String) {
         let url = format!("{}/api/v1/sessions/{session_id}/rpc", self.client);
         let resp = self
             .http
@@ -1258,7 +1349,12 @@ fn notification_event_types(frames: &[Value]) -> Vec<String> {
     frames
         .iter()
         .filter(|f| f["method"] == json!("session.event"))
-        .map(|f| f["params"]["event_type"].as_str().unwrap_or("?").to_string())
+        .map(|f| {
+            f["params"]["event_type"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string()
+        })
         .collect()
 }
 
@@ -1273,9 +1369,11 @@ fn notification_event_ids(frames: &[Value]) -> Vec<String> {
 
 /// The first JSON-RPC error code among a frame list, if any.
 fn rpc_error_code(frames: &[Value]) -> Option<i64> {
-    frames
-        .iter()
-        .find_map(|f| f.get("error").and_then(|e| e.get("code")).and_then(Value::as_i64))
+    frames.iter().find_map(|f| {
+        f.get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_i64)
+    })
 }
 
 /// Frames that are terminal responses (carry `result` or `error`).
@@ -1373,9 +1471,7 @@ fn captured_text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jsonrpc_envelope_error_codes() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -1395,13 +1491,27 @@ async fn jsonrpc_envelope_error_codes() {
 
     // Missing/!2.0 `jsonrpc` version → -32600.
     let (_s, frames, raw) = ts
-        .rpc(&sid, &key, json!({ "id": 1, "method": "session.unsubscribe" }))
+        .rpc(
+            &sid,
+            &key,
+            json!({ "id": 1, "method": "session.unsubscribe" }),
+        )
         .await;
-    assert_eq!(rpc_error_code(&frames), Some(-32600), "missing jsonrpc: {raw}");
+    assert_eq!(
+        rpc_error_code(&frames),
+        Some(-32600),
+        "missing jsonrpc: {raw}"
+    );
 
     // Missing `method` → -32600.
-    let (_s, frames, raw) = ts.rpc(&sid, &key, json!({ "jsonrpc": "2.0", "id": 1 })).await;
-    assert_eq!(rpc_error_code(&frames), Some(-32600), "missing method: {raw}");
+    let (_s, frames, raw) = ts
+        .rpc(&sid, &key, json!({ "jsonrpc": "2.0", "id": 1 }))
+        .await;
+    assert_eq!(
+        rpc_error_code(&frames),
+        Some(-32600),
+        "missing method: {raw}"
+    );
 
     // Unknown `method` → -32601, and the response echoes the request id.
     let (_s, frames, raw) = ts
@@ -1411,10 +1521,22 @@ async fn jsonrpc_envelope_error_codes() {
             json!({ "jsonrpc": "2.0", "id": 42, "method": "no.such.method", "params": {} }),
         )
         .await;
-    assert_eq!(rpc_error_code(&frames), Some(-32601), "unknown method: {raw}");
+    assert_eq!(
+        rpc_error_code(&frames),
+        Some(-32601),
+        "unknown method: {raw}"
+    );
     let terminals = terminal_frames(&frames);
-    assert_eq!(terminals.len(), 1, "exactly one response for an id'd request: {raw}");
-    assert_eq!(terminals[0]["id"], json!(42), "response echoes the request id: {raw}");
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one response for an id'd request: {raw}"
+    );
+    assert_eq!(
+        terminals[0]["id"],
+        json!(42),
+        "response echoes the request id: {raw}"
+    );
 
     // Known method, missing required `params.message` → -32602.
     let (_s, frames, raw) = ts
@@ -1424,7 +1546,11 @@ async fn jsonrpc_envelope_error_codes() {
             json!({ "jsonrpc": "2.0", "id": 5, "method": "session.sendMessage", "params": {} }),
         )
         .await;
-    assert_eq!(rpc_error_code(&frames), Some(-32602), "missing message param: {raw}");
+    assert_eq!(
+        rpc_error_code(&frames),
+        Some(-32602),
+        "missing message param: {raw}"
+    );
 
     // Known method, `params.message` present but the wrong shape → -32602.
     let (_s, frames, raw) = ts
@@ -1435,15 +1561,26 @@ async fn jsonrpc_envelope_error_codes() {
                     "params": { "message": 5 } }),
         )
         .await;
-    assert_eq!(rpc_error_code(&frames), Some(-32602), "invalid message param: {raw}");
+    assert_eq!(
+        rpc_error_code(&frames),
+        Some(-32602),
+        "invalid message param: {raw}"
+    );
 
     // NOTIFICATION SEMANTICS: an object with no `id` is a JSON-RPC notification.
     // The server performs the method's side effect (here, cancelling any active
     // subscriptions) but MUST NOT send a response — no result, no error frame.
     let (status, frames, raw) = ts
-        .rpc(&sid, &key, json!({ "jsonrpc": "2.0", "method": "session.unsubscribe" }))
+        .rpc(
+            &sid,
+            &key,
+            json!({ "jsonrpc": "2.0", "method": "session.unsubscribe" }),
+        )
         .await;
-    assert_eq!(status, 200, "notification still opens the 200 stream: {raw}");
+    assert_eq!(
+        status, 200,
+        "notification still opens the 200 stream: {raw}"
+    );
     let terminals = terminal_frames(&frames);
     assert!(
         terminals.is_empty(),
@@ -1458,9 +1595,7 @@ async fn jsonrpc_envelope_error_codes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn send_message_streams_events_then_one_terminal() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -1478,7 +1613,11 @@ async fn send_message_streams_events_then_one_terminal() {
     // client.message.send (a client-authored event is never echoed back).
     assert_eq!(
         notification_event_types(&frames),
-        vec!["provider.request", "provider.response", "server.message.send"],
+        vec![
+            "provider.request",
+            "provider.response",
+            "server.message.send"
+        ],
         "live notifications in order, client-authored events excluded: {raw}"
     );
 
@@ -1509,9 +1648,7 @@ async fn send_message_streams_events_then_one_terminal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_receives_live_turn_events_from_a_second_connection() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
 
@@ -1536,7 +1673,11 @@ async fn subscribe_receives_live_turn_events_from_a_second_connection() {
     // The subscribe feed carries the same live, ordered, client-filtered events.
     assert_eq!(
         notification_event_types(&frames),
-        vec!["provider.request", "provider.response", "server.message.send"],
+        vec![
+            "provider.request",
+            "provider.response",
+            "server.message.send"
+        ],
         "subscribe delivered the turn's events in order, client-authored events excluded"
     );
 }
@@ -1548,16 +1689,18 @@ async fn subscribe_receives_live_turn_events_from_a_second_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_resume_replays_after_since_event_id_without_gap_or_dup() {
     let ts = start_server().await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-    let profile_id = ts.create_profile(&base, json!([]), json!([])).await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
     let client_key = ts.create_key(&profile_id).await;
     let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
 
     // Persist two turns' worth of events.
-    let (s1, _r1, _raw1) = ts.send_message(&sid, &key, json!({ "content": "one" })).await;
+    let (s1, _r1, _raw1) = ts
+        .send_message(&sid, &key, json!({ "content": "one" }))
+        .await;
     assert_eq!(s1, 200);
-    let (s2, _r2, _raw2) = ts.send_message(&sid, &key, json!({ "content": "two" })).await;
+    let (s2, _r2, _raw2) = ts
+        .send_message(&sid, &key, json!({ "content": "two" }))
+        .await;
     assert_eq!(s2, 200);
 
     // The authoritative, ordered, *unfiltered* history (replay is unfiltered too,
@@ -1566,7 +1709,10 @@ async fn subscribe_resume_replays_after_since_event_id_without_gap_or_dup() {
         .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&key))
         .await;
     let items = events["items"].as_array().unwrap();
-    assert!(items.len() >= 6, "expected several persisted events: {items:?}");
+    assert!(
+        items.len() >= 6,
+        "expected several persisted events: {items:?}"
+    );
     let ids: Vec<String> = items
         .iter()
         .map(|e| e["id"].as_str().unwrap().to_string())
@@ -1589,11 +1735,18 @@ async fn subscribe_resume_replays_after_since_event_id_without_gap_or_dup() {
     let got = notification_event_ids(&frames);
 
     // No missed events, no duplicates, exactly the tail after `since`.
-    assert_eq!(got, expected_after, "replay covers exactly the events after since_event_id");
+    assert_eq!(
+        got, expected_after,
+        "replay covers exactly the events after since_event_id"
+    );
     let mut unique = got.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), got.len(), "no duplicate events in the resume replay");
+    assert_eq!(
+        unique.len(),
+        got.len(),
+        "no duplicate events in the resume replay"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,13 +1756,10 @@ async fn subscribe_resume_replays_after_since_event_id_without_gap_or_dup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mcp_round_trip_emits_real_payloads() {
     let ts = start_server_with_registry(echo_registry("echo", None)).await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/mcp");
-
     // The profile opts into the "echo" MCP server; the client declares no tools,
     // so the provider's tool_use for `remote_search` is dispatched to MCP.
     let profile_id = ts
-        .create_profile_with_mcp(&base, json!(["echo"]), json!([]))
+        .create_profile_with_mcp("mcp", json!(["echo"]), json!([]))
         .await;
     let client_key = ts.create_key(&profile_id).await;
     let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
@@ -1618,7 +1768,10 @@ async fn mcp_round_trip_emits_real_payloads() {
         .send_message(&sid, &key, json!({ "content": "search please" }))
         .await;
     assert_eq!(status, 200, "mcp turn: {raw}");
-    assert_eq!(resp["message"]["content"][0]["text"], json!("after mcp stub"));
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("after mcp stub")
+    );
 
     let evs = resp["events"].as_array().unwrap();
     let find = |t: &str| -> Value {
@@ -1675,14 +1828,11 @@ async fn invalid_mcp_name_logged_on_every_session_while_valid_connects() {
     // Install the log capture BEFORE the server starts so its errors are caught.
     let logs = log_capture();
     let ts = start_server_with_registry(echo_registry("echo", None)).await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/mcp");
-
     // A unique missing name so this test's log lines are unambiguous in the
     // shared capture buffer.
     let ghost = format!("ghost-{}", generate_id(""));
     let profile_id = ts
-        .create_profile_with_mcp(&base, json!(["echo", ghost]), json!([]))
+        .create_profile_with_mcp("mcp", json!(["echo", ghost]), json!([]))
         .await;
     let client_key = ts.create_key(&profile_id).await;
 
@@ -1700,8 +1850,16 @@ async fn invalid_mcp_name_logged_on_every_session_while_valid_connects() {
             .iter()
             .find(|e| e["event_type"] == json!("mcp.response"))
             .unwrap_or_else(|| panic!("attempt {attempt} missing mcp.response: {raw}"));
-        assert_eq!(res["payload"]["server_name"], json!("echo"), "attempt {attempt}");
-        assert_eq!(res["payload"]["ok"], json!(true), "attempt {attempt}: echo connected");
+        assert_eq!(
+            res["payload"]["server_name"],
+            json!("echo"),
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            res["payload"]["ok"],
+            json!(true),
+            "attempt {attempt}: echo connected"
+        );
         let _ = ts
             .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&key))
             .await;
@@ -1733,11 +1891,9 @@ async fn mcp_connection_failure_is_non_fatal() {
         "[[mcp.servers]]\nname = {bad:?}\ntransport = \"stdio\"\ncommand = \"baesrv-no-such-binary-xyzzy\"\n"
     ));
     let ts = start_server_with_registry(registry).await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/mcp");
 
     let profile_id = ts
-        .create_profile_with_mcp(&base, json!([bad]), json!([]))
+        .create_profile_with_mcp("mcp", json!([bad]), json!([]))
         .await;
     let client_key = ts.create_key(&profile_id).await;
 
@@ -1749,9 +1905,13 @@ async fn mcp_connection_failure_is_non_fatal() {
             json!({ "tools": [] }),
         )
         .await;
-    assert_eq!(status, 201, "connect failure must not fail session creation: {raw}");
+    assert_eq!(
+        status, 201,
+        "connect failure must not fail session creation: {raw}"
+    );
     let sid = v["session_id"].as_str().unwrap().to_string();
     let key = v["session_key"].as_str().unwrap().to_string();
+    ts.register_driver(&sid, &key).await;
 
     // The failing server is absent from the session's tools: the provider's
     // tool_use for `remote_search` has no MCP server to route to, so the turn
@@ -1766,12 +1926,17 @@ async fn mcp_connection_failure_is_non_fatal() {
         .iter()
         .find(|e| e["event_type"] == json!("tool.result"))
         .expect("a tool.result event");
-    assert_eq!(tr["payload"]["is_error"], json!(true), "absent server → error result");
+    assert_eq!(
+        tr["payload"]["is_error"],
+        json!(true),
+        "absent server → error result"
+    );
 
     // And the connect failure was logged.
     let text = captured_text(&logs);
     assert!(
-        text.lines().any(|l| l.contains(&bad) && l.contains("failed to connect")),
+        text.lines()
+            .any(|l| l.contains(&bad) && l.contains("failed to connect")),
         "the connect failure must be logged for {bad}:\n{text}"
     );
 }
@@ -1789,18 +1954,18 @@ async fn session_close_terminates_spawned_mcp_subprocess() {
     let pidfile_str = pidfile.to_str().unwrap().to_string();
 
     let ts = start_server_with_registry(echo_registry("echo", Some(&pidfile_str))).await;
-    let mock = start_mock().await;
-    let base = format!("{mock}/text");
-
     let profile_id = ts
-        .create_profile_with_mcp(&base, json!(["echo"]), json!([]))
+        .create_profile_with_mcp("text", json!(["echo"]), json!([]))
         .await;
     let client_key = ts.create_key(&profile_id).await;
     let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
 
     // The fixture writes its PID at startup; wait for it, then confirm alive.
     let pid = read_pid(&pidfile).await.expect("fixture wrote its PID");
-    assert!(proc_exists(pid), "MCP subprocess {pid} should be running while the session is open");
+    assert!(
+        proc_exists(pid),
+        "MCP subprocess {pid} should be running while the session is open"
+    );
 
     // Closing the session tears the subprocess down.
     let (status, _v, raw) = ts
@@ -1817,7 +1982,10 @@ async fn session_close_terminates_spawned_mcp_subprocess() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(terminated, "MCP subprocess {pid} must be terminated after DELETE");
+    assert!(
+        terminated,
+        "MCP subprocess {pid} must be terminated after DELETE"
+    );
 
     let _ = std::fs::remove_dir_all(&pid_dir);
     // (The broadcast-registry-entry removal on close is covered directly by the
@@ -1841,4 +2009,1294 @@ async fn read_pid(pidfile: &std::path::Path) -> Option<u32> {
 /// container is Linux, matching the deployment target).
 fn proc_exists(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+// ===========================================================================
+// WI 0005 — parallel client handling
+//
+// join / multi-key sessions, driver registration, the FIFO turn gate, the
+// abandonment timeout, and the OpenAI-kind provider translation / mixed-kind
+// fallback chains. See `/awman/context/workflow/test-plan.md` for the mapping
+// from each work-item "Test Consideration" to the test(s) below.
+//
+// Everything here stays offline: mock provider HTTP servers (Anthropic- and
+// OpenAI-shaped) plus a short `BAE_TURN_TIMEOUT` override for the abandonment
+// test — no real LLM calls and no wall-clock 120 s waits.
+// ===========================================================================
+
+/// Recorded provider request bodies, in receive order (newest last).
+type Recorder = Arc<Mutex<Vec<Value>>>;
+
+/// A `[[providers.entries]]` TOML fragment for one registry entry, so a test can
+/// build a provider registry pointing at its own mock(s) through the **real**
+/// loader ([`provider_registry_from_toml`]) exactly as startup would.
+fn provider_entry_toml(name: &str, kind: &str, base_url: &str, auth_token: &str) -> String {
+    format!(
+        "[[providers.entries]]\nname = {name:?}\nprovider = {kind:?}\n\
+         base_url = {base_url:?}\nmodel = \"m-mock\"\nauth_token = {auth_token:?}\n\n"
+    )
+}
+
+/// Whether the last message in a provider request body carries a block of the
+/// given `type` (used by the mock to decide the tool-loop phase).
+fn last_message_has_block(body: &Value, block_type: &str) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .and_then(|m| m.last())
+        .and_then(|last| last.get("content"))
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some(block_type))
+        })
+        .unwrap_or(false)
+}
+
+/// The sorted `name` list from a provider request body's `tools` array.
+fn req_tool_names(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// --- Anthropic-shaped recording/delay mock ---------------------------------
+
+/// Start an Anthropic-Messages-shaped mock that records every request body into
+/// the returned [`Recorder`] and waits `delay` before answering (`Duration::ZERO`
+/// for none — the delay is what makes the FIFO test's turns genuinely overlap).
+/// Behaviour is chosen by the leading path segment, like [`mock_handler`]:
+/// `/text` (always final text "Hello from anthropic mock"), `/tool` (a
+/// `get_current_time` tool_use until a `tool_result` arrives, then text),
+/// `/fail` (HTTP 500). Returns `(base_url, recorder)`.
+async fn start_anthropic_recording_mock(delay: Duration) -> (String, Recorder) {
+    let requests: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(anthropic_recording_handler)
+        .with_state((requests.clone(), delay));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests)
+}
+
+async fn anthropic_recording_handler(
+    axum::extract::State((requests, delay)): axum::extract::State<(Recorder, Duration)>,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    requests.lock().unwrap().push(body.clone());
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    if path.starts_with("/fail") {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "boom" })),
+        )
+            .into_response();
+    }
+    let out = if path.starts_with("/tool") {
+        if last_message_has_block(&body, "tool_result") {
+            json!({ "role": "assistant", "stop_reason": "end_turn",
+                    "content": [{ "type": "text", "text": "tool round-trip complete" }] })
+        } else {
+            json!({ "role": "assistant", "stop_reason": "tool_use", "content": [
+                { "type": "tool_use", "id": "tu_1", "name": "get_current_time", "input": {} }] })
+        }
+    } else {
+        json!({ "role": "assistant", "stop_reason": "end_turn",
+                "content": [{ "type": "text", "text": "Hello from anthropic mock" }] })
+    };
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+// --- OpenAI-shaped recording mock ------------------------------------------
+
+/// Start an OpenAI-Chat-Completions-shaped mock that records every request body.
+/// Behaviour by leading path segment: `/oai-text` (plain text completion "Hello
+/// from openai mock"), `/oai-tool` (a `tool_calls` response for
+/// `get_current_time` until the request carries a `role:"tool"` message, then
+/// text), `/oai-fail` (HTTP 500). Returns `(base_url, recorder)`.
+async fn start_openai_mock() -> (String, Recorder) {
+    let requests: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(openai_handler)
+        .with_state(requests.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests)
+}
+
+async fn openai_handler(
+    axum::extract::State(requests): axum::extract::State<Recorder>,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    requests.lock().unwrap().push(body.clone());
+    if path.starts_with("/oai-fail") {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": { "message": "boom" } })),
+        )
+            .into_response();
+    }
+    // The OpenAI translation emits `role:"tool"` messages for returned results.
+    let has_tool_msg = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|ms| {
+            ms.iter()
+                .any(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        })
+        .unwrap_or(false);
+    let out = if path.starts_with("/oai-tool") && !has_tool_msg {
+        json!({ "choices": [{ "message": {
+            "role": "assistant", "content": Value::Null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "get_current_time", "arguments": "{}" },
+            }],
+        } }] })
+    } else if path.starts_with("/oai-tool") {
+        json!({ "choices": [{ "message": {
+            "role": "assistant", "content": "tool round-trip complete" } }] })
+    } else {
+        json!({ "choices": [{ "message": {
+            "role": "assistant", "content": "Hello from openai mock" } }] })
+    };
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+// --- Multi-client test helpers ---------------------------------------------
+
+impl TestServer {
+    /// Open a session **without** registering as a driver — for the driver-gate
+    /// test, which asserts `session.sendMessage` is refused until registration.
+    async fn open_session_no_register(
+        &self,
+        client_key: &str,
+        tools: Value,
+    ) -> (String, String, Value) {
+        let (status, v, raw) = self
+            .client_post(
+                "/api/v1/sessions",
+                Some(client_key),
+                json!({ "client_version": "1.0.0", "tools": tools }),
+            )
+            .await;
+        assert_eq!(status, 201, "open session failed: {raw}");
+        (
+            v["session_id"].as_str().unwrap().to_string(),
+            v["session_key"].as_str().unwrap().to_string(),
+            v,
+        )
+    }
+
+    /// `POST /api/v1/sessions/{id}/join`, returning `(status, value, raw)`
+    /// without registering — for the error/edge cases (profile_mismatch,
+    /// session_closed, primary_provider_unavailable).
+    async fn join_raw(
+        &self,
+        session_id: &str,
+        client_key: &str,
+        tools: Value,
+    ) -> (u16, Value, String) {
+        self.client_post(
+            &format!("/api/v1/sessions/{session_id}/join"),
+            Some(client_key),
+            json!({ "client_version": "1.0.0", "tools": tools }),
+        )
+        .await
+    }
+
+    /// Join a session on success and register the joiner as a driver; returns
+    /// its session key. Mirrors what an SDK `join()` does.
+    async fn join_session(&self, session_id: &str, client_key: &str, tools: Value) -> String {
+        let (status, v, raw) = self.join_raw(session_id, client_key, tools).await;
+        assert_eq!(status, 201, "join failed: {raw}");
+        let key = v["session_key"].as_str().unwrap().to_string();
+        self.register_driver(session_id, &key).await;
+        key
+    }
+
+    /// `GET /api/v1/sessions/{id}/participants`.
+    async fn participants(&self, session_id: &str, session_key: &str) -> (u16, Value, String) {
+        self.client_get(
+            &format!("/api/v1/sessions/{session_id}/participants"),
+            Some(session_key),
+        )
+        .await
+    }
+
+    /// The client-key id for a plaintext client key, via the admin list (prefix
+    /// match, same technique as [`auth_rejection_cases`]).
+    async fn client_key_id(&self, plaintext: &str) -> String {
+        let (_s, list, _r) = self.admin_get("/admin/v1/keys").await;
+        let prefix = &plaintext[..8];
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["prefix"].as_str() == Some(prefix))
+            .map(|k| k["id"].as_str().unwrap().to_string())
+            .expect("client key listed")
+    }
+
+    /// Revoke a client key by id (asserting the 204).
+    async fn revoke_key(&self, key_id: &str) {
+        let (status, _v, raw) = self.admin_delete(&format!("/admin/v1/keys/{key_id}")).await;
+        assert_eq!(status, 204, "revoke failed: {raw}");
+    }
+
+    /// The full, ordered `(event_type, client_key_id)` list from the replay
+    /// endpoint — for asserting turn ownership and non-interleaving.
+    async fn replay_pairs(&self, session_id: &str, session_key: &str) -> Vec<(String, String)> {
+        let (_s, events, _r) = self
+            .client_get(
+                &format!("/api/v1/sessions/{session_id}/events"),
+                Some(session_key),
+            )
+            .await;
+        events["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["event_type"].as_str().unwrap_or("?").to_string(),
+                    e["client_key_id"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A) join — profile-match guard + terminal-session guard
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_profile_match_guard() {
+    let ts = start_server().await;
+    let profile_a = ts.create_profile("text", json!([]), json!([])).await;
+    let profile_b = ts.create_profile("text", json!([]), json!([])).await;
+    let key_a = ts.create_key(&profile_a).await;
+    let key_a2 = ts.create_key(&profile_a).await; // same profile as the session
+    let key_b = ts.create_key(&profile_b).await; // a *different* profile
+
+    let (sid, skey_a, _) = ts.open_session(&key_a, json!([])).await;
+
+    // Same profile → join succeeds and returns a usable session key.
+    let (status, v, raw) = ts.join_raw(&sid, &key_a2, json!([])).await;
+    assert_eq!(status, 201, "same-profile join must succeed: {raw}");
+    let joiner_key = v["session_key"].as_str().unwrap().to_string();
+    assert!(joiner_key.starts_with("bae_ses_"));
+    let (s, _v, _r) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&joiner_key))
+        .await;
+    assert_eq!(s, 200, "the joiner's session key authenticates");
+
+    // Exactly one session.join so far; snapshot the log length.
+    let before = ts.replay_pairs(&sid, &skey_a).await;
+    let joins_before = before.iter().filter(|(t, _)| t == "session.join").count();
+    assert_eq!(joins_before, 1);
+
+    // Different profile → 403 profile_mismatch, *before* any event is logged or
+    // session key minted (the hard boundary): the log is byte-for-byte unchanged.
+    let (status, err, raw) = ts.join_raw(&sid, &key_b, json!([])).await;
+    assert_eq!(status, 403, "cross-profile join must be refused: {raw}");
+    assert_eq!(err["type"], json!("profile_mismatch"));
+
+    let after = ts.replay_pairs(&sid, &skey_a).await;
+    assert_eq!(
+        before, after,
+        "a profile_mismatch join must log no event on the session"
+    );
+    // The rejected client's session key was never minted, so it cannot auth
+    // (there is nothing to present — assert no *second* join event exists).
+    assert_eq!(
+        after.iter().filter(|(t, _)| t == "session.join").count(),
+        1,
+        "the mismatched attempt minted no session key / logged no join"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_closed_session_is_conflict() {
+    let ts = start_server().await;
+    let profile = ts.create_profile("text", json!([]), json!([])).await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let (sid, skey_a, _) = ts.open_session(&key_a, json!([])).await;
+
+    let (s, _v, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&skey_a))
+        .await;
+    assert_eq!(s, 200, "close: {raw}");
+
+    // A joiner cannot resurrect a terminal session (same error shape as close's
+    // conflict).
+    let (s, err, raw) = ts.join_raw(&sid, &key_b, json!([])).await;
+    assert_eq!(s, 409, "join on a closed session: {raw}");
+    assert_eq!(err["type"], json!("session_closed"));
+}
+
+// ---------------------------------------------------------------------------
+// A) multi-key session lifecycle
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_key_session_lifecycle() {
+    let ts = start_server().await;
+    let profile = ts.create_profile("text", json!([]), json!([])).await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+
+    let (sid, skey_a, _) = ts.open_session(&key_a, json!([])).await;
+    let skey_b = ts.join_session(&sid, &key_b, json!([])).await;
+
+    // Both keys drive a turn via session.sendMessage.
+    let (s1, r1, raw1) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "hi from a" }))
+        .await;
+    assert_eq!(s1, 200, "A sendMessage: {raw1}");
+    assert_eq!(r1["message"]["role"], json!("assistant"));
+    let (s2, r2, raw2) = ts
+        .send_message(&sid, &skey_b, json!({ "content": "hi from b" }))
+        .await;
+    assert_eq!(s2, 200, "B sendMessage: {raw2}");
+    assert_eq!(r2["message"]["role"], json!("assistant"));
+
+    // The joiner (B) also authenticates via session.subscribe: it receives A's
+    // live turn events on its own session key.
+    let subscriber = ts.subscribe_collect(
+        &sid,
+        &skey_b,
+        None,
+        StopWhen::EventType("server.message.send".into()),
+        Duration::from_secs(5),
+    );
+    let driver = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ts.send_message(&sid, &skey_a, json!({ "content": "watch this" }))
+            .await
+    };
+    let (frames, (ds, _res, _raw)) = tokio::join!(subscriber, driver);
+    assert_eq!(ds, 200, "driver turn during B's subscribe");
+    assert!(
+        notification_event_types(&frames).contains(&"server.message.send".to_string()),
+        "B's subscribe (session key) receives live events"
+    );
+
+    // GET participants shows both registered drivers.
+    let mut expected = vec![
+        ts.client_key_id(&key_a).await,
+        ts.client_key_id(&key_b).await,
+    ];
+    expected.sort();
+    let (ps, pv, praw) = ts.participants(&sid, &skey_a).await;
+    assert_eq!(ps, 200, "participants: {praw}");
+    assert_eq!(pv["drivers"], json!(expected));
+
+    // The event log shows both session.open and session.join.
+    let types: Vec<String> = ts
+        .replay_pairs(&sid, &skey_a)
+        .await
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    assert!(types.contains(&"session.open".to_string()));
+    assert!(types.contains(&"session.join".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// A) revoke no longer nukes shared sessions
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoke_joiner_leaves_shared_session_open_last_key_closes() {
+    let ts = start_server().await;
+    let profile = ts.create_profile("text", json!([]), json!([])).await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let (sid, skey_a, _) = ts.open_session(&key_a, json!([])).await;
+    let skey_b = ts.join_session(&sid, &key_b, json!([])).await;
+
+    // Revoke the joiner's client key: its session key dies, but the session
+    // stays open and the creator's driver still authenticates.
+    let kid_b = ts.client_key_id(&key_b).await;
+    ts.revoke_key(&kid_b).await;
+
+    let (s, _v, _r) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&skey_b))
+        .await;
+    assert_eq!(
+        s, 401,
+        "the revoked joiner's session key no longer authenticates"
+    );
+    let (s, _v, _r) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&skey_a))
+        .await;
+    assert_eq!(s, 200, "the other driver's session key still authenticates");
+    let (s, _r, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "still here" }))
+        .await;
+    assert_eq!(
+        s, 200,
+        "session stays open after the joiner is revoked: {raw}"
+    );
+
+    // Revoke the last remaining active key → the session auto-closes.
+    let kid_a = ts.client_key_id(&key_a).await;
+    ts.revoke_key(&kid_a).await;
+    let (s, _v, _r) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&skey_a))
+        .await;
+    assert_eq!(s, 401, "the last session key is now revoked");
+    // A fresh client on the same profile finds the session terminal.
+    let key_c = ts.create_key(&profile).await;
+    let (s, err, raw) = ts.join_raw(&sid, &key_c, json!([])).await;
+    assert_eq!(
+        s, 409,
+        "session auto-closed after the last key was revoked: {raw}"
+    );
+    assert_eq!(err["type"], json!("session_closed"));
+}
+
+// ---------------------------------------------------------------------------
+// B) driver registration gate
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn driver_registration_gate() {
+    let ts = start_server().await;
+    let profile = ts.create_profile("text", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts.open_session_no_register(&key, json!([])).await;
+
+    // session.sendMessage before session.registerDriver → -32001.
+    let (status, frames, raw) = ts
+        .rpc(
+            &sid,
+            &skey,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "session.sendMessage",
+                    "params": { "message": { "content": "hi" } } }),
+        )
+        .await;
+    assert_eq!(status, 200, "rpc stream opens: {raw}");
+    assert_eq!(
+        rpc_error_code(&frames),
+        Some(-32001),
+        "an unregistered driver's send is refused: {raw}"
+    );
+
+    // After registering, the send succeeds.
+    ts.register_driver(&sid, &skey).await;
+    let (s, r, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "hi" }))
+        .await;
+    assert_eq!(s, 200, "registered send: {raw}");
+    assert_eq!(r["message"]["role"], json!("assistant"));
+
+    // A subscribe-only connection never needs to register: a joiner that only
+    // subscribes (no registerDriver) still authenticates and receives live
+    // events.
+    let key_obs = ts.create_key(&profile).await;
+    let (js, jv, jraw) = ts.join_raw(&sid, &key_obs, json!([])).await;
+    assert_eq!(js, 201, "observer join: {jraw}");
+    let skey_obs = jv["session_key"].as_str().unwrap().to_string();
+    let subscriber = ts.subscribe_collect(
+        &sid,
+        &skey_obs,
+        None,
+        StopWhen::EventType("server.message.send".into()),
+        Duration::from_secs(5),
+    );
+    let driver = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ts.send_message(&sid, &skey, json!({ "content": "observe me" }))
+            .await
+    };
+    let (frames, (ds, _res, _raw)) = tokio::join!(subscriber, driver);
+    assert_eq!(ds, 200);
+    assert!(
+        notification_event_types(&frames).contains(&"server.message.send".to_string()),
+        "a subscribe-only connection receives events without registerDriver"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B) per-turn tool scoping (asserted against the mock's received tool list)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_turn_tool_scoping_advertises_only_the_acting_driver() {
+    let (mock, requests) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let reg = provider_registry_from_toml(&provider_entry_toml(
+        "text",
+        "anthropic",
+        &format!("{mock}/text"),
+        "test-token",
+    ));
+    let ts = boot_server(HashMap::new(), reg, None).await;
+
+    let profile = ts
+        .create_profile("text", json!([]), json!(["only_a", "only_b"]))
+        .await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let tools_a =
+        json!([{ "name": "only_a", "input_schema": { "type": "object", "properties": {} } }]);
+    let tools_b =
+        json!([{ "name": "only_b", "input_schema": { "type": "object", "properties": {} } }]);
+
+    let (sid, skey_a, _) = ts.open_session(&key_a, tools_a).await;
+    let skey_b = ts.join_session(&sid, &key_b, tools_b).await;
+
+    // Sequential turns so the recorded requests map deterministically: A then B.
+    let (s, resp_a, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "a turn" }))
+        .await;
+    assert_eq!(s, 200, "A turn: {raw}");
+    let (s, _resp_b, raw) = ts
+        .send_message(&sid, &skey_b, json!({ "content": "b turn" }))
+        .await;
+    assert_eq!(s, 200, "B turn: {raw}");
+
+    // The mock's ACTUALLY-received tool lists (not just the persisted event):
+    let reqs = requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "one provider request per text turn");
+    assert_eq!(
+        req_tool_names(&reqs[0]),
+        vec!["only_a".to_string()],
+        "A's turn advertises only A's tool"
+    );
+    assert_eq!(
+        req_tool_names(&reqs[1]),
+        vec!["only_b".to_string()],
+        "B's turn advertises only B's tool — never A's"
+    );
+
+    // The persisted provider.request event agrees (the other seam).
+    let pr_a = resp_a["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("provider.request"))
+        .unwrap();
+    let ev_names: Vec<String> = pr_a["payload"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(ev_names, vec!["only_a".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// B) FIFO ordering — two drivers' turns never interleave
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fifo_two_drivers_turns_do_not_interleave() {
+    // A per-request delay keeps each turn in flight long enough that, without
+    // the FIFO gate, the two turns' events would interleave.
+    let (mock, _rec) = start_anthropic_recording_mock(Duration::from_millis(400)).await;
+    let reg = provider_registry_from_toml(&provider_entry_toml(
+        "text",
+        "anthropic",
+        &format!("{mock}/text"),
+        "test-token",
+    ));
+    let ts = boot_server(HashMap::new(), reg, None).await;
+    let profile = ts.create_profile("text", json!([]), json!([])).await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let (sid, skey_a, _) = ts.open_session(&key_a, json!([])).await;
+    let skey_b = ts.join_session(&sid, &key_b, json!([])).await;
+    let kid_a = ts.client_key_id(&key_a).await;
+    let kid_b = ts.client_key_id(&key_b).await;
+
+    // Fire both back-to-back (concurrently at the transport layer).
+    let a = ts.send_message(&sid, &skey_a, json!({ "content": "a" }));
+    let b = ts.send_message(&sid, &skey_b, json!({ "content": "b" }));
+    let ((sa, _, ra), (sb, _, rb)) = tokio::join!(a, b);
+    assert_eq!(sa, 200, "A: {ra}");
+    assert_eq!(sb, 200, "B: {rb}");
+
+    // In the persisted log the two turns form two contiguous blocks: one
+    // driver's full turn (through its terminal server.message.send) completes
+    // before the other's first turn event appears.
+    let turn_owners: Vec<String> = ts
+        .replay_pairs(&sid, &skey_a)
+        .await
+        .into_iter()
+        .filter(|(t, _)| {
+            matches!(
+                t.as_str(),
+                "client.message.send"
+                    | "provider.request"
+                    | "provider.response"
+                    | "server.message.send"
+            )
+        })
+        .map(|(_, k)| k)
+        .collect();
+    assert_eq!(
+        turn_owners.iter().filter(|k| **k == kid_a).count(),
+        4,
+        "A drove exactly one text turn"
+    );
+    assert_eq!(
+        turn_owners.iter().filter(|k| **k == kid_b).count(),
+        4,
+        "B drove exactly one text turn"
+    );
+    let transitions = turn_owners.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(
+        transitions, 1,
+        "the turns must not interleave (ownership sequence: {turn_owners:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B) same-owner continuation reuses the lock without queuing
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_owner_continuation_runs_before_a_queued_driver() {
+    let ts = start_server().await;
+    let profile = ts
+        .create_profile("tool", json!([]), json!(["get_current_time"]))
+        .await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object", "properties": {} } }]);
+    let (sid, skey_a, _) = ts.open_session(&key_a, tools).await;
+    let skey_b = ts.join_session(&sid, &key_b, json!([])).await;
+    let kid_a = ts.client_key_id(&key_a).await;
+    let kid_b = ts.client_key_id(&key_b).await;
+
+    // A's first turn pauses on a client-side tool call.
+    let (s, first, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "time?" }))
+        .await;
+    assert_eq!(s, 200, "A first turn: {raw}");
+    let tuid = first["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == json!("tool_use"))
+        .expect("A paused on a tool_use")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // B queues a message (blocks on the gate) while A is paused; concurrently A
+    // sends its own continuation. A must reclaim the lock without waiting behind
+    // B, and B must only run after A's continuation completes.
+    let b_fut = ts.send_message(&sid, &skey_b, json!({ "content": "b message" }));
+    let a_cont = async {
+        tokio::time::sleep(Duration::from_millis(300)).await; // let B queue first
+        ts.send_message(
+            &sid,
+            &skey_a,
+            json!({ "content": [{ "type": "tool_result", "tool_use_id": tuid, "content": "12:00" }] }),
+        )
+        .await
+    };
+    let ((sb, _, rb), (sa, _, ra)) = tokio::join!(b_fut, a_cont);
+    assert_eq!(sa, 200, "A continuation: {ra}");
+    assert_eq!(sb, 200, "B eventually runs: {rb}");
+
+    // A had two server.message.send events (the paused one + the completed
+    // continuation); B's turn began only after the second.
+    let pairs = ts.replay_pairs(&sid, &skey_a).await;
+    let a_sms: Vec<usize> = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, k))| t == "server.message.send" && *k == kid_a)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        a_sms.len(),
+        2,
+        "A: a paused + a completed server.message.send"
+    );
+    let b_msg_idx = pairs
+        .iter()
+        .position(|(t, k)| t == "client.message.send" && *k == kid_b)
+        .expect("B's message was logged");
+    assert!(
+        b_msg_idx > a_sms[1],
+        "no queued driver's message ran between A's pause and its continuation \
+         (B msg at {b_msg_idx}, A's continuation completed at {})",
+        a_sms[1]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B) a paused turn's owner may send a brand-new message instead of a
+//    tool_result continuation (ownership is by client key, not content shape)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_owner_may_abandon_its_tool_call_with_a_plain_message() {
+    let ts = start_server().await;
+    let profile = ts
+        .create_profile("tool", json!([]), json!(["get_current_time"]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object", "properties": {} } }]);
+    let (sid, skey, _) = ts.open_session(&key, tools).await;
+
+    // The first turn pauses on a client-side tool call.
+    let (s, first, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "time?" }))
+        .await;
+    assert_eq!(s, 200, "first turn: {raw}");
+    assert!(first["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["type"] == json!("tool_use")));
+
+    // The owner returns with a brand-new plain message, not a tool_result
+    // continuation. Ownership is checked by client key id, not content shape,
+    // so the parked turn is reclaimed and the message is served as the next
+    // run_turn input (the /tool mock, seeing no tool_result, asks again).
+    let (s, second, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "never mind that" }))
+        .await;
+    assert_eq!(s, 200, "plain-message send from the paused owner: {raw}");
+    assert!(
+        second.get("error").is_none(),
+        "the owner's non-continuation message must be served, not refused: {raw}"
+    );
+    assert_eq!(second["message"]["role"], json!("assistant"));
+
+    // Both messages were served as ordinary turns, and the reclaim was by
+    // ownership — no timeout expiry was involved (no session.error logged).
+    let pairs = ts.replay_pairs(&sid, &skey).await;
+    assert_eq!(
+        pairs
+            .iter()
+            .filter(|(t, _)| t == "client.message.send")
+            .count(),
+        2,
+        "both of the owner's messages were logged as turn inputs"
+    );
+    assert!(
+        !pairs.iter().any(|(t, _)| t == "session.error"),
+        "a voluntary abandonment is a same-owner reclaim, never a \
+         driver_turn_abandoned expiry: {pairs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B) cross-driver continuation blocks (does not error) until terminal
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_driver_send_blocks_until_owner_turn_terminal() {
+    let ts = start_server().await;
+    let profile = ts
+        .create_profile("tool", json!([]), json!(["get_current_time"]))
+        .await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object", "properties": {} } }]);
+    let (sid, skey_a, _) = ts.open_session(&key_a, tools).await;
+    let skey_b = ts.join_session(&sid, &key_b, json!([])).await;
+
+    // A pauses on a client-side tool call.
+    let (s, first, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "time?" }))
+        .await;
+    assert_eq!(s, 200, "A first turn: {raw}");
+    let tuid = first["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == json!("tool_use"))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // B (a different, registered driver) sends mid-turn: its call must BLOCK
+    // (not error) while A's turn is paused.
+    let b_fut = ts.send_message(&sid, &skey_b, json!({ "content": "let me in" }));
+    tokio::pin!(b_fut);
+    let early = tokio::time::timeout(Duration::from_millis(600), &mut b_fut).await;
+    assert!(
+        early.is_err(),
+        "B's send must block (no response) while A's turn is in flight"
+    );
+
+    // A reaches a terminal state via its continuation → B then unblocks and runs.
+    let (sa, _, ra) = ts
+        .send_message(
+            &sid,
+            &skey_a,
+            json!({ "content": [{ "type": "tool_result", "tool_use_id": tuid, "content": "12:00" }] }),
+        )
+        .await;
+    assert_eq!(sa, 200, "A continuation: {ra}");
+    let (sb, rbody, rb) = b_fut.await;
+    assert_eq!(
+        sb, 200,
+        "B unblocks and completes after A's turn is terminal: {rb}"
+    );
+    assert_eq!(rbody["message"]["role"], json!("assistant"));
+}
+
+// ---------------------------------------------------------------------------
+// B) abandoned turn timeout (short BAE_TURN_TIMEOUT)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_turn_timeout_releases_gate_and_stays_open() {
+    let (mock, _rec) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let reg = provider_registry_from_toml(&provider_entry_toml(
+        "tool",
+        "anthropic",
+        &format!("{mock}/tool"),
+        "test-token",
+    ));
+    // A short turn timeout so the abandoned paused turn expires in the test.
+    let ts = boot_server(HashMap::new(), reg, Some(Duration::from_millis(300))).await;
+    let profile = ts
+        .create_profile("tool", json!([]), json!(["get_current_time"]))
+        .await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object", "properties": {} } }]);
+    let (sid, skey_a, _) = ts.open_session(&key_a, tools).await;
+    let skey_b = ts.join_session(&sid, &key_b, json!([])).await;
+    let kid_a = ts.client_key_id(&key_a).await;
+
+    // A pauses and never returns its continuation.
+    let (s, first, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "time?" }))
+        .await;
+    assert_eq!(s, 200, "A pauses: {raw}");
+    assert!(first["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["type"] == json!("tool_use")));
+
+    // Wait past BAE_TURN_TIMEOUT, then B's queued message proceeds.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let (sb, rb, raw) = ts
+        .send_message(&sid, &skey_b, json!({ "content": "my turn now" }))
+        .await;
+    assert_eq!(sb, 200, "B proceeds after the abandonment timeout: {raw}");
+    assert_eq!(rb["message"]["role"], json!("assistant"));
+
+    // A session.error(driver_turn_abandoned) was logged, attributed to A, and
+    // the session is still open.
+    let (_s, events, _r) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&skey_b))
+        .await;
+    let abandoned = events["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["event_type"] == json!("session.error")
+                && e["payload"]["reason"] == json!("driver_turn_abandoned")
+        })
+        .expect("driver_turn_abandoned logged");
+    assert_eq!(abandoned["payload"]["owner_client_key_id"], json!(kid_a));
+    assert_eq!(
+        abandoned["client_key_id"],
+        json!(kid_a),
+        "the event is attributed to the abandoned owner"
+    );
+
+    // Session stays open: another turn still works.
+    let (s, _r, raw) = ts
+        .send_message(&sid, &skey_b, json!({ "content": "still open?" }))
+        .await;
+    assert_eq!(s, 200, "session stays open after abandonment: {raw}");
+}
+
+// ---------------------------------------------------------------------------
+// C) fatal primary — at message time (finish_failed) + at join
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fatal_primary_blocks_join_and_ends_message_via_finish_failed() {
+    let ts = start_server().await;
+    let profile = ts.create_profile("text", json!([]), json!([])).await;
+    let key_a = ts.create_key(&profile).await;
+    let key_b = ts.create_key(&profile).await;
+    let (sid, skey_a, _) = ts.open_session(&key_a, json!([])).await;
+
+    // A normal turn works first.
+    let (s, _r, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "ok" }))
+        .await;
+    assert_eq!(s, 200, "baseline turn: {raw}");
+
+    // Simulate a config change that drops the primary: point the profile at a
+    // provider name absent from the registry (the "restart with a changed
+    // bae-config.toml" scenario). The session stays open until its next turn.
+    let (ps, _pv, praw) = ts
+        .admin_put(
+            &format!("/admin/v1/profiles/{profile}"),
+            json!({
+                "name": "mutated",
+                "primary_provider": "ghost-primary",
+                "fallback_providers": [],
+                "allowed_tools": [],
+            }),
+        )
+        .await;
+    assert_eq!(ps, 200, "profile PUT: {praw}");
+
+    // A second client joining the still-open session is refused with 422
+    // primary_provider_unavailable (the fatal-for-the-profile check re-runs on
+    // join).
+    let (js, jerr, jraw) = ts.join_raw(&sid, &key_b, json!([])).await;
+    assert_eq!(js, 422, "join on a now-broken primary: {jraw}");
+    assert_eq!(jerr["type"], json!("primary_provider_unavailable"));
+
+    // The already-open session's next sendMessage ends the turn via
+    // finish_failed: a session.error(provider_config) naming the missing name,
+    // then the session moves to error and refuses further turns.
+    let (s, resp, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "after change" }))
+        .await;
+    assert_eq!(s, 200, "rpc stream opens: {raw}");
+    let se = resp["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("session.error"))
+        .expect("a session.error");
+    assert_eq!(se["payload"]["reason"], json!("provider_config"));
+    assert!(se["payload"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("ghost-primary"));
+    let (s, again, raw) = ts
+        .send_message(&sid, &skey_a, json!({ "content": "again" }))
+        .await;
+    assert_eq!(s, 200, "{raw}");
+    assert_eq!(
+        again["error"]["code"],
+        json!(-32000),
+        "the error-state session refuses new turns: {raw}"
+    );
+
+    // And a fresh create on the broken profile is refused with 422 on every
+    // attempt (no dedup).
+    for attempt in 0..2 {
+        let (cs, cerr, craw) = ts
+            .client_post("/api/v1/sessions", Some(&key_b), json!({ "tools": [] }))
+            .await;
+        assert_eq!(cs, 422, "create attempt {attempt}: {craw}");
+        assert_eq!(cerr["type"], json!("primary_provider_unavailable"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C) non-fatal fallback — missing fallback skipped + logged every session
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_fatal_missing_fallback_is_skipped_and_logged_every_session() {
+    let logs = log_capture();
+    let ts = start_server().await;
+    // A unique missing fallback name so this test's log lines are unambiguous in
+    // the shared capture buffer.
+    let ghost = format!("ghost-fb-{}", generate_id(""));
+    // Primary FAILS (500) so the fallback walk runs; one valid ("text") + one
+    // missing (ghost) fallback.
+    let profile = ts
+        .create_profile("fail", json!(["text", ghost]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+
+    for attempt in 0..2 {
+        let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+        let (s, resp, raw) = ts
+            .send_message(&sid, &skey, json!({ "content": "go" }))
+            .await;
+        assert_eq!(s, 200, "attempt {attempt}: {raw}");
+        // The one valid fallback served the turn.
+        assert_eq!(
+            resp["message"]["content"][0]["text"],
+            json!("Hello from mock")
+        );
+        // Exactly two provider attempts (primary fail + valid fallback) — the
+        // missing ghost fallback was skipped, never attempted.
+        let attempts = resp["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"] == json!("provider.request"))
+            .count();
+        assert_eq!(
+            attempts, 2,
+            "the missing fallback must be skipped, not attempted"
+        );
+        let _ = ts
+            .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&skey))
+            .await;
+    }
+
+    // The missing fallback name was logged on BOTH turns (never deduplicated).
+    let text = captured_text(&logs);
+    let n = text
+        .lines()
+        .filter(|l| l.contains(&ghost) && l.contains("fallback"))
+        .count();
+    assert_eq!(
+        n, 2,
+        "the missing fallback must be logged every session (found {n}):\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C) OpenAI-kind end-to-end tool round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openai_kind_end_to_end_tool_round_trip() {
+    let (oai, requests) = start_openai_mock().await;
+    let reg = provider_registry_from_toml(&provider_entry_toml(
+        "oai-tool",
+        "openai",
+        &format!("{oai}/oai-tool"),
+        "test-token",
+    ));
+    let ts = boot_server(HashMap::new(), reg, None).await;
+    let profile = ts
+        .create_profile("oai-tool", json!([]), json!(["get_current_time"]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let tools = json!([{ "name": "get_current_time", "description": "time",
+                        "input_schema": { "type": "object", "properties": {} } }]);
+    let (sid, skey, _) = ts.open_session(&key, tools).await;
+
+    // First turn: the OpenAI mock returns a tool_calls response, which the engine
+    // consumes as a CANONICAL tool_use — identical shape to an Anthropic run.
+    let (s, first, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "what time?" }))
+        .await;
+    assert_eq!(s, 200, "first turn: {raw}");
+    let tu = first["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == json!("tool_use"))
+        .expect("canonical tool_use from the OpenAI response");
+    assert_eq!(tu["name"], json!("get_current_time"));
+    let tuid = tu["id"].as_str().unwrap().to_string();
+
+    // tool.call is canonical and tagged client dispatch (same as Anthropic).
+    let tc = first["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.call"))
+        .unwrap();
+    assert_eq!(tc["payload"]["name"], json!("get_current_time"));
+    assert_eq!(tc["payload"]["dispatch"], json!("client"));
+
+    // provider.response records the RAW OpenAI wire body (choices/tool_calls);
+    // provider.request identifies the openai kind. (The raw *outgoing* wire body
+    // is verified against the mock's recorder below.)
+    let pr = first["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("provider.response"))
+        .unwrap();
+    assert!(
+        pr["payload"]["body"]["choices"][0]["message"]["tool_calls"].is_array(),
+        "raw OpenAI response body logged in provider.response: {pr}"
+    );
+    let preq = first["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("provider.request"))
+        .unwrap();
+    assert_eq!(preq["payload"]["provider"], json!("openai"));
+
+    // Second turn: return the tool result → a plain-text completion, canonical.
+    let (s, second, raw) = ts
+        .send_message(
+            &sid,
+            &skey,
+            json!({ "content": [{ "type": "tool_result", "tool_use_id": tuid, "content": "12:00 UTC" }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "second turn: {raw}");
+    assert_eq!(
+        second["message"]["content"][0]["text"],
+        json!("tool round-trip complete")
+    );
+
+    // The mock actually received OpenAI-shaped wire requests: function-calling
+    // tools on the first call and a role:"tool" message on the continuation.
+    let reqs = requests.lock().unwrap().clone();
+    assert_eq!(
+        reqs[0]["tools"][0]["type"],
+        json!("function"),
+        "outgoing tools are OpenAI function-shaped: {:?}",
+        reqs[0]
+    );
+    let last = reqs.last().unwrap();
+    assert!(
+        last["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == json!("tool")),
+        "the tool result was sent as a role:\"tool\" message: {last:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C) mixed-kind fallback chain (either direction)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_kind_fallback_chain_either_direction() {
+    // Case 1: OpenAI-kind primary fails (500) → Anthropic-kind fallback succeeds.
+    {
+        let (anth, _ra) = start_anthropic_recording_mock(Duration::ZERO).await;
+        let (oai, _ro) = start_openai_mock().await;
+        let toml = [
+            provider_entry_toml(
+                "primary-oai-fail",
+                "openai",
+                &format!("{oai}/oai-fail"),
+                "test-token",
+            ),
+            provider_entry_toml(
+                "fb-anth-ok",
+                "anthropic",
+                &format!("{anth}/text"),
+                "test-token",
+            ),
+        ]
+        .concat();
+        let reg = provider_registry_from_toml(&toml);
+        let ts = boot_server(HashMap::new(), reg, None).await;
+        let profile = ts
+            .create_profile("primary-oai-fail", json!(["fb-anth-ok"]), json!([]))
+            .await;
+        let key = ts.create_key(&profile).await;
+        let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+        let (s, resp, raw) = ts
+            .send_message(&sid, &skey, json!({ "content": "hi" }))
+            .await;
+        assert_eq!(s, 200, "{raw}");
+        // The persisted/returned canonical content is the fallback's, regardless
+        // of the kind mix.
+        assert_eq!(
+            resp["message"]["content"][0]["text"],
+            json!("Hello from anthropic mock")
+        );
+        let responses: Vec<&Value> = resp["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"] == json!("provider.response"))
+            .collect();
+        assert_eq!(responses.len(), 2, "one response per attempt");
+        assert_eq!(responses[0]["payload"]["provider"], json!("openai"));
+        assert_eq!(responses[0]["payload"]["ok"], json!(false));
+        // The successful attempt's own provider.response carries its raw
+        // (untranslated) Anthropic wire body.
+        assert_eq!(responses[1]["payload"]["provider"], json!("anthropic"));
+        assert_eq!(responses[1]["payload"]["ok"], json!(true));
+        assert_eq!(
+            responses[1]["payload"]["body"]["content"][0]["text"],
+            json!("Hello from anthropic mock")
+        );
+    }
+
+    // Case 2 (reverse): Anthropic-kind primary fails (500) → OpenAI-kind fallback
+    // succeeds.
+    {
+        let (anth, _ra) = start_anthropic_recording_mock(Duration::ZERO).await;
+        let (oai, _ro) = start_openai_mock().await;
+        let toml = [
+            provider_entry_toml(
+                "primary-anth-fail",
+                "anthropic",
+                &format!("{anth}/fail"),
+                "test-token",
+            ),
+            provider_entry_toml(
+                "fb-oai-ok",
+                "openai",
+                &format!("{oai}/oai-text"),
+                "test-token",
+            ),
+        ]
+        .concat();
+        let reg = provider_registry_from_toml(&toml);
+        let ts = boot_server(HashMap::new(), reg, None).await;
+        let profile = ts
+            .create_profile("primary-anth-fail", json!(["fb-oai-ok"]), json!([]))
+            .await;
+        let key = ts.create_key(&profile).await;
+        let (sid, skey, _) = ts.open_session(&key, json!([])).await;
+        let (s, resp, raw) = ts
+            .send_message(&sid, &skey, json!({ "content": "hi" }))
+            .await;
+        assert_eq!(s, 200, "{raw}");
+        assert_eq!(
+            resp["message"]["content"][0]["text"],
+            json!("Hello from openai mock")
+        );
+        let responses: Vec<&Value> = resp["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"] == json!("provider.response"))
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["payload"]["provider"], json!("anthropic"));
+        assert_eq!(responses[0]["payload"]["ok"], json!(false));
+        assert_eq!(responses[1]["payload"]["provider"], json!("openai"));
+        assert_eq!(responses[1]["payload"]["ok"], json!(true));
+        // The OpenAI fallback's provider.response carries its raw OpenAI wire body.
+        assert!(
+            responses[1]["payload"]["body"]["choices"].is_array(),
+            "raw OpenAI wire body on the fallback attempt: {}",
+            responses[1]
+        );
+    }
 }

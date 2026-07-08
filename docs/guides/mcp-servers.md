@@ -91,18 +91,18 @@ that the path is correct and that the process has permission to read it.
 `mcp_servers` is now an array of **server names** (strings that must match an
 entry in `bae-config.toml`):
 
+This assumes `bae-config.toml` also declares an `anthropic-sonnet` entry
+under `[providers]` (see [Configuration — `[providers]`](../reference/configuration.md#providers))
+— `[mcp]` and `[providers]` coexist freely in one file, as
+[`examples/bae-config/providers.toml`](../../examples/bae-config/providers.toml)'s
+header comment notes.
+
 ```sh
 curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "fs-assistant",
-    "provider_config": {
-      "provider": "anthropic",
-      "base_url": "https://api.anthropic.com",
-      "model": "claude-sonnet-4-6",
-      "auth_token": "${ANTHROPIC_API_KEY}",
-      "max_tokens": 8096
-    },
+    "primary_provider": "anthropic-sonnet",
     "mcp_servers": ["filesystem"],
     "allowed_tools": []
   }'
@@ -159,13 +159,23 @@ now advertised to the provider alongside any client-declared tools.
 
 ## Step 6 — Send a message that triggers the filesystem tool
 
+Register as a driver first (required once per session key, before its first
+`session.sendMessage`):
+
+```sh
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
+  -H "Authorization: Bearer $SESSION_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"session.registerDriver","params":{}}'
+```
+
 ```sh
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
-    "id": 1,
+    "id": 2,
     "method": "session.sendMessage",
     "params": {
       "message": {
@@ -248,7 +258,7 @@ curl http://127.0.0.1:8081/admin/v1/mcp-servers
 # Create a profile that opts into it:
 curl -X POST http://127.0.0.1:8081/admin/v1/profiles \
   -H 'Content-Type: application/json' \
-  -d '{"name":"fetch-assistant","provider_config":{…},"mcp_servers":["fetch"]}'
+  -d '{"name":"fetch-assistant","primary_provider":"anthropic-sonnet","mcp_servers":["fetch"]}'
 
 # Open a session and ask the agent to fetch a URL:
 # (follow steps 4–6 as above, with the fetch profile)
@@ -279,8 +289,12 @@ url       = "https://mcp.example.com/sse"
 headers   = { Authorization = "Bearer ${SEARCH_MCP_TOKEN}" }
 ```
 
-Future top-level sections (`[logging]`, `[providers]`, etc.) can coexist with
-`[mcp]` without conflict. Unknown top-level keys are silently ignored.
+`[providers]` (the LLM provider registry — see
+[Configuration](../reference/configuration.md#providers)) coexists with
+`[mcp]` in the same file with no naming conflict — the two are separate
+registries, so a provider and an MCP server may even share a `name`. Other
+future top-level sections (e.g. `[logging]`) follow the same pattern; unknown
+top-level keys are silently ignored.
 
 ### Profile `mcp_servers` field
 

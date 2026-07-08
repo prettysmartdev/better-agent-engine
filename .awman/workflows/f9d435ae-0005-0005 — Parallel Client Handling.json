@@ -1,0 +1,91 @@
+{
+  "schema_version": 4,
+  "invocation_id": "3acdf355-f625-4222-bdb9-71ec1f1f40a3",
+  "workflow_name": "0005 — Parallel Client Handling",
+  "workflow_hash": "a62c645c98be7fb9b949e52100e8d919296c734851a1382943d97794a2413646",
+  "work_item": 5,
+  "step_states": {
+    "implement-providers": "Succeeded",
+    "sdk-clients": "Succeeded",
+    "docs": "Succeeded",
+    "server-tests": "Succeeded",
+    "review": "Skipped",
+    "implement-multi-client": "Succeeded"
+  },
+  "completed_steps": [
+    "server-tests",
+    "implement-providers",
+    "implement-multi-client",
+    "docs",
+    "sdk-clients",
+    "review"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-07-07T20:22:04.070707Z",
+  "updated_at": "2026-07-08T00:25:30.681047Z",
+  "steps": [
+    {
+      "name": "implement-providers",
+      "depends_on": [],
+      "model": "claude-fable-5"
+    },
+    {
+      "name": "implement-multi-client",
+      "depends_on": [
+        "implement-providers"
+      ],
+      "model": "claude-fable-5"
+    },
+    {
+      "name": "server-tests",
+      "depends_on": [
+        "implement-multi-client"
+      ]
+    },
+    {
+      "name": "sdk-clients",
+      "depends_on": [
+        "implement-multi-client"
+      ]
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "implement-multi-client"
+      ],
+      "model": "claude-sonnet-5"
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "server-tests",
+        "sdk-clients",
+        "docs"
+      ],
+      "model": "claude-fable-5"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": true,
+  "teardown_completed": true,
+  "setup_step_states": [
+    {
+      "description": "checkout_create_branch: feature/0005-parallel-client-handling",
+      "status": "Succeeded"
+    }
+  ],
+  "teardown_step_states": [
+    {
+      "description": "run_shell: make test",
+      "status": {
+        "Failed": {
+          "error": "error: no container engine available.\n       Install Docker (and start its daemon), or Apple containers\n       (https://github.com/apple/container) on macOS.\nmake: *** [Makefile:79: ensure-engine] Error 1\n"
+        }
+      }
+    },
+    {
+      "description": "commit_changes: Implement 0005: parallel client handling (multi-driver sessions, FIFO turn mutex, [providers] registry)",
+      "status": "Pending"
+    }
+  ]
+}

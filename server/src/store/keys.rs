@@ -258,7 +258,9 @@ pub fn insert_client_key(
 
 /// Persist a session key. Its owning `session_id` is stored in `name` (the
 /// lookup selector for session auth) and `client_id` records the client key
-/// that opened the session.
+/// the session key was minted for — the creator's at session open, a joiner's
+/// at `POST /api/v1/sessions/{id}/join`. A session may therefore hold several
+/// active session-key rows, one per participating client key.
 pub fn insert_session_key(
     conn: &Connection,
     session_id: &str,
@@ -378,10 +380,17 @@ pub fn touch_last_used(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Revoke (soft-delete) a client key and invalidate everything it opened.
+/// Revoke (soft-delete) a client key and invalidate what it — and only it —
+/// opened.
 ///
-/// Sets `deleted_at` on the client key, soft-deletes its session keys (so they
-/// can no longer authenticate), and moves its open sessions to `closed`.
+/// Sets `deleted_at` on the client key and soft-deletes its session keys (so
+/// they can no longer authenticate). A session this client participated in is
+/// moved to `closed` **only when no other active session key remains for it**
+/// — i.e. only when the revoked client was the session's last participant.
+/// Revoking one driver of a shared multi-client session (whether a joiner or
+/// the original creator) leaves the session open for the other still-valid
+/// drivers/observers.
+///
 /// Returns `None` if no active client key has `id`, otherwise the ids of the
 /// sessions that were closed (so the caller can log `session.close` events).
 pub fn revoke_client_key(conn: &Connection, id: &str) -> rusqlite::Result<Option<Vec<String>>> {
@@ -399,28 +408,32 @@ pub fn revoke_client_key(conn: &Connection, id: &str) -> rusqlite::Result<Option
         return Ok(None);
     }
 
-    // Collect the open sessions before we mutate them.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id FROM sessions WHERE client_key_id = ?1 AND state = '{STATE_OPEN}'"
-    ))?;
-    let closed: Vec<String> = stmt
-        .query_map(params![id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(stmt);
-
     let now_client = format!("UPDATE keys SET deleted_at = {NOW_SQL} WHERE id = ?1");
     conn.execute(&now_client, params![id])?;
-    // Session keys reference their opening client key via client_id.
+    // Session keys reference the client key they were minted for via client_id
+    // (the creator's at open, a joiner's at join).
     let now_sessions_keys = format!(
         "UPDATE keys SET deleted_at = {NOW_SQL} \
          WHERE role = '{ROLE_SESSION}' AND client_id = ?1 AND deleted_at IS NULL"
     );
     conn.execute(&now_sessions_keys, params![id])?;
-    let now_sessions = format!(
+    // Close the open sessions this client participated in (a session key's
+    // `name` is its session id) that now have NO active session key left; a
+    // session with other still-active participants stays open.
+    let close_orphaned = format!(
         "UPDATE sessions SET state = '{STATE_CLOSED}', closed_at = {NOW_SQL} \
-         WHERE client_key_id = ?1 AND state = '{STATE_OPEN}'"
+         WHERE state = '{STATE_OPEN}' \
+           AND id IN (SELECT name FROM keys \
+                      WHERE role = '{ROLE_SESSION}' AND client_id = ?1) \
+           AND NOT EXISTS (SELECT 1 FROM keys k \
+                           WHERE k.role = '{ROLE_SESSION}' AND k.name = sessions.id \
+                             AND k.deleted_at IS NULL) \
+         RETURNING id"
     );
-    conn.execute(&now_sessions, params![id])?;
+    let mut stmt = conn.prepare(&close_orphaned)?;
+    let closed: Vec<String> = stmt
+        .query_map(params![id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(Some(closed))
 }
 

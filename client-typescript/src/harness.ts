@@ -71,10 +71,37 @@ export class Harness {
   }
 
   /**
-   * Open a session: exchange the client key for a session id + key, declaring
-   * the registered tools. Returns a {@link Session} bound to that session key.
+   * Open a new session: exchange the client key for a session id + key,
+   * declaring the registered tools. Registers this connection as a driver
+   * (`session.registerDriver`) before returning, so the first `send()` is
+   * permitted. Returns a {@link Session} bound to that session key.
    */
   async connect(): Promise<Session> {
+    return this.open("/api/v1/sessions");
+  }
+
+  /**
+   * Join an **existing** session as an additional driver, returning a
+   * {@link Session} shaped identically to {@link connect}'s.
+   *
+   * POSTs to `/api/v1/sessions/{sessionId}/join` with this harness's
+   * `client_version` and registered tool declarations (a joining client
+   * declares its own, independent tool set, validated against the *same*
+   * profile's `allowed_tools`). The joining client key must resolve to the same
+   * profile as the session, or the server rejects with `403 profile_mismatch`.
+   * Like {@link connect}, registers this connection as a driver before returning.
+   */
+  async join(sessionId: string): Promise<Session> {
+    return this.open(`/api/v1/sessions/${sessionId}/join`);
+  }
+
+  /**
+   * Shared body of {@link connect} and {@link join}: POST the declared tools to
+   * `path` with client-key auth, build the {@link Session}, then register it as
+   * a driver before handing it back. Both endpoints return the identical
+   * `{session_id, session_key, profile}` shape.
+   */
+  private async open(path: string): Promise<Session> {
     const body = {
       client_version: this.config.clientVersion,
       tools: [...this.tools.values()].map((t) => ({
@@ -85,11 +112,14 @@ export class Harness {
     };
     const res = await this.transport.request({
       method: "POST",
-      path: "/api/v1/sessions",
+      path,
       token: this.config.clientKey,
       body,
     });
     const open = expectOk(res) as OpenSessionResponse;
+    // Register as a driver before any send: session.sendMessage requires it
+    // (a -32001 error otherwise). Application code never calls this.
+    await this.registerDriver(open.session_id, open.session_key);
     return new Session(
       this.transport,
       open.session_id,
@@ -98,6 +128,34 @@ export class Harness {
       this.tools,
       this.hooks,
     );
+  }
+
+  /**
+   * Issue the one-time `session.registerDriver` JSON-RPC call over `…/rpc`,
+   * consuming its single terminal `{registered:true}` frame. Kept private: the
+   * harness owns driver registration; application code never triggers it.
+   */
+  private async registerDriver(
+    sessionId: string,
+    sessionKey: string,
+  ): Promise<void> {
+    const body: JsonRpcRequest = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "session.registerDriver",
+      params: {},
+    };
+    const frames = this.transport.stream({
+      method: "POST",
+      path: `/api/v1/sessions/${sessionId}/rpc`,
+      token: sessionKey,
+      body,
+    });
+    for await (const frame of frames) {
+      if (frame.error)
+        throw new RpcError(frame.error.code, frame.error.message);
+      if (isTerminalFrame(frame)) break;
+    }
   }
 }
 
@@ -175,7 +233,8 @@ export class Session {
       body: this.rpcRequest("session.subscribe", params),
     });
     for await (const frame of frames) {
-      if (frame.error) throw new RpcError(frame.error.code, frame.error.message);
+      if (frame.error)
+        throw new RpcError(frame.error.code, frame.error.message);
       if (isTerminalFrame(frame)) break;
       const event = eventFromFrame(frame);
       if (event !== null && (await handler(event)) === false) break;
@@ -191,7 +250,8 @@ export class Session {
       body: this.rpcRequest("session.unsubscribe", {}),
     });
     for await (const frame of frames) {
-      if (frame.error) throw new RpcError(frame.error.code, frame.error.message);
+      if (frame.error)
+        throw new RpcError(frame.error.code, frame.error.message);
       if (isTerminalFrame(frame)) break;
     }
   }

@@ -9,10 +9,13 @@
 //! - `profiles` — create, list (cursor-paginated), get, replace, soft-delete.
 //! - `keys` — issue (plaintext once), list (never `key_hash`), revoke.
 //! - `mcp-servers` — read-only list of the configured MCP registry (no secrets).
+//! - `providers` — read-only list of the configured provider registry (no
+//!   secrets; `base_url` is the effective value).
 
 pub mod keys;
 pub mod mcp;
 pub mod profiles;
+pub mod providers;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -37,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/v1/keys", post(keys::create).get(keys::list))
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
         .route("/admin/v1/mcp-servers", get(mcp::list))
+        .route("/admin/v1/providers", get(providers::list))
         .layer(axum::middleware::from_fn(crate::api::log_requests))
         .with_state(state)
 }

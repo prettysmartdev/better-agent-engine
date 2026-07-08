@@ -23,6 +23,7 @@ import type {
   McpResponsePayload,
   SendMessageParams,
   SessionEvent,
+  SessionJoinPayload,
 } from "./types.js";
 import { messageText } from "./types.js";
 
@@ -34,6 +35,13 @@ import { messageText } from "./types.js";
  */
 class MockTransport implements Transport {
   readonly requests: TransportRequest[] = [];
+  /**
+   * `session.registerDriver` calls, recorded separately and answered with a
+   * canned `{registered:true}` frame. connect()/join() each issue one during
+   * setup; keeping them out of `requests`/`onStream` leaves the script-based
+   * `call` indices of the ordinary REST + sendMessage exchange untouched.
+   */
+  readonly registerDriverCalls: TransportRequest[] = [];
   constructor(
     private readonly onRequest: (
       req: TransportRequest,
@@ -51,6 +59,12 @@ class MockTransport implements Transport {
     return this.onRequest(req, call);
   }
   async *stream(req: TransportRequest): AsyncIterable<JsonRpcFrame> {
+    const body = req.body as JsonRpcRequest | undefined;
+    if (body?.method === "session.registerDriver") {
+      this.registerDriverCalls.push(structuredClone(req));
+      yield { jsonrpc: "2.0", id: body.id, result: { registered: true } };
+      return;
+    }
     const call = this.requests.length;
     this.requests.push(structuredClone(req));
     for (const frame of this.onStream(req, call)) yield frame;
@@ -306,7 +320,10 @@ describe("send — error propagation", () => {
     const transport = new MockTransport(
       () => openOk,
       () =>
-        assistantFrames([{ type: "text", text: "provider unavailable" }], events),
+        assistantFrames(
+          [{ type: "text", text: "provider unavailable" }],
+          events,
+        ),
     );
     const session = await new Harness(config(), { transport }).connect();
     await expect(session.send("hi")).rejects.toMatchObject({
@@ -440,7 +457,10 @@ function mcpScenarioFrames(): JsonRpcFrame[] {
     jsonrpc: "2.0",
     id: 1,
     result: {
-      message: { role: "assistant", content: [{ type: "text", text: "after mcp" }] },
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "after mcp" }],
+      },
       events: [],
     },
   };
@@ -488,5 +508,202 @@ describe("MCP cross-SDK parity", () => {
 
     // No trace of the removed stub payload shape.
     expect(JSON.stringify(observed)).not.toContain('"status":"stub"');
+  });
+});
+
+// ===========================================================================
+// Cross-SDK two-driver parity (WI 0005)
+//
+// Two client keys attach to one session (driver A via connect, driver B via
+// join, same profile), both register as drivers, both send a message. Every
+// driver observes the SAME ordered broadcast event sequence — including the
+// other driver's session.join / session.driver.register and, in FIFO order,
+// both turns' messages. The canonical sequence below MUST stay byte-for-byte
+// identical to the arrays in:
+//   - client-rust/src/harness.rs                (TWO_DRIVER_PARITY_SEQUENCE)
+//   - client-python/tests/test_two_driver_parity.py (TWO_DRIVER_PARITY_SEQUENCE)
+// ===========================================================================
+
+/** The canonical live-notification sequence every driver observes. */
+const TWO_DRIVER_PARITY_SEQUENCE = [
+  "session.driver.register", // driver A registered (connect)
+  "session.join", // driver B joined
+  "session.driver.register", // driver B registered (join)
+  "client.message.send", // driver A's message (FIFO first)
+  "provider.request",
+  "provider.response",
+  "server.message.send",
+  "client.message.send", // driver B's message (FIFO second)
+  "provider.request",
+  "provider.response",
+  "server.message.send",
+];
+
+const DRIVER_A_KEY = "key_driver_a";
+const DRIVER_B_KEY = "key_driver_b";
+
+function attributedEvent(
+  event_type: string,
+  client_key_id: string,
+  payload: Record<string, unknown>,
+): SessionEvent {
+  return {
+    id: `evt_${event_type}_${client_key_id}`,
+    session_id: "ses_two_driver",
+    client_key_id,
+    event_type,
+    payload,
+    created_at: "t",
+  } as SessionEvent;
+}
+
+/**
+ * One sendMessage reply carrying the full two-driver broadcast as live
+ * notifications, then a terminal assistant turn. Both drivers' streams deliver
+ * this identical sequence (cross-visibility).
+ */
+function twoDriverScenarioFrames(): JsonRpcFrame[] {
+  const notifs = [
+    attributedEvent("session.driver.register", DRIVER_A_KEY, {}),
+    attributedEvent("session.join", DRIVER_B_KEY, {
+      client_version: "9.9.9",
+      tools: ["get_current_time"],
+    }),
+    attributedEvent("session.driver.register", DRIVER_B_KEY, {}),
+    attributedEvent("client.message.send", DRIVER_A_KEY, {
+      role: "user",
+      content: "from A",
+    }),
+    attributedEvent("provider.request", DRIVER_A_KEY, { attempt: 0 }),
+    attributedEvent("provider.response", DRIVER_A_KEY, {
+      ok: true,
+      status: 200,
+    }),
+    attributedEvent("server.message.send", DRIVER_A_KEY, {
+      role: "assistant",
+      content: [{ type: "text", text: "reply A" }],
+    }),
+    attributedEvent("client.message.send", DRIVER_B_KEY, {
+      role: "user",
+      content: "from B",
+    }),
+    attributedEvent("provider.request", DRIVER_B_KEY, { attempt: 0 }),
+    attributedEvent("provider.response", DRIVER_B_KEY, {
+      ok: true,
+      status: 200,
+    }),
+    attributedEvent("server.message.send", DRIVER_B_KEY, {
+      role: "assistant",
+      content: [{ type: "text", text: "reply B" }],
+    }),
+  ].map((event): JsonRpcFrame => ({
+    jsonrpc: "2.0",
+    method: "session.event",
+    params: event,
+  }));
+  const terminal: JsonRpcFrame = {
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "reply B" }],
+      },
+      events: [],
+    },
+  };
+  return [...notifs, terminal];
+}
+
+describe("two-driver cross-SDK parity", () => {
+  it("connect + join both register drivers and observe the identical FIFO broadcast", async () => {
+    // A shared server: connect returns driver A's key, join returns driver B's.
+    const transport = new MockTransport(
+      (req) => ({
+        status: 201,
+        body: {
+          session_id: "ses_two_driver",
+          session_key: req.path.endsWith("/join") ? "bae_ses_b" : "bae_ses_a",
+          profile: {
+            id: "pro_1",
+            name: "main",
+            allowed_tools: ["get_current_time"],
+            mcp_servers: [],
+            provider: { provider: "anthropic", model: "claude-sonnet-4-6" },
+          },
+        },
+      }),
+      () => twoDriverScenarioFrames(),
+    );
+
+    const observedA: SessionEvent[] = [];
+    const observedB: SessionEvent[] = [];
+    const harnessA = new Harness(
+      new Config({
+        serverUrl: "http://test",
+        clientKey: "bae_client_a",
+        clientVersion: "9.9.9",
+      }),
+      { transport },
+    ).setHooks({ on_event: (e) => void observedA.push(e) });
+    const harnessB = new Harness(
+      new Config({
+        serverUrl: "http://test",
+        clientKey: "bae_client_b",
+        clientVersion: "9.9.9",
+      }),
+      { transport },
+    ).setHooks({ on_event: (e) => void observedB.push(e) });
+
+    // Driver A connects; driver B joins the same session.
+    const sessionA = await harnessA.connect();
+    const sessionB = await harnessB.join(sessionA.id);
+    expect(sessionB.id).toBe(sessionA.id);
+
+    // Both send a message; each observes the full broadcast.
+    await sessionA.send("from A");
+    await sessionB.send("from B");
+
+    // Both drivers observe the identical canonical sequence (cross-visibility).
+    expect(observedA.map((e) => e.event_type)).toEqual(
+      TWO_DRIVER_PARITY_SEQUENCE,
+    );
+    expect(observedB.map((e) => e.event_type)).toEqual(
+      TWO_DRIVER_PARITY_SEQUENCE,
+    );
+    expect(observedA.map((e) => e.event_type)).toEqual(
+      observedB.map((e) => e.event_type),
+    );
+
+    // connect() and join() each issued exactly one session.registerDriver, with
+    // the respective session key.
+    expect(transport.registerDriverCalls).toHaveLength(2);
+    expect(transport.registerDriverCalls[0]!.token).toBe("bae_ses_a");
+    expect(transport.registerDriverCalls[1]!.token).toBe("bae_ses_b");
+
+    // join() hit the /join path authenticated with driver B's client key.
+    const joinReq = transport.requests.find((r) => r.path.endsWith("/join"))!;
+    expect(joinReq.method).toBe("POST");
+    expect(joinReq.token).toBe("bae_client_b");
+
+    // Cross-visibility of client keys: an observer sees BOTH drivers' events.
+    const keys = new Set(observedA.map((e) => e.client_key_id));
+    expect(keys.has(DRIVER_A_KEY)).toBe(true);
+    expect(keys.has(DRIVER_B_KEY)).toBe(true);
+
+    // FIFO ordering: driver A's message turn precedes driver B's.
+    const sends = observedA.filter(
+      (e) => e.event_type === "client.message.send",
+    );
+    expect(sends).toHaveLength(2);
+    expect(sends[0]!.client_key_id).toBe(DRIVER_A_KEY);
+    expect(sends[1]!.client_key_id).toBe(DRIVER_B_KEY);
+
+    // The new session.join payload parses to its real shape.
+    const join = observedA.find((e) => e.event_type === "session.join")!;
+    expect((join.payload as SessionJoinPayload).tools).toEqual([
+      "get_current_time",
+    ]);
+    expect((join.payload as SessionJoinPayload).client_version).toBe("9.9.9");
   });
 });

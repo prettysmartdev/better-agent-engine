@@ -41,7 +41,8 @@ to loopback **inside** the container and is never exposed — reach it via
 | `BAE_DB_PATH` | `/var/lib/bae/bae.db` | SQLite database file. Mount a volume here to persist data. |
 | `BAE_LOG` | `info` | Tracing filter, e.g. `baesrv=debug,tower=warn`. |
 | `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain in-flight requests on SIGTERM. |
-| `BAE_CONFIG` | _(none)_ | Path to a `bae-config.toml` file for MCP server configuration. |
+| `BAE_CONFIG` | _(none)_ | Path to a `bae-config.toml` file (MCP server and LLM provider registries). |
+| `BAE_TURN_TIMEOUT` | `120` | Seconds a paused turn's owner has to return with its continuation before it's considered abandoned. |
 
 See [Configuration](../reference/configuration.md) for the full reference.
 Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the
@@ -65,19 +66,19 @@ curl http://localhost:8080/api/v1/meta
 Profiles are managed through the **admin API**, which binds to loopback only.
 From inside the container:
 
+This assumes the server was started with a `bae-config.toml` that declares an
+`anthropic-sonnet` entry under `[providers]` — e.g.
+[`examples/bae-config/providers.toml`](../../examples/bae-config/providers.toml)
+(`BAE_CONFIG=examples/bae-config/providers.toml`). See
+[Configuration — `[providers]`](../reference/configuration.md#providers).
+
 ```sh
 docker exec -i bae sh << 'EOF'
 curl -s -X POST http://127.0.0.1:8081/admin/v1/profiles \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "main",
-    "provider_config": {
-      "provider": "anthropic",
-      "base_url": "https://api.anthropic.com",
-      "model": "claude-sonnet-4-6",
-      "auth_token": "${ANTHROPIC_API_KEY}",
-      "max_tokens": 8096
-    },
+    "primary_provider": "anthropic-sonnet",
     "allowed_tools": ["get_current_time"]
   }' | tee /dev/stderr | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'])"
 EOF
@@ -182,13 +183,26 @@ envelope. The response is a stream of newline-delimited JSON objects
 (`application/x-ndjson`): zero or more `session.event` notifications, followed
 by a terminal result object.
 
+**Register as a driver first.** Every session key must call
+`session.registerDriver` once before its first `session.sendMessage` — SDK
+harnesses do this automatically in `connect()`, but raw HTTP callers must do
+it explicitly or `session.sendMessage` fails with `-32001`:
+
+```sh
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
+  -H "Authorization: Bearer $SESSION_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"session.registerDriver","params":{}}'
+# {"jsonrpc":"2.0","id":1,"result":{"registered":true}}
+```
+
 ```sh
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
-    "id": 1,
+    "id": 2,
     "method": "session.sendMessage",
     "params": {"message": {"role": "user", "content": "What time is it?"}}
   }'
@@ -201,20 +215,21 @@ The response streams multiple lines. Each line is a complete JSON object:
 {"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"provider.request",…}}
 {"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"provider.response",…}}
 {"jsonrpc":"2.0","method":"session.event","params":{"id":"evt_…","event_type":"server.message.send",…}}
-{"jsonrpc":"2.0","id":1,"result":{"message":{"role":"assistant","content":[{"type":"text","text":"It is currently …"}]},"events":[…]}}
+{"jsonrpc":"2.0","id":2,"result":{"message":{"role":"assistant","content":[{"type":"text","text":"It is currently …"}]},"events":[…]}}
 ```
 
 Objects without `"id"` are live event notifications. The last object (carrying
-`"id":1`) is the terminal response; its `result` contains the final
+`"id":2`) is the terminal response; its `result` contains the final
 `message` and the full `events` array for the turn.
 
-To extract just the assistant's reply:
+To extract just the assistant's reply (the session key is already registered
+as a driver from the `session.registerDriver` call above):
 
 ```sh
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"session.sendMessage","params":{"message":{"role":"user","content":"What time is it?"}}}' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"session.sendMessage","params":{"message":{"role":"user","content":"What time is it?"}}}' \
   | tail -1 \
   | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result']['message']['content'][0]['text'])"
 ```
@@ -240,6 +255,7 @@ curl -s -X DELETE "http://localhost:8080/api/v1/sessions/$SESSION_ID" \
 - [Admin API reference](../reference/admin-api.md) — manage profiles and keys.
 - [Client API reference](../reference/client-api.md) — full session and message endpoints.
 - [Profiles](../profiles.md) — provider config, env var references, fallbacks, MCP wiring.
-- [Message types](../reference/message-types.md) — all twelve `event_type` values and their payloads.
+- [Message types](../reference/message-types.md) — all fourteen `event_type` values and their payloads.
 - [MCP Servers](mcp-servers.md) — connect real MCP tools to a profile.
 - [Event Streaming](event-streaming.md) — live progress notifications and observer subscriptions.
+- [Multi-Client Sessions](multi-client-sessions.md) — join a session as a second driver.

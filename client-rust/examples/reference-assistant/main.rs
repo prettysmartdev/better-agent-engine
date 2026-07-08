@@ -125,7 +125,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             h5.fetch_add(1, Ordering::SeqCst);
             match event.event_type.as_str() {
                 "mcp.request" => {
-                    if let Ok(p) = serde_json::from_value::<McpRequestPayload>(event.payload.clone())
+                    if let Ok(p) =
+                        serde_json::from_value::<McpRequestPayload>(event.payload.clone())
                     {
                         eprintln!(
                             "[event] mcp.request  server={} tool={} method={}",

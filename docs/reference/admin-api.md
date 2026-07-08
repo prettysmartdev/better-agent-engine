@@ -63,23 +63,25 @@ List endpoints accept `?cursor=<opaque>&limit=<n>` and return:
 ```json
 {
   "name": "main",
-  "provider_config": {
-    "provider": "anthropic",
-    "base_url": "https://api.anthropic.com",
-    "model": "claude-sonnet-4-6",
-    "auth_token": "${ANTHROPIC_API_KEY}",
-    "max_tokens": 8096
-  },
-  "fallback_configs": [],
+  "primary_provider": "anthropic-sonnet",
+  "fallback_providers": [],
   "mcp_servers": ["filesystem"],
   "allowed_tools": ["get_current_time"]
 }
 ```
 
 - `name` — required, must be unique.
-- `provider_config` — required. See [profiles.md](../profiles.md) for the schema.
-- `fallback_configs` — optional, default `[]`. Array of provider configs tried
-  in order if the primary fails.
+- `primary_provider` — required, non-blank string. The **name** of a
+  `[providers]` entry in `bae-config.toml` — not an inline config object. See
+  [profiles.md](../profiles.md#provider-config) for the schema and the
+  breaking change from the prior inline-object shape. Not resolved against
+  the registry at write time (a profile may reference a name that doesn't
+  exist yet); resolution — and the fatal-if-missing check — happens at
+  session creation/join. See [Providers](#providers) below.
+- `fallback_providers` — optional, default `[]`. **Array of registry name
+  strings** tried in order if the primary fails. Every element must be a
+  string; a non-string element returns `400 bad_request`. A name not in the
+  registry is logged and skipped, never fatal.
 - `mcp_servers` — optional, default `[]`. **Array of MCP server name strings**
   matching entries in `bae-config.toml`. Every element must be a string; a
   non-string element returns `400 bad_request`.
@@ -96,7 +98,7 @@ List endpoints accept `?cursor=<opaque>&limit=<n>` and return:
 }
 ```
 
-**Errors:** `400 bad_request` (blank name, malformed `provider_config`,
+**Errors:** `400 bad_request` (blank name, blank `primary_provider`,
 non-array or non-string list fields), `409 duplicate_name`.
 
 ---
@@ -115,14 +117,8 @@ GET /admin/v1/profiles?limit=20&cursor=
     {
       "id": "pro_…",
       "name": "main",
-      "provider_config": {
-        "provider": "anthropic",
-        "base_url": "https://api.anthropic.com",
-        "model": "claude-sonnet-4-6",
-        "auth_token": "${ANTHROPIC_API_KEY}",
-        "max_tokens": 8096
-      },
-      "fallback_configs": [],
+      "primary_provider": "anthropic-sonnet",
+      "fallback_providers": [],
       "mcp_servers": ["filesystem"],
       "allowed_tools": ["get_current_time"],
       "created_at": "2026-07-06T18:26:01.123Z",
@@ -133,9 +129,11 @@ GET /admin/v1/profiles?limit=20&cursor=
 }
 ```
 
-The admin surface returns the full `provider_config` including the literal
-`auth_token` string (e.g. `"${ANTHROPIC_API_KEY}"`). This is a template
-reference, not an actual secret. Deleted profiles are excluded from the list.
+The admin surface returns `primary_provider`/`fallback_providers` as name
+references only — never an inline config, never `auth_token`. To see what a
+name actually resolves to (model, effective `base_url`), use
+[`GET /admin/v1/providers`](#get-adminv1providers). Deleted profiles are
+excluded from the list.
 
 ---
 
@@ -291,6 +289,45 @@ Items are sorted by name. Only `name` and `transport` are returned — no
 The registry is rebuilt on restart; this endpoint reflects the current in-memory
 state. An empty `items` array means the server started without a config file,
 or the config file had no `[[mcp.servers]]` entries.
+
+---
+
+## Providers
+
+### `GET /admin/v1/providers`
+
+Returns the currently loaded LLM provider registry — the set of entries
+parsed from `[providers]` in `bae-config.toml` at startup. Useful to confirm
+what a running server has available, and what a `primary_provider`/
+`fallback_providers` name in a profile actually resolves to, without reading
+the config file on disk.
+
+```sh
+curl http://127.0.0.1:8081/admin/v1/providers
+```
+
+**Response `200 OK`:**
+
+```json
+{
+  "items": [
+    {"name": "anthropic-sonnet", "provider": "anthropic", "model": "claude-sonnet-4-6", "base_url": "https://api.anthropic.com"},
+    {"name": "openai-gpt",       "provider": "openai",    "model": "gpt-5",             "base_url": "https://api.openai.com"}
+  ]
+}
+```
+
+Items are sorted by name. `base_url` is always the **effective** value — the
+explicit value when the entry set one, otherwise the `provider` kind's
+default SaaS endpoint. Only `name`, `provider`, `model`, and `base_url` are
+returned — `auth_token` is never exposed.
+
+The registry is rebuilt on restart; this endpoint reflects the current
+in-memory state. An empty `items` array means the server started without a
+config file, or the config file had no `[[providers.entries]]` entries. See
+[Configuration — `[providers]`](configuration.md#providers) for the full
+schema and [Profiles — Provider config](../profiles.md#provider-config) for
+how profiles reference these entries by name.
 
 ---
 

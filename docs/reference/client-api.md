@@ -29,10 +29,14 @@ absent or empty header returns `401`.
 | Endpoint | Required key type |
 |---|---|
 | `POST /api/v1/sessions` | Client key (`bae_…`) |
+| `POST /api/v1/sessions/{id}/join` | Client key (`bae_…`) — may be a **different** client key than the one that created the session, as long as it shares the session's profile |
 | All other `/api/v1/sessions/{id}/*` | Session key (`bae_ses_…`) for that session |
 
 A valid session key presented for a different session id returns `401` (the
-session key is bound to its session at creation).
+session key is bound to its session at creation). A session can have
+**multiple** valid session keys at once — one per client key that created or
+joined it (see [`join`](#post-apiv1sessionsidjoin--join-an-existing-session)
+below).
 
 ---
 
@@ -72,8 +76,10 @@ Every non-2xx response from REST endpoints follows RFC 7807:
 | `unauthorized` | 401 | Missing, invalid, or revoked key. |
 | `not_found` | 404 | Session does not exist. |
 | `tool_not_allowed` | 403 | A declared tool is not in the profile's `allowed_tools`. |
+| `profile_mismatch` | 403 | `POST /join` only — the joining client key's profile differs from the session's profile. |
 | `session_closed` | 409 | Session is not open (already closed or errored) — REST endpoints only. |
 | `profile_unavailable` | 422 | The profile was deleted after the key was created. |
+| `primary_provider_unavailable` | 422 | The profile's `primary_provider` name is not in the server's `[providers]` registry. Logged on every attempt, never deduplicated. See [Profiles](../profiles.md#fatal-primary--non-fatal-fallback). |
 | `internal` | 500 | Unexpected server error. |
 
 > **`POST /api/v1/sessions/{id}/rpc`** checks auth before opening the stream;
@@ -164,6 +170,97 @@ in the registry is skipped non-fatally (logged as an error).
 - `403 tool_not_allowed` — a declared tool is not in `allowed_tools`.
 - `422 profile_unavailable` — the profile was deleted between key creation and
   session open. A `session.error` event is still recorded for audit.
+- `422 primary_provider_unavailable` — the profile's `primary_provider` name
+  is not in the server's `[providers]` registry. Logged (`tracing::error!`)
+  on every attempt, never deduplicated. A `session.error` event (`reason:
+  "primary_provider_unavailable"`) is recorded for audit, same posture as
+  `profile_unavailable`. No session is created and no session key is issued.
+
+---
+
+### `POST /api/v1/sessions/{id}/join` — join an existing session
+
+Auth: **client key**. May be a different client key than the one that opened
+the session — that's the point of this endpoint.
+
+**Request body:** identical shape to `POST /api/v1/sessions`:
+
+```json
+{
+  "client_version": "1.0.0",
+  "tools": [
+    { "name": "get_current_time", "description": "…", "input_schema": {} }
+  ]
+}
+```
+
+`tools` are validated against the **shared** profile's `allowed_tools`,
+exactly like `create`. A joining client declares its own, independent tool
+set — joining never merges with, replaces, or reads any other client's
+declared tools. See [Message Types — `session.join`](message-types.md#sessionjoin).
+
+**Response `201 Created`:** identical shape to `create`:
+
+```json
+{
+  "session_id": "ses_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "session_key": "bae_ses_7f8e9d0c1b2a7f8e9d0c1b2a7f8e9d0c1b2a7f8e9d0c1b2a",
+  "profile": { "id": "pro_…", "name": "main", "…": "…" }
+}
+```
+
+The response mints a **new** session key (distinct from the creator's, and
+from any other prior joiner's) bound to the joining client key. MCP
+connections are **not** re-resolved on join — they are session-wide
+infrastructure established once, at create.
+
+**Checks, in order (first failure wins):**
+
+1. `401 unauthorized` — bad or missing client key.
+2. `404 not_found` — no session with this id.
+3. `409 session_closed` — the session is `closed` or `error`
+   (`detail: "session is already <state>"`, same shape as `DELETE`'s
+   conflict). A joiner cannot resurrect a terminal session.
+4. `403 profile_mismatch` — the joining client key's `profile_id` differs
+   from the session's `profile_id`. This is the hard boundary that keeps a
+   client on profile X from ever attaching to a session created under
+   profile Y. **No event is logged, no session key is minted, the session is
+   untouched** — an authorization failure at the client-key level, same
+   posture as `tool_not_allowed`.
+5. `422 profile_unavailable` — the shared profile was deleted. Same audit
+   posture as `create`: a separate `state='error'` session row is logged; the
+   joined session itself is untouched.
+6. `422 primary_provider_unavailable` — the shared profile's
+   `primary_provider` is not in the registry. Same logging/audit posture as
+   `create`'s check above.
+7. `403 tool_not_allowed` — a tool the joiner declared is not in the shared
+   profile's `allowed_tools` (validated independently of what the creator or
+   any other joiner declared).
+
+See [Multi-Client Sessions](../guides/multi-client-sessions.md) for a
+worked example and [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+for what happens once both clients start sending messages.
+
+---
+
+### `GET /api/v1/sessions/{id}/participants` — list registered drivers
+
+Auth: **session key** for `{id}`.
+
+**Response `200 OK`:**
+
+```json
+{ "drivers": ["key_a1b2c3d4", "key_e5f6a7b8"] }
+```
+
+A sorted array of client-key ids currently registered as drivers (via
+[`session.registerDriver`](#sessionregisterdriver)), from the server's
+**in-memory** registry. This is live-only — it resets on server restart, the
+same posture as MCP session state. For durable "who ever joined or
+registered" history, use `GET /api/v1/sessions/{id}/events` and look for
+`session.open`, `session.join`, and `session.driver.register` events.
+
+**Errors:** `401 unauthorized`, `404 not_found`.
 
 ---
 
@@ -266,6 +363,43 @@ Content-Type: application/x-ndjson
 {"jsonrpc":"2.0","id":1,"result":{…}}\n
 ```
 
+The four supported `method` values are `session.registerDriver`,
+`session.sendMessage`, `session.subscribe`, `session.unsubscribe`.
+
+---
+
+### `session.registerDriver`
+
+Register the calling connection's client key as a **driver** on this session
+— required once before that client key's first `session.sendMessage` call.
+SDK harnesses call this automatically as part of `connect()`/`join()`;
+application code normally never calls it directly. See
+[Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+for the full driver/observer model.
+
+**Params:** `{}`
+
+**Terminal result:**
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "result": { "registered": true } }
+```
+
+- **Idempotent.** A repeat call from an already-registered client key returns
+  `registered: true` without inserting a duplicate `session.driver.register`
+  event.
+- Records `session_id → client_key_id` in the server's in-memory driver
+  registry (see [`GET .../participants`](#get-apiv1sessionsidparticipants--list-registered-drivers))
+  and inserts a broadcast `session.driver.register` event — other
+  drivers/observers see who registered, live.
+- No auto-registration anywhere else: a connection that only ever calls
+  `session.subscribe` never needs to register, and `session.sendMessage` will
+  never silently register a caller on its behalf.
+
+**JSON-RPC errors:**
+- `-32000` — the session is not in `open` state (mirrors `sendMessage`'s
+  state gate — a terminal session cannot gain drivers).
+
 ---
 
 ### `session.sendMessage`
@@ -273,6 +407,10 @@ Content-Type: application/x-ndjson
 Send a user turn and stream live events as the provider processes it.
 
 **Replaces** `POST /api/v1/sessions/{id}/messages` (removed).
+
+**Requires prior driver registration.** The calling client key must have
+already called `session.registerDriver` on this session (see above) — SDK
+harnesses do this automatically during `connect()`/`join()`.
 
 **Params:**
 
@@ -372,13 +510,29 @@ moves to `error` state. SDKs surface this as `ProvidersFailedError`.
 - `-32601 Method not found` — unknown method.
 - `-32602 Invalid params` — missing or wrong-typed params.
 - `-32000` — session is not open (`open` state required).
+- `-32001 driver_not_registered` — `{"code": -32001, "message": "call session.registerDriver before session.sendMessage"}`.
+  Checked **first**, before the state check, param validation, the turn lock,
+  or broadcast subscription. Never auto-registers — see
+  [`session.registerDriver`](#sessionregisterdriver) above.
+
+**FIFO queuing.** If another driver's turn is already in flight on this
+session, this call **blocks** — its NDJSON response opens but stays silent
+(zero bytes written) until the in-flight turn completes or is judged
+abandoned. This is not an error: no bytes means "still queued," not "stuck."
+Apply your own client-side request timeout if you'd rather give up than wait
+indefinitely — the server itself never times out a queued (not yet started)
+message. See [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+for the full ordering, ownership, and abandonment-timeout semantics.
 
 ---
 
 ### `session.subscribe`
 
 Open a live event subscription. Useful for an observer connection that is not
-driving the turn (a dashboard, a log stream, etc.).
+driving the turn (a dashboard, a log stream, etc.). **Calling `session.subscribe`
+is itself the observer registration act** — there is no separate
+"registerObserver" method and nothing is logged when a connection subscribes;
+it stands in deliberate contrast to `session.registerDriver`, which does log.
 
 **Params:**
 

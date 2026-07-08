@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use config_file::McpServerConfig;
+use engine::provider::ProviderConfig;
 
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -99,12 +100,14 @@ pub fn open_store(config: &Config) -> Result<Store, StoreError> {
 /// `store` is passed in (rather than opened here) so the caller can fail fast on
 /// database problems before we touch the network.
 ///
-/// `mcp_registry` is the (possibly empty) set of MCP servers parsed from
-/// `bae-config.toml`; it is held in-memory on [`AppState`] and never persisted.
+/// `mcp_registry` and `provider_registry` are the (possibly empty) sets of MCP
+/// servers and LLM providers parsed from `bae-config.toml`; both are held
+/// in-memory on [`AppState`] and never persisted.
 pub async fn serve(
     config: Config,
     store: Store,
     mcp_registry: HashMap<String, McpServerConfig>,
+    provider_registry: HashMap<String, ProviderConfig>,
 ) -> Result<(), RunError> {
     tracing::info!(
         version = VERSION,
@@ -113,7 +116,8 @@ pub async fn serve(
         "Better Agent Engine (BAE) starting — welcome!"
     );
 
-    let state = AppState::with_mcp_registry(store, mcp_registry);
+    let mut state = AppState::with_registries(store, mcp_registry, provider_registry);
+    state.turn_timeout = config.turn_timeout;
 
     // Periodic activity summary. The first tick fires immediately, so one
     // summary also lands at startup; after that, one per interval.

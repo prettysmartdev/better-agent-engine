@@ -1,10 +1,17 @@
 //! Admin profile endpoints (`/admin/v1/profiles`).
 //!
 //! Profiles are the admin-managed binding target for client keys: the primary
-//! provider config, ordered fallbacks, the opt-in list of MCP server *names*
-//! (each matching a `bae-config.toml` registry entry), and the client tool
-//! allowlist. This router is served only on the loopback admin listener, so
-//! there is no auth here initially.
+//! provider *name* plus ordered fallback provider *names* (each matching a
+//! `bae-config.toml` `[providers]` registry entry), the opt-in list of MCP
+//! server *names* (likewise registry entries), and the client tool allowlist.
+//! This router is served only on the loopback admin listener, so there is no
+//! auth here initially.
+//!
+//! Provider references are names, not inline config objects (the WI 0005
+//! breaking change, mirroring the WI 0003 `mcp_servers` blob → name-array
+//! change): the request/response fields are `primary_provider: string` and
+//! `fallback_providers: string[]`. Registry resolution happens at
+//! session-creation and message time, never at admin-write time.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -15,16 +22,17 @@ use serde_json::{json, Value};
 use crate::api::error::ApiError;
 use crate::api::pagination::{next_cursor, PageQuery};
 use crate::api::AppState;
-use crate::engine::provider::ProviderConfig;
 use crate::store::profiles::{self, DeleteOutcome, ProfileInput, ProfileRecord};
 
 /// `POST /admin/v1/profiles` body.
 #[derive(Debug, Deserialize)]
 pub struct CreateProfile {
     pub name: String,
-    pub provider_config: Value,
+    /// The primary provider's `bae-config.toml` registry name.
+    pub primary_provider: String,
+    /// Ordered fallback provider registry names.
     #[serde(default)]
-    pub fallback_configs: Option<Value>,
+    pub fallback_providers: Option<Value>,
     #[serde(default)]
     pub mcp_servers: Option<Value>,
     #[serde(default)]
@@ -33,52 +41,43 @@ pub struct CreateProfile {
 
 impl CreateProfile {
     /// Validate and normalise into a [`ProfileInput`]. Rejects a blank name, a
-    /// provider config that does not match the schema, and non-array
-    /// `fallback_configs` / `mcp_servers` / `allowed_tools`.
+    /// blank `primary_provider`, and non-string-array `fallback_providers` /
+    /// `mcp_servers`, plus a non-array `allowed_tools`.
     fn into_input(self) -> Result<ProfileInput, ApiError> {
         if self.name.trim().is_empty() {
             return Err(ApiError::bad_request("name must not be empty"));
         }
-        validate_provider_config(&self.provider_config)?;
+        // `primary_provider` is a provider *name* (a `bae-config.toml`
+        // `[providers]` registry entry), not an inline config object. Registry
+        // resolution happens at session-creation/message time, exactly like
+        // `mcp_servers`; here we only enforce the shape.
+        if self.primary_provider.trim().is_empty() {
+            return Err(ApiError::bad_request("primary_provider must not be empty"));
+        }
 
-        let fallback_configs = self.fallback_configs.unwrap_or_else(|| json!([]));
-        validate_fallbacks(&fallback_configs)?;
+        let fallback_providers = self.fallback_providers.unwrap_or_else(|| json!([]));
+        require_string_array(&fallback_providers, "fallback_providers")?;
         let mcp_servers = self.mcp_servers.unwrap_or_else(|| json!([]));
-        // `mcp_servers` is now an array of MCP server *names* (strings) that must
+        // `mcp_servers` is an array of MCP server *names* (strings) that must
         // match `bae-config.toml` registry entries, not an opaque JSON blob.
-        // Registry resolution happens at session-creation time (a later step);
-        // here we only enforce the shape. Non-string elements are rejected at
-        // admin-write time rather than silently ignored later.
+        // Registry resolution happens at session-creation time; here we only
+        // enforce the shape. Non-string elements are rejected at admin-write
+        // time rather than silently ignored later.
         require_string_array(&mcp_servers, "mcp_servers")?;
         let allowed_tools = self.allowed_tools.unwrap_or_else(|| json!([]));
         require_array(&allowed_tools, "allowed_tools")?;
 
         Ok(ProfileInput {
             name: self.name,
-            provider_config: self.provider_config,
-            fallback_configs,
+            // Stored in the unchanged TEXT columns as a JSON string / JSON
+            // string-array (an application-layer shape change, not a schema
+            // change).
+            provider_config: json!(self.primary_provider),
+            fallback_configs: fallback_providers,
             mcp_servers,
             allowed_tools,
         })
     }
-}
-
-fn validate_provider_config(v: &Value) -> Result<(), ApiError> {
-    serde_json::from_value::<ProviderConfig>(v.clone())
-        .map_err(|e| ApiError::bad_request(format!("provider_config is not valid: {e}")))?;
-    Ok(())
-}
-
-fn validate_fallbacks(v: &Value) -> Result<(), ApiError> {
-    let arr = v
-        .as_array()
-        .ok_or_else(|| ApiError::bad_request("fallback_configs must be an array"))?;
-    for (i, cfg) in arr.iter().enumerate() {
-        serde_json::from_value::<ProviderConfig>(cfg.clone()).map_err(|e| {
-            ApiError::bad_request(format!("fallback_configs[{i}] is not valid: {e}"))
-        })?;
-    }
-    Ok(())
 }
 
 fn require_array(v: &Value, field: &str) -> Result<(), ApiError> {
@@ -90,7 +89,8 @@ fn require_array(v: &Value, field: &str) -> Result<(), ApiError> {
 }
 
 /// Like [`require_array`], but additionally requires every element to be a
-/// string. Used for `mcp_servers`, which is an array of registry names.
+/// string. Used for `mcp_servers` and `fallback_providers`, both arrays of
+/// `bae-config.toml` registry names.
 fn require_string_array(v: &Value, field: &str) -> Result<(), ApiError> {
     let arr = v
         .as_array()
@@ -98,20 +98,22 @@ fn require_string_array(v: &Value, field: &str) -> Result<(), ApiError> {
     for (i, el) in arr.iter().enumerate() {
         if !el.is_string() {
             return Err(ApiError::bad_request(format!(
-                "{field}[{i}] must be a string (an MCP server name)"
+                "{field}[{i}] must be a string (a bae-config.toml registry name)"
             )));
         }
     }
     Ok(())
 }
 
-/// Full JSON view of a profile (all fields). Used by GET/PUT responses.
+/// Full JSON view of a profile (all fields). Used by GET/PUT responses. The
+/// provider fields surface under their name-reference API names
+/// (`primary_provider` / `fallback_providers`), not the storage column names.
 pub fn profile_view(p: &ProfileRecord) -> Value {
     json!({
         "id": p.id,
         "name": p.name,
-        "provider_config": p.provider_config,
-        "fallback_configs": p.fallback_configs,
+        "primary_provider": p.provider_config,
+        "fallback_providers": p.fallback_configs,
         "mcp_servers": p.mcp_servers,
         "allowed_tools": p.allowed_tools,
         "created_at": p.created_at,

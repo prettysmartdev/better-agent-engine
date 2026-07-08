@@ -47,6 +47,7 @@ from .types import (
     Profile,
     SendMessageResult,
     SessionEvent,
+    SessionJoinPayload,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -91,6 +92,7 @@ __all__ = [
     "JsonRpcRequest",
     "JsonRpcError",
     "SendMessageResult",
+    "SessionJoinPayload",
     "McpRequestPayload",
     "McpResponsePayload",
     # security primitives

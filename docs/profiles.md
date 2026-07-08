@@ -1,9 +1,10 @@
 # Profiles
 
 A **profile** packages everything the server needs to run a session on behalf
-of an agent: which LLM provider to call, how to authenticate with it, which
-fallback providers to try if the primary fails, which MCP servers are
-available, and which client-side tools agents are allowed to declare.
+of an agent: which LLM provider to call (by name, from the registry declared
+in `bae-config.toml`), which fallback providers to try if the primary fails,
+which MCP servers are available, and which client-side tools agents are
+allowed to declare.
 
 Profiles are managed via the admin API — see [admin-api.md](reference/admin-api.md).
 
@@ -11,40 +12,54 @@ Profiles are managed via the admin API — see [admin-api.md](reference/admin-ap
 
 ## Provider config
 
-The `provider_config` field of a profile describes the primary LLM:
+> **Alpha breaking change.** Prior to work item 0005, `primary_provider` and
+> `fallback_providers` were named `provider_config` and `fallback_configs`,
+> and each held an **inline config object** (`{provider, base_url, model,
+> auth_token, max_tokens}`). They now hold **registry name references** — a
+> single string and an array of strings — resolved against the `[providers]`
+> table in `bae-config.toml` at session-creation time, the same
+> opt-in-by-name model [MCP servers](#mcp-servers) already use. This is a
+> bigger change than the work item 0003 `mcp_servers` shape change (field
+> names changed, not just the array element type): existing profile data
+> using the old inline-object shape is silently broken (alpha status, no
+> migration) and must be recreated against named `[providers]` entries.
+
+The `primary_provider` field of a profile is the **name** of a `[providers]`
+entry declared in `bae-config.toml`:
 
 ```json
-{
-  "provider":   "anthropic",
-  "base_url":   "https://api.anthropic.com",
-  "model":      "claude-sonnet-4-6",
-  "auth_token": "${ANTHROPIC_API_KEY}",
-  "max_tokens": 8096
-}
+"primary_provider": "anthropic-sonnet"
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `provider` | yes | Provider name (currently `"anthropic"`). |
-| `base_url` | yes | Base URL for the provider's API. |
-| `model` | yes | Model identifier. |
-| `auth_token` | yes | API key or `${ENV_VAR}` reference (see below). |
-| `max_tokens` | no | Max tokens per response. Default `4096`. |
+At session creation (`POST /api/v1/sessions`) and at join
+(`POST /api/v1/sessions/{id}/join`), BAE resolves this name against the
+server's provider registry. Unlike `mcp_servers`, **a missing primary is
+fatal**: if the name isn't in the registry, the request is rejected with
+`422 primary_provider_unavailable` and no session (and no session key) is
+created. The failure is logged on every attempt (never deduplicated) — see
+[Fatal primary / non-fatal fallback](#fatal-primary--non-fatal-fallback)
+below.
+
+See [Configuration](reference/configuration.md#providers) for the full
+`[providers]` `bae-config.toml` schema, and
+[`examples/bae-config/providers.toml`](../examples/bae-config/providers.toml)
+for a runnable three-entry example.
 
 ---
 
 ## Referencing environment variables in `auth_token`
 
-`auth_token` may contain `${ENV_VAR_NAME}` tokens:
+`auth_token` in a `[providers]` registry entry may contain `${ENV_VAR_NAME}`
+tokens:
 
-```json
-"auth_token": "${ANTHROPIC_API_KEY}"
+```toml
+auth_token  = "${ANTHROPIC_API_KEY}"
 ```
 
 The server resolves these **immediately before** each provider call, holds
 the resolved value only for the duration of that HTTP request, and discards
 it immediately afterward. Resolved values are never written to the database,
-logs, or event payloads. The stored config retains the literal template string
+logs, or event payloads. The registry retains the literal template string
 (e.g. `"${ANTHROPIC_API_KEY}"`).
 
 Rules:
@@ -58,39 +73,31 @@ Rules:
   begins. If no fallback succeeds, `session.sendMessage` returns a terminal
   `result` with a "provider unavailable" message (SDKs raise `ProvidersFailedError`).
 
-The admin surface returns the literal template string (e.g.
-`"${ANTHROPIC_API_KEY}"`), not the resolved value. The client-facing session
-open response strips `auth_token` entirely.
+`GET /admin/v1/providers` (see [Configuration](reference/configuration.md#admin-endpoint-get-adminv1providers))
+returns the literal template string (e.g. `"${ANTHROPIC_API_KEY}"`), never
+the resolved value. The client-facing session open response strips
+`auth_token` entirely — it only ever surfaces `{"provider": "<kind>", "model": "<model>"}`.
 
 ---
 
-## Fallback configs
+## Fallback providers
 
-`fallback_configs` is an ordered array of provider configs tried if the
-primary fails:
+`fallback_providers` is an ordered array of **registry name strings** tried if
+the primary fails:
 
 ```json
-"fallback_configs": [
-  {
-    "provider":   "anthropic",
-    "base_url":   "https://api.anthropic.com",
-    "model":      "claude-haiku-4-5-20251001",
-    "auth_token": "${ANTHROPIC_API_KEY}",
-    "max_tokens": 4096
-  },
-  {
-    "provider":   "anthropic",
-    "base_url":   "https://api-fallback.example.com",
-    "model":      "claude-sonnet-4-6",
-    "auth_token": "${FALLBACK_API_KEY}",
-    "max_tokens": 8096
-  }
-]
+"fallback_providers": ["anthropic-haiku", "openai-gpt"]
 ```
 
-- Each entry has the same shape as `provider_config`.
+- Each name is resolved independently against the `[providers]` registry.
 - Fallbacks are tried in order after the primary fails. The first successful
   response ends the walk.
+- A profile's primary and fallbacks may resolve to **different provider
+  kinds** (e.g. an `anthropic`-kind primary with an `openai`-kind fallback,
+  or vice versa) — mixed-kind fallback chains work with no extra
+  configuration; each attempt is translated independently based on its own
+  registry entry's `provider` kind. See
+  [Configuration — `[providers]`](reference/configuration.md#providers).
 - If all providers fail, the session moves to `error` state. `session.sendMessage`
   returns a terminal `result` (HTTP 200) whose `message` contains a generic
   "provider unavailable" assistant turn and whose `events` include the failure
@@ -98,6 +105,24 @@ primary fails:
 - `"provider_call_failed"` events are recorded for each failing attempt;
   `"all_providers_failed"` is recorded if every attempt fails.
 - Omit or pass `[]` for no fallbacks (default).
+
+### Fatal primary / non-fatal fallback
+
+This is the one asymmetry between `primary_provider` and `fallback_providers`
+(mirroring the summary's requirement in the work item):
+
+| | Missing from `[providers]` registry | Session creation / join |
+|---|---|---|
+| `primary_provider` | Logged (`tracing::error!`, every attempt, never deduplicated) | **Fatal** — `422 primary_provider_unavailable`, no session created, no session key issued |
+| Each `fallback_providers` entry | Logged and skipped, independently per name | **Never fatal** — session creation succeeds with whatever subset resolved (including zero) |
+
+A profile whose `primary_provider` cannot be resolved blocks **every** client
+key associated with it from creating or joining sessions on that profile —
+not just the request that first surfaces the typo. If an already-open
+session's next `session.sendMessage` hits the same missing-primary condition
+(e.g. the server restarted with a changed `bae-config.toml`), that turn ends
+via the existing `session.error` (`reason: "provider_config"`) path instead
+of serving a message — see [Message Types](reference/message-types.md#sessionerror).
 
 ---
 
@@ -153,7 +178,7 @@ Behavior:
 ```json
 {
   "name": "server-only",
-  "provider_config": { … },
+  "primary_provider": "anthropic-sonnet",
   "allowed_tools": []
 }
 ```
@@ -165,7 +190,7 @@ Clients connecting with this profile must pass `"tools": []` at session open.
 ```json
 {
   "name": "assistant",
-  "provider_config": { … },
+  "primary_provider": "anthropic-sonnet",
   "allowed_tools": ["get_current_time", "search_web"]
 }
 ```
@@ -180,26 +205,16 @@ is accepted. A client declaring an additional tool not in the list is rejected.
 ```json
 {
   "name": "production-assistant",
-  "provider_config": {
-    "provider":   "anthropic",
-    "base_url":   "https://api.anthropic.com",
-    "model":      "claude-sonnet-4-6",
-    "auth_token": "${ANTHROPIC_API_KEY}",
-    "max_tokens": 8096
-  },
-  "fallback_configs": [
-    {
-      "provider":   "anthropic",
-      "base_url":   "https://api.anthropic.com",
-      "model":      "claude-haiku-4-5-20251001",
-      "auth_token": "${ANTHROPIC_API_KEY}",
-      "max_tokens": 4096
-    }
-  ],
+  "primary_provider": "anthropic-sonnet",
+  "fallback_providers": ["anthropic-haiku"],
   "mcp_servers": ["filesystem"],
   "allowed_tools": ["get_current_time", "read_file"]
 }
 ```
+
+This assumes `bae-config.toml` declares matching `[providers]` entries named
+`anthropic-sonnet` and `anthropic-haiku` — see
+[Configuration — `[providers]`](reference/configuration.md#providers).
 
 Create it:
 

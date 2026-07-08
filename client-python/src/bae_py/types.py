@@ -2,10 +2,10 @@
 the sanitized profile view.
 
 The event model is deliberately *closed*. ``EventType`` enumerates exactly the
-twelve strings the server may emit (api-contract §8); parsing an unknown string
-raises immediately, and :func:`describe_event` switches over every arm with an
-``assert_never`` fall-through, so adding a new event type without handling it is
-a loud failure rather than a silent pass-through.
+fourteen strings the server may emit (api-contract §8); parsing an unknown
+string raises immediately, and :func:`describe_event` switches over every arm
+with an ``assert_never`` fall-through, so adding a new event type without
+handling it is a loud failure rather than a silent pass-through.
 """
 
 from __future__ import annotations
@@ -156,7 +156,7 @@ class Profile:
 
 
 # ---------------------------------------------------------------------------
-# Session events (the closed twelve-member set)
+# Session events (the closed fourteen-member set)
 # ---------------------------------------------------------------------------
 
 
@@ -172,6 +172,8 @@ class EventType(str, Enum):
     MCP_REQUEST = "mcp.request"
     MCP_RESPONSE = "mcp.response"
     SESSION_OPEN = "session.open"
+    SESSION_JOIN = "session.join"
+    SESSION_DRIVER_REGISTER = "session.driver.register"
     SESSION_CLOSE = "session.close"
     SESSION_ERROR = "session.error"
     SESSION_COMPACTION = "session.compaction"
@@ -209,6 +211,31 @@ def parse_events(raw: Any) -> list[SessionEvent]:
 def assert_never(value: NoReturn) -> NoReturn:
     """Static-exhaustiveness marker: reaching this at runtime is a bug."""
     raise AssertionError(f"unhandled event type: {value!r}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-driver event payloads (WI 0005)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class SessionJoinPayload:
+    """Payload of a ``session.join`` event: a second (or further) client key
+    minted a session key for an existing session via ``POST …/join``. Same shape
+    as ``session.open``; the joining client is the event's ``client_key_id``.
+    Parse it from a :class:`SessionEvent` whose ``event_type`` is
+    :attr:`EventType.SESSION_JOIN`.
+    """
+
+    client_version: str | None
+    tools: list[str]
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "SessionJoinPayload":
+        return cls(
+            client_version=payload.get("client_version"),
+            tools=list(payload.get("tools") or []),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +372,10 @@ def describe_event(event: SessionEvent) -> str:
             return f"MCP response from {server} (ok={event.payload.get('ok')})"
         case EventType.SESSION_OPEN:
             return "session opened"
+        case EventType.SESSION_JOIN:
+            return "driver joined the session"
+        case EventType.SESSION_DRIVER_REGISTER:
+            return "driver registered"
         case EventType.SESSION_CLOSE:
             return f"session closed ({event.payload.get('reason')})"
         case EventType.SESSION_ERROR:

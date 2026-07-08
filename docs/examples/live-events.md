@@ -17,7 +17,16 @@ For the conceptual overview see [Event Streaming](../guides/event-streaming.md).
 ## Method 1 — Inline notifications during `session.sendMessage`
 
 Every `session.sendMessage` call streams `session.event` notifications before
-the terminal result. No additional call is needed.
+the terminal result. No additional call is needed — beyond the one-time
+`session.registerDriver` every session key must make before its first
+`session.sendMessage` (SDKs do this automatically inside `connect()`):
+
+```sh
+curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
+  -H "Authorization: Bearer $SESSION_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"session.registerDriver","params":{}}'
+```
 
 ### curl
 
@@ -25,7 +34,7 @@ the terminal result. No additional call is needed.
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
   -H "Authorization: Bearer $SESSION_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"session.sendMessage","params":{"message":{"role":"user","content":"What is 2+2?"}}}' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"session.sendMessage","params":{"message":{"role":"user","content":"What is 2+2?"}}}' \
 | while IFS= read -r line; do
     # Check whether this line is a notification or the terminal result
     if echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if 'id' not in d else 1)" 2>/dev/null; then

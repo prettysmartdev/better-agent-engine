@@ -9,7 +9,7 @@
 //! and `version`. `serve` is assumed when no subcommand is given.
 //!
 //! The single global flag is `--config <path>`, giving the path to an optional
-//! `bae-config.toml` (the MCP server registry). It may appear before or after
+//! `bae-config.toml` (the MCP server and LLM provider registries). It may appear before or after
 //! the subcommand (`baesrv --config x`, `baesrv serve --config x`). When both
 //! `--config` and the `BAE_CONFIG` env var are set, `--config` wins — the
 //! flag-beats-env-var precedence `aspec/uxui/cli.md` commits to.
@@ -105,9 +105,10 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
     };
     init_tracing(&config.log);
 
-    // Load the optional MCP server registry from bae-config.toml (via --config
-    // or BAE_CONFIG). A missing file is not an error; a malformed one is.
-    let mcp_registry = match load_mcp_registry(config_flag) {
+    // Load the optional MCP server + provider registries from bae-config.toml
+    // (via --config or BAE_CONFIG). A missing file is not an error; a
+    // malformed one is.
+    let (mcp_registry, provider_registry) = match load_registries(config_flag) {
         Ok(r) => r,
         Err(code) => return code,
     };
@@ -132,7 +133,7 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    match runtime.block_on(crate::serve(config, store, mcp_registry)) {
+    match runtime.block_on(crate::serve(config, store, mcp_registry, provider_registry)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
@@ -141,37 +142,47 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// Resolve `--config`/`BAE_CONFIG`, load and validate the MCP server registry.
-/// A missing file (or neither source set) yields an empty registry with no
-/// error; a malformed file or a structural error (duplicate name, unsupported
-/// transport) is a usage error (exit 2). Tracing is already initialised here, so
-/// authoring errors are also echoed to stderr like other config errors.
-fn load_mcp_registry(
-    config_flag: Option<PathBuf>,
-) -> Result<std::collections::HashMap<String, crate::config_file::McpServerConfig>, ExitCode> {
+/// The `(mcp, providers)` registry pair parsed from one `bae-config.toml`.
+type Registries = (
+    std::collections::HashMap<String, crate::config_file::McpServerConfig>,
+    std::collections::HashMap<String, crate::engine::provider::ProviderConfig>,
+);
+
+/// Resolve `--config`/`BAE_CONFIG`, load and validate the MCP server and
+/// provider registries. A missing file (or neither source set) yields empty
+/// registries with no error; a malformed file or a structural error (duplicate
+/// name, unsupported transport/provider kind) is a usage error (exit 2).
+/// Tracing is already initialised here, so authoring errors are also echoed to
+/// stderr like other config errors.
+fn load_registries(config_flag: Option<PathBuf>) -> Result<Registries, ExitCode> {
     let path = resolve_config_path(config_flag);
-    load_mcp_registry_from(path.as_deref()).map_err(|e| {
+    load_registries_from(path.as_deref()).map_err(|e| {
         eprintln!("baesrv: configuration error: {e}");
         ExitCode::from(e.exit_code() as u8)
     })
 }
 
-/// Path-driven half of [`load_mcp_registry`], split out for testability.
-fn load_mcp_registry_from(
+/// Path-driven half of [`load_registries`], split out for testability. The
+/// file is loaded once and both registries are built from the same parse.
+fn load_registries_from(
     path: Option<&Path>,
-) -> Result<
-    std::collections::HashMap<String, crate::config_file::McpServerConfig>,
-    crate::config_file::ConfigFileError,
-> {
+) -> Result<Registries, crate::config_file::ConfigFileError> {
     let file = BaeConfigFile::load(path)?;
-    let registry = file.mcp_registry()?;
-    if !registry.is_empty() {
+    let mcp = file.mcp_registry()?;
+    if !mcp.is_empty() {
         tracing::info!(
-            count = registry.len(),
+            count = mcp.len(),
             "loaded MCP server registry from bae-config.toml"
         );
     }
-    Ok(registry)
+    let providers = file.provider_registry()?;
+    if !providers.is_empty() {
+        tracing::info!(
+            count = providers.len(),
+            "loaded provider registry from bae-config.toml"
+        );
+    }
+    Ok((mcp, providers))
 }
 
 fn run_migrate() -> ExitCode {
@@ -232,8 +243,9 @@ COMMANDS:
     help       Print this message
 
 OPTIONS:
-    --config <path>   Path to an optional bae-config.toml (MCP server
-                      registry). May also be set via the BAE_CONFIG env var;
+    --config <path>   Path to an optional bae-config.toml (MCP server and
+                      LLM provider registries). May also be set via the
+                      BAE_CONFIG env var;
                       when both are set, --config wins. A missing file is not
                       an error (empty registry).
 
@@ -249,12 +261,9 @@ mod tests {
 
     #[test]
     fn extracts_config_flag_space_form() {
-        let (path, rest) = parse_config_flag(&[
-            "serve".into(),
-            "--config".into(),
-            "/etc/bae.toml".into(),
-        ])
-        .unwrap();
+        let (path, rest) =
+            parse_config_flag(&["serve".into(), "--config".into(), "/etc/bae.toml".into()])
+                .unwrap();
         assert_eq!(path, Some(PathBuf::from("/etc/bae.toml")));
         assert_eq!(rest, vec!["serve".to_string()]);
     }
@@ -305,9 +314,12 @@ mod tests {
     #[test]
     fn missing_registry_file_is_empty_no_error() {
         let path = std::env::temp_dir().join("baesrv-cli-absent.toml");
-        let reg = load_mcp_registry_from(Some(&path)).unwrap();
-        assert!(reg.is_empty());
+        let (mcp, providers) = load_registries_from(Some(&path)).unwrap();
+        assert!(mcp.is_empty());
+        assert!(providers.is_empty());
         // Neither source set → None → empty.
-        assert!(load_mcp_registry_from(None).unwrap().is_empty());
+        let (mcp, providers) = load_registries_from(None).unwrap();
+        assert!(mcp.is_empty());
+        assert!(providers.is_empty());
     }
 }

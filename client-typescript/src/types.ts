@@ -99,7 +99,7 @@ export interface Profile {
 // handling it here is a compile error.
 // ---------------------------------------------------------------------------
 
-/** The closed set of 12 event type strings. */
+/** The closed set of 14 event type strings. */
 export type EventType =
   | "client.message.send"
   | "server.message.send"
@@ -110,6 +110,8 @@ export type EventType =
   | "mcp.request"
   | "mcp.response"
   | "session.open"
+  | "session.join"
+  | "session.driver.register"
   | "session.close"
   | "session.error"
   | "session.compaction";
@@ -194,6 +196,21 @@ export interface SessionOpenPayload {
   client_version: string | null;
   tools: string[];
 }
+/**
+ * Payload of a `session.join` event: a second (or further) client key minted a
+ * session key for an existing session via `POST …/join`. Same shape as
+ * `session.open`; the joining client is the event's `client_key_id`.
+ */
+export interface SessionJoinPayload {
+  client_version: string | null;
+  tools: string[];
+}
+/**
+ * Payload of a `session.driver.register` event: a client key registered as a
+ * driver via `session.registerDriver`. The actor is the event's
+ * `client_key_id`; the payload itself carries no fields.
+ */
+export type SessionDriverRegisterPayload = Record<string, never>;
 export interface SessionClosePayload {
   reason: "client_close" | "client_key_revoked";
 }
@@ -202,6 +219,8 @@ export interface SessionErrorPayload {
     | "provider_config"
     | "provider_call_failed"
     | "all_providers_failed"
+    | "primary_provider_unavailable"
+    | "driver_turn_abandoned"
     | "loop_limit"
     | "profile_unavailable";
   [key: string]: unknown;
@@ -221,6 +240,8 @@ interface EventPayloads {
   "mcp.request": McpRequestPayload;
   "mcp.response": McpResponsePayload;
   "session.open": SessionOpenPayload;
+  "session.join": SessionJoinPayload;
+  "session.driver.register": SessionDriverRegisterPayload;
   "session.close": SessionClosePayload;
   "session.error": SessionErrorPayload;
   "session.compaction": SessionCompactionPayload;
@@ -271,6 +292,10 @@ export function describeEvent(event: SessionEvent): string {
       return `mcp response from ${event.payload.server_name ?? "<unrouted>"} (ok=${event.payload.ok})`;
     case "session.open":
       return "session opened";
+    case "session.join":
+      return "driver joined the session";
+    case "session.driver.register":
+      return "driver registered";
     case "session.close":
       return `session closed (${event.payload.reason})`;
     case "session.error":
@@ -296,6 +321,7 @@ export function describeEvent(event: SessionEvent): string {
 /** JSON-RPC methods the session loop understands. */
 export type RpcMethod =
   | "session.sendMessage"
+  | "session.registerDriver"
   | "session.subscribe"
   | "session.unsubscribe";
 

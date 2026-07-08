@@ -1,0 +1,57 @@
+# bae-config.toml — the [providers] LLM provider registry
+#
+# Providers are declared once here and referenced by profiles by name, the
+# same opt-in-by-name model as [mcp]:
+#
+#   POST /admin/v1/profiles
+#   { "name": "assistant",
+#     "primary_provider": "anthropic-sonnet",
+#     "fallback_providers": ["openai-gpt"] }
+#
+# `provider` selects a WIRE FORMAT ("anthropic" = Messages API,
+# "openai" = Chat Completions), not a vendor. `base_url` is optional: omitted,
+# it defaults to that kind's own SaaS endpoint (https://api.anthropic.com /
+# https://api.openai.com); when set, it is always used verbatim, regardless of
+# `provider` — any endpoint speaking either format works.
+#
+# `${ENV_VAR}` tokens in auth_token are resolved only at call time, from the
+# server's environment; they are never persisted or logged.
+#
+# A profile whose *primary* provider name is not declared here cannot open
+# sessions or send messages (422 primary_provider_unavailable); a missing
+# *fallback* name is logged and skipped, never fatal.
+#
+# Point the server at this file with either:
+#   baesrv --config examples/bae-config/providers.toml
+#   BAE_CONFIG=examples/bae-config/providers.toml baesrv
+#
+# [providers] and [mcp] coexist in one file; their names are separate
+# registries, so a provider and an MCP server may share a name.
+
+[providers]
+
+# Anthropic, default SaaS endpoint (base_url omitted).
+[[providers.entries]]
+name        = "anthropic-sonnet"
+provider    = "anthropic"
+model       = "claude-sonnet-4-6"
+auth_token  = "${ANTHROPIC_API_KEY}"
+max_tokens  = 8096
+
+# OpenAI, default SaaS endpoint (base_url omitted).
+[[providers.entries]]
+name        = "openai-gpt"
+provider    = "openai"
+model       = "gpt-5"
+auth_token  = "${OPENAI_API_KEY}"
+max_tokens  = 8096
+
+# Anthropic-*compatible* wire format at a non-Anthropic endpoint (e.g. a
+# self-hosted proxy or gateway that speaks the Messages API) — base_url
+# always wins when set, regardless of `provider`.
+[[providers.entries]]
+name        = "self-hosted-claude-gateway"
+provider    = "anthropic"
+base_url    = "https://llm-gateway.internal.example.com"
+model       = "claude-sonnet-4-6"
+auth_token  = "${INTERNAL_GATEWAY_TOKEN}"

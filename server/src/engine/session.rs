@@ -8,10 +8,16 @@
 //! 2. Before each provider call, insert a `provider.request` event (the full
 //!    request payload, minus the resolved auth token).
 //! 3. Call the primary provider. On failure, insert a `provider.response`
-//!    failure event and a `session.error` context event, then walk
-//!    `fallback_configs` in order — inserting a `provider.response` for **every**
-//!    attempt, success or failure — until one succeeds.
-//! 4. On success, insert a `provider.response` with the raw body.
+//!    failure event and a `session.error` context event, then walk the
+//!    profile's `fallback_providers` in order — inserting a `provider.response`
+//!    for **every** attempt, success or failure — until one succeeds. Provider
+//!    names are resolved against the startup registry: a missing primary ends
+//!    the turn (defensive re-check — session creation already refuses an
+//!    unresolvable primary), missing fallbacks are logged and skipped.
+//! 4. On success, insert a `provider.response` with the raw wire body — for an
+//!    OpenAI-kind attempt that is the untranslated Chat Completions response;
+//!    the loop itself only ever consumes the canonical translation
+//!    [`provider::call`] hands back, so this module stays wire-format-agnostic.
 //! 5. If the response contains tool calls, insert a `tool.call` per call.
 //!    Client-side tools (declared by the client at session open) are returned to
 //!    the client for execution and the turn pauses. MCP tools are dispatched to
@@ -101,24 +107,39 @@ fn log_event(
 /// Run one client turn. The caller has already inserted the incoming
 /// `client.message.send` (and any `tool.result` events for returned tool
 /// output) before calling this.
+///
+/// `acting_client_key_id` is the client key driving this turn (the same id the
+/// FIFO turn lock records as the turn's owner). It scopes the turn in two
+/// ways: only the acting client's own entry in the session's per-client
+/// `client_tools` object is advertised to the provider — another driver's
+/// private tools are never sent during this turn, so the model cannot request
+/// a tool the turn's owner doesn't implement — and every event the turn logs
+/// is attributed to it, not to the session's original creator.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     store: &Store,
     http: &reqwest::Client,
     broadcaster: &EventBroadcaster,
     session: &SessionRecord,
     profile: &ProfileRecord,
+    provider_registry: &std::collections::HashMap<String, ProviderConfig>,
     mcp: Option<Arc<Mutex<McpSession>>>,
+    acting_client_key_id: &str,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
-    let cid = session.client_key_id.as_str();
+    let cid = acting_client_key_id;
     let mut events: Vec<EventRecord> = Vec::new();
 
-    // The client-side tools the LLM is allowed to call. Only these count as
-    // "client dispatch"; MCP tools (merged below) route to the MCP path.
-    let client_tools: Vec<Value> = match &session.client_tools {
-        Value::Array(a) => a.clone(),
-        _ => Vec::new(),
-    };
+    // The acting client's own client-side tools — only these count as "client
+    // dispatch" and only these are advertised alongside the session-wide MCP
+    // tools (merged below); other drivers' entries in the per-client object
+    // are never read.
+    let client_tools: Vec<Value> = session
+        .client_tools
+        .get(acting_client_key_id)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let client_tool_names: HashSet<String> = client_tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
@@ -138,23 +159,42 @@ pub async fn run_turn(
     };
     let tools_value = Value::Array(advertised_tools);
 
-    // Parse provider configs. A malformed primary config is an operator error:
-    // record it and end as ProvidersFailed rather than panicking.
-    let (primary, fallbacks) =
-        match provider::configs_from_profile(&profile.provider_config, &profile.fallback_configs) {
-            Ok(v) => v,
-            Err(e) => {
-                events.push(log_event(
-                    store,
-                    broadcaster,
-                    sid,
-                    cid,
-                    EventType::SessionError,
-                    json!({ "reason": "provider_config", "detail": e.to_string() }),
-                )?);
-                return finish_failed(store, sid, events);
-            }
-        };
+    // Resolve the profile's provider name references against the startup
+    // registry. A non-string primary reference or a primary name absent from
+    // the registry is an operator error — the latter is a defensive re-check
+    // (session creation already refuses an unresolvable primary; the registry
+    // or profile may have changed since): record it and end as ProvidersFailed
+    // rather than panicking. Missing fallback names are logged and skipped
+    // inside the resolver, never fatal.
+    let fallback_names: Vec<String> = profile
+        .fallback_configs
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let resolved = match profile.provider_config.as_str() {
+        Some(name) => provider::resolve_from_profile(provider_registry, name, &fallback_names),
+        None => Err(provider::ProviderConfigError::Malformed(
+            "primary_provider is not a string".to_string(),
+        )),
+    };
+    let (primary, fallbacks) = match resolved {
+        Ok(v) => v,
+        Err(e) => {
+            events.push(log_event(
+                store,
+                broadcaster,
+                sid,
+                cid,
+                EventType::SessionError,
+                json!({ "reason": "provider_config", "detail": e.to_string() }),
+            )?);
+            return finish_failed(store, sid, events);
+        }
+    };
     let configs: Vec<ProviderConfig> = std::iter::once(primary).chain(fallbacks).collect();
 
     // History streamed from the log; extended in-memory across MCP round-trips.
@@ -178,8 +218,8 @@ pub async fn run_turn(
                 json!({
                     "attempt": i,
                     "kind": kind,
-                    "provider": cfg.provider,
-                    "base_url": cfg.base_url,
+                    "provider": cfg.provider.as_str(),
+                    "base_url": cfg.effective_base_url(),
                     "model": cfg.model,
                     "max_tokens": cfg.max_tokens,
                     "messages": history_value,
@@ -188,16 +228,18 @@ pub async fn run_turn(
             )?);
 
             match provider::call(http, cfg, &history_value, &tools_value).await {
-                Ok(body) => {
+                Ok(resp) => {
+                    // The event records the raw, untranslated wire body; the
+                    // loop consumes only the canonical translation.
                     events.push(log_event(
                         store,
                         broadcaster,
                         sid,
                         cid,
                         EventType::ProviderResponse,
-                        json!({ "attempt": i, "kind": kind, "provider": cfg.provider, "ok": true, "status": 200, "body": body }),
+                        json!({ "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": true, "status": 200, "body": resp.raw }),
                     )?);
-                    success = Some(body);
+                    success = Some(resp.canonical);
                     break;
                 }
                 Err(e) => {
@@ -208,7 +250,7 @@ pub async fn run_turn(
                         cid,
                         EventType::ProviderResponse,
                         json!({
-                            "attempt": i, "kind": kind, "provider": cfg.provider, "ok": false,
+                            "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": false,
                             "status": e.status(), "error": e.detail(), "body": e.body(),
                         }),
                     )?);
@@ -221,7 +263,7 @@ pub async fn run_turn(
                             sid,
                             cid,
                             EventType::SessionError,
-                            json!({ "reason": "provider_call_failed", "provider": cfg.provider, "detail": e.detail() }),
+                            json!({ "reason": "provider_call_failed", "provider": cfg.provider.as_str(), "detail": e.detail() }),
                         )?);
                     }
                 }
@@ -279,7 +321,14 @@ pub async fn run_turn(
             if !is_client {
                 payload["server_name"] = json!(mcp_routes.get(name));
             }
-            events.push(log_event(store, broadcaster, sid, cid, EventType::ToolCall, payload)?);
+            events.push(log_event(
+                store,
+                broadcaster,
+                sid,
+                cid,
+                EventType::ToolCall,
+                payload,
+            )?);
         }
 
         let has_client_tool = tool_uses

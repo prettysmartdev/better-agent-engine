@@ -54,11 +54,19 @@ pub enum EventType {
     /// Session history was compacted (summary event).
     #[serde(rename = "session.compaction")]
     SessionCompaction,
+    /// A second (or further) client key minted a session key for an existing
+    /// session via `POST /api/v1/sessions/{id}/join`.
+    #[serde(rename = "session.join")]
+    SessionJoin,
+    /// A client key registered as a driver via the `session.registerDriver`
+    /// JSON-RPC method.
+    #[serde(rename = "session.driver.register")]
+    SessionDriverRegistered,
 }
 
 impl EventType {
     /// Every variant, in definition order. Handy for tests and documentation.
-    pub const ALL: [EventType; 12] = [
+    pub const ALL: [EventType; 14] = [
         EventType::ClientMessageSend,
         EventType::ServerMessageSend,
         EventType::ProviderRequest,
@@ -71,6 +79,8 @@ impl EventType {
         EventType::SessionClose,
         EventType::SessionError,
         EventType::SessionCompaction,
+        EventType::SessionJoin,
+        EventType::SessionDriverRegistered,
     ];
 
     /// The canonical wire/storage string for this event type.
@@ -91,6 +101,8 @@ impl EventType {
             EventType::SessionClose => "session.close",
             EventType::SessionError => "session.error",
             EventType::SessionCompaction => "session.compaction",
+            EventType::SessionJoin => "session.join",
+            EventType::SessionDriverRegistered => "session.driver.register",
         }
     }
 }
@@ -134,7 +146,7 @@ mod tests {
         for ev in EventType::ALL {
             assert!(seen.insert(ev.as_str()), "duplicate wire string: {ev}");
         }
-        assert_eq!(seen.len(), 12);
+        assert_eq!(seen.len(), 14);
     }
 
     #[test]

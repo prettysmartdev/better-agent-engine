@@ -357,6 +357,22 @@ pub struct SendMessageResult {
     pub events: Vec<EventView>,
 }
 
+/// Payload of a `session.join` session event: a second (or further) client key
+/// minted a session key for an existing session via `POST …/join`. Carried in
+/// the `payload` of an [`EventView`] whose `event_type` is `"session.join"`;
+/// the joining client is identified by the event's `client_key_id`. Same shape
+/// as the `session.open` payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionJoinPayload {
+    /// The joining client's declared `client_version`, if any.
+    #[serde(default)]
+    pub client_version: Option<String>,
+    /// The names of the tools the joining client declared (independent of any
+    /// other driver's set).
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
 /// Payload of an `mcp.request` session event: the engine dispatching a tool
 /// call to a configured MCP server. Carried in the `payload` of an
 /// [`EventView`] whose `event_type` is `"mcp.request"`.

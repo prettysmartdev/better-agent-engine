@@ -115,17 +115,58 @@ pub struct CreateSession {
 }
 
 /// Client-safe projection of a profile (no `auth_token`, no env var names).
-fn public_profile(p: &ProfileRecord) -> Value {
+/// The `provider` sub-object is resolved from the profile's `primary_provider`
+/// registry name — never the registry name's raw config (which carries the
+/// auth token template).
+fn public_profile(state: &AppState, p: &ProfileRecord) -> Value {
+    let provider = p
+        .provider_config
+        .as_str()
+        .and_then(|name| state.provider_registry.get(name))
+        .map(|cfg| json!({ "provider": cfg.provider.as_str(), "model": cfg.model }))
+        .unwrap_or_else(|| json!({ "provider": Value::Null, "model": Value::Null }));
     json!({
         "id": p.id,
         "name": p.name,
         "allowed_tools": p.allowed_tools,
         "mcp_servers": p.mcp_servers,
-        "provider": {
-            "provider": p.provider_config.get("provider").cloned().unwrap_or(Value::Null),
-            "model": p.provider_config.get("model").cloned().unwrap_or(Value::Null),
-        },
+        "provider": provider,
     })
+}
+
+/// Enforce a profile's tool allowlist against a client's declared tools. An
+/// empty allowlist permits no tools. Shared by `create` and `join` — each
+/// client's declaration is validated independently against the same profile.
+fn enforce_tool_allowlist(
+    profile: &ProfileRecord,
+    tools: &[ClientToolDef],
+) -> Result<(), ApiError> {
+    let allowed: HashSet<&str> = profile
+        .allowed_tools
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for tool in tools {
+        if !allowed.contains(tool.name.as_str()) {
+            return Err(ApiError::forbidden(
+                "tool_not_allowed",
+                format!("tool {:?} is not in the profile's allowlist", tool.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The declared tools as the JSON array the engine advertises to the LLM.
+fn declared_tools_json(tools: &[ClientToolDef]) -> Value {
+    json!(tools
+        .iter()
+        .map(|t| json!({
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.input_schema.clone().unwrap_or_else(|| json!({})),
+        }))
+        .collect::<Vec<_>>())
 }
 
 pub async fn create(
@@ -149,31 +190,27 @@ pub async fn create(
         None => return profile_unavailable_at_open(&state, &client_key, &profile_id, &body),
     };
 
-    // Enforce the tool allowlist. An empty allowlist permits no tools.
-    let allowed: HashSet<&str> = profile
-        .allowed_tools
-        .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    for tool in &body.tools {
-        if !allowed.contains(tool.name.as_str()) {
-            return Err(ApiError::forbidden(
-                "tool_not_allowed",
-                format!("tool {:?} is not in the profile's allowlist", tool.name),
-            ));
-        }
+    // The profile's primary provider must resolve against the startup registry
+    // before a session can exist at all — a missing primary is fatal for every
+    // client on this profile (unlike missing fallbacks/MCP servers, which are
+    // logged and skipped at use time).
+    let primary_provider = profile.provider_config.as_str().unwrap_or_default();
+    if !state.provider_registry.contains_key(primary_provider) {
+        return primary_provider_unavailable_at_open(
+            &state,
+            &client_key,
+            &profile,
+            primary_provider,
+            &body,
+        );
     }
 
-    // Persist the declared tools as-is for the engine to advertise to the LLM.
-    let client_tools = json!(body
-        .tools
-        .iter()
-        .map(|t| json!({
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.input_schema.clone().unwrap_or_else(|| json!({})),
-        }))
-        .collect::<Vec<_>>());
+    // Enforce the tool allowlist. An empty allowlist permits no tools.
+    enforce_tool_allowlist(&profile, &body.tools)?;
+
+    // Persist the declared tools as-is for the engine to advertise to the LLM
+    // (stored under this client's own key in the per-client tools object).
+    let client_tools = declared_tools_json(&body.tools);
 
     let session_key = keys::generate_session_key();
     let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
@@ -224,8 +261,146 @@ pub async fn create(
         Json(json!({
             "session_id": session.id,
             "session_key": session_key.plaintext,
-            "profile": public_profile(&profile),
+            "profile": public_profile(&state, &profile),
         })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/sessions/{id}/join
+// ---------------------------------------------------------------------------
+
+/// Mint an additional session key for an existing open session, so a second
+/// (third, …) client key can drive/observe it. Body: the same shape as
+/// [`CreateSession`].
+///
+/// The core guard is the **profile match**: the joining client key must be
+/// bound to the exact profile the session was opened with — a client on a
+/// different profile is rejected with `403 profile_mismatch` before any event
+/// is logged or session key minted (an authorization failure at the client-key
+/// level, same posture as `tool_not_allowed`). The joiner declares its own,
+/// independent tool set (validated against the shared profile's allowlist and
+/// stored under its own key in the per-client `client_tools` object — never
+/// merged with any other driver's list), and existing participants see the
+/// join live via a broadcast `session.join` event.
+pub async fn join(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CreateSession>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let client_key = auth_client(&state, &headers)?;
+
+    let session = state
+        .store
+        .with_conn(|c| sessions::get_session(c, &id))
+        .map_err(ApiError::from_db)?;
+    let session = session.ok_or_else(|| ApiError::not_found(format!("no session {id}")))?;
+    // A joiner cannot resurrect a terminal session.
+    if session.state != STATE_OPEN {
+        return Err(ApiError::conflict(
+            "session_closed",
+            format!("session is already {}", session.state),
+        ));
+    }
+
+    // The client → profile → session mapping: a client key on a different
+    // profile must never attach to this session.
+    if client_key.profile_id.as_deref() != Some(session.profile_id.as_str()) {
+        return Err(ApiError::forbidden(
+            "profile_mismatch",
+            "the client key's profile does not match this session's profile",
+        ));
+    }
+
+    // Load the shared profile; it may have been deleted since the session
+    // opened. Same rejection posture as `create`.
+    let profile = state
+        .store
+        .with_conn(|c| profiles::get(c, &session.profile_id))
+        .map_err(ApiError::from_db)?;
+    let profile = match profile {
+        Some(p) => p,
+        None => {
+            return profile_unavailable_at_open(&state, &client_key, &session.profile_id, &body)
+        }
+    };
+
+    // The primary provider must still resolve — the same fatal-for-the-profile
+    // check `create` performs, re-run on every join attempt.
+    let primary_provider = profile.provider_config.as_str().unwrap_or_default();
+    if !state.provider_registry.contains_key(primary_provider) {
+        return primary_provider_unavailable_at_open(
+            &state,
+            &client_key,
+            &profile,
+            primary_provider,
+            &body,
+        );
+    }
+
+    // The joiner's own tool declaration, against the same profile's allowlist.
+    enforce_tool_allowlist(&profile, &body.tools)?;
+    let client_tools = declared_tools_json(&body.tools);
+    let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
+
+    // Upsert this client's tools entry, mint its session key, and log the join
+    // under one lock; publish the join event to live watchers afterwards.
+    let session_key = keys::generate_session_key();
+    let join_event = state.store.with_conn(|c| {
+        sessions::set_client_tools(c, &session.id, &client_key.id, &client_tools)
+            .map_err(ApiError::from_db)?;
+        keys::insert_session_key(
+            c,
+            &session.id,
+            &client_key.id,
+            &session.profile_id,
+            &session_key,
+        )
+        .map_err(|e| match e {
+            keys::InsertError::Sqlite(e) => ApiError::from_db(e),
+            keys::InsertError::Key(e) => {
+                tracing::error!("session key hashing failed: {e}");
+                ApiError::internal("failed to hash session key")
+            }
+        })?;
+        sessions::insert_event(
+            c,
+            &session.id,
+            Some(&client_key.id),
+            EventType::SessionJoin,
+            &json!({ "client_version": body.client_version, "tools": tool_names }),
+        )
+        .map_err(ApiError::from_db)
+    })?;
+    state.broadcaster.publish(&join_event);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "session_id": session.id,
+            "session_key": session_key.plaintext,
+            "profile": public_profile(&state, &profile),
+        })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/sessions/{id}/participants
+// ---------------------------------------------------------------------------
+
+/// The session's currently-registered drivers, from the in-memory registry.
+/// Live-only by design (lost on restart, like the MCP/broadcast state): the
+/// durable "who ever joined" record is the event log's `session.open` /
+/// `session.join` / `session.driver.register` events.
+pub async fn participants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (session, _key) = auth_session(&state, &headers, &id)?;
+    Ok(Json(
+        json!({ "drivers": state.registered_drivers(&session.id) }),
     ))
 }
 
@@ -348,6 +523,61 @@ fn profile_unavailable_at_open(
     ))
 }
 
+/// Handle a profile whose `primary_provider` name does not resolve against the
+/// startup registry: log the operator error (on **every** attempt, never
+/// deduplicated — same posture as the MCP "not found" logging), record an
+/// error session and a `session.error` event (matching
+/// [`profile_unavailable_at_open`]'s pattern), and reject with
+/// `422 primary_provider_unavailable`. No open session is created and no
+/// session key is issued.
+fn primary_provider_unavailable_at_open(
+    state: &AppState,
+    client_key: &KeyRecord,
+    profile: &ProfileRecord,
+    primary_provider: &str,
+    body: &CreateSession,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    tracing::error!(
+        profile_id = %profile.id,
+        profile_name = %profile.name,
+        primary_provider = %primary_provider,
+        "profile's primary provider not found in bae-config.toml; refusing to open a session"
+    );
+    let client_tools = json!(body
+        .tools
+        .iter()
+        .map(|t| json!({"name": t.name}))
+        .collect::<Vec<_>>());
+    let _ = state.store.with_conn(|c| -> rusqlite::Result<()> {
+        let session = sessions::create_session(
+            c,
+            &client_key.id,
+            &profile.id,
+            STATE_ERROR,
+            body.client_version.as_deref(),
+            &client_tools,
+        )?;
+        sessions::insert_event(
+            c,
+            &session.id,
+            Some(&client_key.id),
+            EventType::SessionError,
+            &json!({
+                "reason": "primary_provider_unavailable",
+                "profile_id": profile.id,
+                "primary_provider": primary_provider,
+            }),
+        )?;
+        Ok(())
+    });
+    Err(ApiError::unprocessable(
+        "primary_provider_unavailable",
+        format!(
+            "the profile's primary provider {primary_provider:?} is not configured in bae-config.toml"
+        ),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Message body (shared with the JSON-RPC `session.sendMessage` method)
 // ---------------------------------------------------------------------------
@@ -464,12 +694,15 @@ pub async fn close(
     // resources are already gone (e.g. a double DELETE).
     //
     // Drop the broadcast channel (dropping the sender ends every live watcher's
-    // stream cleanly), then tear down any live MCP connections (kill spawned
-    // stdio subprocesses and drop the registry entry).
+    // stream cleanly), tear down any live MCP connections (kill spawned stdio
+    // subprocesses and drop the registry entry), then clear the session's
+    // multi-client runtime state (driver registrations, turn gate, and any
+    // parked paused turn — whose dropped guard frees queued waiters).
     state.broadcaster.remove(&session.id);
     if let Some(mcp) = state.take_mcp_session(&session.id) {
         mcp.lock().await.shutdown().await;
     }
+    state.remove_session_runtime(&session.id);
 
     if !closed {
         return Err(ApiError::conflict(
@@ -509,11 +742,7 @@ mod tests {
     #[test]
     fn valid_names_resolve_and_a_middle_miss_does_not_short_circuit() {
         let reg = registry(&["fs", "search"]);
-        let names = vec![
-            "fs".to_string(),
-            "ghost".to_string(),
-            "search".to_string(),
-        ];
+        let names = vec!["fs".to_string(), "ghost".to_string(), "search".to_string()];
         let (resolved, missing) = resolve_registry_names(&reg, &names);
         // The miss between two valid names must not drop the trailing valid one.
         let resolved_names: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();

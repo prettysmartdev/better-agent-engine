@@ -13,7 +13,7 @@ The admin port (`BAE_ADMIN_ADDR`, default `127.0.0.1:8081`) is **REST/HTTP
 throughout** — no JSON-RPC anywhere on the admin port.
 
 This page documents the JSON-RPC transport mechanics. For method params and
-result shapes see [Client API — `/rpc` methods](client-api.md#post-apiv1sessionsidrcpjson-rpc-session-loop).
+result shapes see [Client API — `/rpc` methods](client-api.md#post-apiv1sessionsidrpc--json-rpc-session-loop).
 
 ---
 
@@ -36,7 +36,7 @@ Send a single JSON object:
 |---|---|---|
 | `jsonrpc` | yes | must be the string `"2.0"` |
 | `id` | recommended | any JSON string or integer — echoed back on the terminal response. Omitting `id` makes the request a **notification**: the server performs the method's side effect but sends **no terminal response** (not even an error). Always send an `id` unless you deliberately want fire-and-forget. |
-| `method` | yes | one of `session.sendMessage`, `session.subscribe`, `session.unsubscribe` |
+| `method` | yes | one of `session.registerDriver`, `session.sendMessage`, `session.subscribe`, `session.unsubscribe` |
 | `params` | yes | method-specific object (see [Client API](client-api.md)) |
 
 ### Notification (server → client)
@@ -137,6 +137,7 @@ Errors on `POST /api/v1/sessions/{id}/rpc` are JSON-RPC error objects:
 | `-32602` | Invalid params | Required params are missing or have the wrong type. |
 | `-32603` | Internal error | Unexpected server error (e.g. database failure). |
 | `-32000` | Application error | Session is not in `open` state, profile was deleted mid-session, or the broadcast channel was overrun (see `"lagged"` below). |
+| `-32001` | Driver not registered | `session.sendMessage` called before `session.registerDriver` on this connection's client key. See [FIFO turn ownership](#fifo-turn-ownership-and-driver-registration) below. |
 
 All other client-port endpoints (meta, session open/getEvents/close) return RFC
 7807 error bodies on non-2xx status codes — unchanged from before.
@@ -165,6 +166,97 @@ Note the **absence of `"id"`** — this is a server-originated error notificatio
 not a response. On seeing it, reconnect via a new `session.subscribe` call with
 `since_event_id` set to the last event id you received, then reconcile any gap
 via `GET /api/v1/sessions/{id}/events`.
+
+---
+
+## FIFO turn ownership and driver registration
+
+A session can have multiple **drivers** — client keys that send messages —
+plus any number of **observers** — connections that only call
+`session.subscribe`. Registration is explicit and asymmetric:
+
+- **Driver**: call `session.registerDriver` once (`{}`, no params) before
+  your first `session.sendMessage`. SDK harnesses do this automatically as
+  part of `connect()`/`join()`. Idempotent, logs a `session.driver.register`
+  event on first registration only.
+- **Observer**: call `session.subscribe`. This *is* the registration act —
+  nothing else is required, and nothing is logged (subscribing is not an
+  audited action; sending messages is).
+
+A `session.sendMessage` call from a client key that never registered as a
+driver is rejected with `-32001` before anything else happens — no state
+check, no param validation, no queuing.
+
+### The single-active-message mutex
+
+At most one driver's message is being processed per session at a time. A
+second driver's `session.sendMessage` call while another turn is in flight
+**queues in FIFO order** — first call to actually reach the front of the
+queue wins, regardless of which HTTP request the underlying transport
+happened to schedule first. The queued caller's NDJSON response opens
+immediately but writes nothing until its turn is dequeued; there is no
+polling, no retry — the connection simply waits.
+
+**A turn is a logical unit, not a single HTTP request.** When a turn pauses
+for a client-side tool call (`Outcome::Paused` — the assistant response
+contains `tool_use` blocks the harness must dispatch), the FIFO gate is not
+released. It stays held by that turn's owner — the client key that sent the
+original message — until:
+
+- The **same** client key sends the `tool_result` continuation (any further
+  `session.sendMessage`, not necessarily one shaped like a tool result — see
+  below), reusing the held gate with no queuing, or
+- `BAE_TURN_TIMEOUT` (default 120s, see [Configuration](configuration.md))
+  elapses without that continuation arriving, at which point the turn is
+  **abandoned**: the gate is released to the next FIFO waiter, and a
+  broadcast `session.error` event (`reason: "driver_turn_abandoned"`,
+  `{"owner_client_key_id": "key_…"}`) is logged. The session itself stays
+  `open` — unlike a provider failure, an abandoned turn does not move the
+  session to `error`, since other drivers are unaffected.
+
+Only the owning client key may submit that turn's continuation; a *different*
+driver's `session.sendMessage` call during someone else's paused turn simply
+queues (blocks) like any other contender for the gate — it is never rejected
+with an error, it waits its turn. Ownership is tracked by `client_key_id`,
+not by the shape of the message: the owner may abandon its own pending tool
+call voluntarily by sending a fresh message instead of a `tool_result`
+continuation, and the turn proceeds with that as the next input.
+
+### "Remaining connected" is a return-before-timeout guarantee, not a held socket
+
+The summary behind this feature describes a persistent-connection model — "if
+client A sends a message, it must remain connected in order to handle
+client-side tool calls, or else the handling of that message is terminated."
+`POST /api/v1/sessions/{id}/rpc` is a one-shot request/NDJSON-response call:
+a `Paused` outcome's terminal response necessarily ends that HTTP exchange —
+there is no socket left to "remain connected" on.
+
+**The translation:** "remaining connected" is operationalized as *returning
+with the continuation before `BAE_TURN_TIMEOUT` elapses*. A driver that
+receives a `tool_use` block, dispatches it locally, and calls
+`session.sendMessage` again with the `tool_result` well within the timeout
+window has behaved exactly as if it had "remained connected," even though
+each leg is its own independent HTTP request. Only exceeding the timeout —
+not disconnecting between requests — triggers abandonment.
+
+### Per-turn tool scoping and event attribution
+
+Each turn only ever advertises the **acting** driver's own declared tools
+(plus the session's shared, session-wide MCP tools) to the provider — a
+different driver's private tool declarations are never sent during another
+driver's turn, so the model cannot request a tool the current turn's owner
+doesn't implement. Every event a turn produces (`provider.request`,
+`tool.call`, `client.message.send`, etc.) is attributed to the **acting**
+client key in its `client_key_id` column — not always the session's original
+creator — so `GET /api/v1/sessions/{id}/events` reconstructs who actually did
+what.
+
+### Joining mid-turn
+
+`POST /api/v1/sessions/{id}/join` and `session.registerDriver` are unaffected
+by an in-flight turn — a joining client can attach and register at any time.
+It simply queues behind the FIFO gate like any other driver once it calls
+`session.sendMessage`.
 
 ---
 

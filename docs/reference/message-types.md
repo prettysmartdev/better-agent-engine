@@ -128,6 +128,30 @@ The raw response received from the LLM provider (or the failure reason).
 - `error` is a human-readable failure reason.
 - Inserted **after** each attempt, success or failure.
 
+#### Raw-logged vs. canonical-returned (OpenAI-kind providers)
+
+`body` is always the **raw, untranslated wire response** — for a `provider`
+whose registry entry has `provider = "anthropic"`, that's the Anthropic
+Messages API shape, unchanged. For a `provider = "openai"` entry, `body` is
+the **raw OpenAI Chat Completions response** (`choices[0].message` with
+`tool_calls`, etc.) — it is *not* translated before being logged here, so the
+event log is a faithful record of what the provider actually said on the
+wire.
+
+This is deliberately different from what the rest of the turn sees: `engine::session::run_turn`
+only ever consumes the **canonical** shape (the same
+`{"content": [{"type": "text"|"tool_use"|"tool_result", …}]}` block format
+used internally today, and by `anthropic`-kind providers natively) —
+`engine::provider::call()` translates an OpenAI response into this canonical
+shape internally before handing it back to the turn loop. So `tool.call`,
+`server.message.send`, and everything else derived from the turn's own
+history are always canonical, regardless of which provider kind served the
+attempt — only `provider.response`'s `body` field preserves the raw,
+kind-specific wire shape. See
+[Configuration — `[providers]`](configuration.md#providers) for the
+`provider` field and [Profiles](../profiles.md#provider-config) for how a
+profile selects providers by name.
+
 ---
 
 ### `tool.call`
@@ -272,6 +296,49 @@ Emitted when the session is created.
 
 ---
 
+### `session.join`
+
+Emitted when a second (or further) client key mints a session key for an
+existing session via `POST /api/v1/sessions/{id}/join`. Same payload shape as
+`session.open` — it's the identical "a client key attached, declaring this
+tool set" fact, just via the join path instead of create.
+
+```json
+{
+  "client_version": "1.2.0",
+  "tools":          ["only_b"]
+}
+```
+
+- `client_version` is `null` if not provided at join.
+- `tools` is the **joining client's own** declared tool list (client-side
+  tools only) — never merged with the creator's or any other joiner's.
+- The event's `client_key_id` column is the **joiner**, not the session's
+  original creator.
+- See [Client API — `POST .../join`](client-api.md#post-apiv1sessionsidjoin--join-an-existing-session)
+  and [Multi-Client Sessions](../guides/multi-client-sessions.md).
+
+---
+
+### `session.driver.register`
+
+Emitted the first time a client key registers as a driver via
+`session.registerDriver`. Idempotent registration does **not** re-emit this
+event — only the first call for a given client key on a given session logs
+it.
+
+```json
+{}
+```
+
+- Empty payload — the actor is fully captured by the event's `client_key_id`
+  column (mirroring how `session.open`/`session.join` also rely on that
+  column, not the payload, to identify the acting client).
+- See [Client API — `session.registerDriver`](client-api.md#sessionregisterdriver)
+  and [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration).
+
+---
+
 ### `session.close`
 
 Emitted when the session is closed normally.
@@ -291,7 +358,9 @@ Emitted when the session is closed normally.
 
 ### `session.error`
 
-Emitted when the session is terminated due to an error.
+Emitted on a session-affecting error. Most reasons move the session to
+`error` state; two (marked below) do not — `session.error` is also used as a
+non-fatal audit/visibility signal.
 
 ```json
 {
@@ -299,13 +368,15 @@ Emitted when the session is terminated due to an error.
 }
 ```
 
-| `reason` | When |
-|---|---|
-| `"provider_config"` | The provider config could not be loaded (e.g. missing env var). |
-| `"provider_call_failed"` | The primary provider failed; fallback walk begins. |
-| `"all_providers_failed"` | Primary and all fallbacks failed; session moved to `error`. |
-| `"loop_limit"` | The per-turn iteration cap (8) was hit. |
-| `"profile_unavailable"` | The profile was deleted mid-session. |
+| `reason` | When | Moves session to `error`? |
+|---|---|---|
+| `"provider_config"` | The provider config could not be loaded (e.g. missing env var), or — since work item 0005 — a message-time re-check found the profile's `primary_provider` name missing from the registry. In the latter case the payload also carries `"detail"` naming the missing provider. | yes |
+| `"provider_call_failed"` | The primary provider failed; fallback walk begins. | no (fallback in progress) |
+| `"all_providers_failed"` | Primary and all fallbacks failed; session moved to `error`. | yes |
+| `"loop_limit"` | The per-turn iteration cap (8) was hit. | yes |
+| `"profile_unavailable"` | The profile was deleted mid-session. | yes |
+| `"primary_provider_unavailable"` | `POST /api/v1/sessions` or `POST /api/v1/sessions/{id}/join` rejected the request because the profile's `primary_provider` name isn't in the `[providers]` registry. Payload: `{"profile_id": "pro_…", "primary_provider": "name"}`. Logged on this **separate audit session row** (`state='error'`) — the real session, if any, is untouched. See [Profiles](../profiles.md#fatal-primary--non-fatal-fallback). | n/a — no real session was created |
+| `"driver_turn_abandoned"` | A paused turn's owning driver didn't return with its continuation before `BAE_TURN_TIMEOUT` elapsed; the FIFO gate was released to the next queued driver. Payload: `{"owner_client_key_id": "key_…"}` (also the event's `client_key_id` column). | **no** — the session stays `open`; other drivers are unaffected |
 
 Note: `"provider_call_failed"` is recorded once when the primary fails but
 a fallback attempt follows. If a fallback succeeds, the session continues
@@ -380,3 +451,25 @@ provider.request
 provider.response      (ok: true)
 server.message.send
 ```
+
+**Multi-driver session (create, join, both drive):**
+
+```
+session.open                    (client_key_id: key_A)
+session.driver.register         (client_key_id: key_A)
+session.join                    (client_key_id: key_B)
+session.driver.register         (client_key_id: key_B)
+client.message.send             (client_key_id: key_A)   -- A's turn
+provider.request
+provider.response      (ok: true)
+server.message.send             (client_key_id: key_A)
+client.message.send             (client_key_id: key_B)   -- B's turn, only starts after A's completes
+provider.request
+provider.response      (ok: true)
+server.message.send             (client_key_id: key_B)
+```
+
+`GET /api/v1/sessions/{id}/events` returns this exact sequence for either
+participant — every event is attributed to whichever client key actually
+produced it. See [Multi-Client Sessions](../guides/multi-client-sessions.md)
+for the full walkthrough.

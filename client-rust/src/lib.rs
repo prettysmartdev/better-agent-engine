@@ -61,7 +61,7 @@ pub use tool::{BoxError, Tool, ToolHandler};
 pub use types::{
     ApiError, Content, ContentBlock, EventView, JsonRpcError, JsonRpcFrame, JsonRpcRequest,
     McpRequestPayload, McpResponsePayload, Message, Profile, SendMessageParams, SendMessageResult,
-    SubscribeParams, ToolResult, ToolUse,
+    SessionJoinPayload, SubscribeParams, ToolResult, ToolUse,
 };
 
 /// Client library version, from the crate manifest.

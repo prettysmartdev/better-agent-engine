@@ -56,7 +56,9 @@ impl EventBroadcaster {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionChannel>> {
-        self.channels.lock().expect("event broadcaster mutex poisoned")
+        self.channels
+            .lock()
+            .expect("event broadcaster mutex poisoned")
     }
 
     /// Subscribe to a session's live feed, creating the channel lazily. Returns
@@ -65,10 +67,12 @@ impl EventBroadcaster {
     /// no event slips through the seam between replay and live delivery.
     pub fn subscribe(&self, session_id: &str) -> (broadcast::Receiver<EventRecord>, Arc<Notify>) {
         let mut map = self.lock();
-        let entry = map.entry(session_id.to_owned()).or_insert_with(|| SessionChannel {
-            sender: broadcast::channel(CHANNEL_CAPACITY).0,
-            cancel: Arc::new(Notify::new()),
-        });
+        let entry = map
+            .entry(session_id.to_owned())
+            .or_insert_with(|| SessionChannel {
+                sender: broadcast::channel(CHANNEL_CAPACITY).0,
+                cancel: Arc::new(Notify::new()),
+            });
         (entry.sender.subscribe(), entry.cancel.clone())
     }
 
@@ -118,9 +122,8 @@ pub fn insert_and_publish(
     event_type: EventType,
     payload: &Value,
 ) -> rusqlite::Result<EventRecord> {
-    let record = store.with_conn(|c| {
-        sessions::insert_event(c, session_id, client_key_id, event_type, payload)
-    })?;
+    let record = store
+        .with_conn(|c| sessions::insert_event(c, session_id, client_key_id, event_type, payload))?;
     broadcaster.publish(&record);
     Ok(record)
 }
@@ -210,7 +213,9 @@ mod tests {
                 | EventType::SessionOpen
                 | EventType::SessionClose
                 | EventType::SessionError
-                | EventType::SessionCompaction => true,
+                | EventType::SessionCompaction
+                | EventType::SessionJoin
+                | EventType::SessionDriverRegistered => true,
             };
             assert_eq!(
                 should_broadcast(&record(et, json!({}))),
@@ -244,8 +249,13 @@ mod tests {
             EventType::SessionOpen,
             EventType::SessionClose,
             EventType::SessionError,
+            EventType::SessionJoin,
+            EventType::SessionDriverRegistered,
         ] {
-            assert!(should_broadcast(&record(et, json!({}))), "{et} should broadcast");
+            assert!(
+                should_broadcast(&record(et, json!({}))),
+                "{et} should broadcast"
+            );
         }
     }
 
