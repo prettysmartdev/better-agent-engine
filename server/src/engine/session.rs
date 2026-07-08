@@ -40,6 +40,7 @@ use tokio::sync::Mutex;
 use super::broadcast::{self, EventBroadcaster};
 use super::mcp::McpSession;
 use super::provider::{self, ProviderConfig};
+use super::sandbox::{ExecResult, SandboxDriver, SandboxHandle};
 use crate::events::EventType;
 use crate::store::sessions::{self, EventRecord, SessionRecord, STATE_ERROR};
 use crate::store::{profiles::ProfileRecord, Store};
@@ -124,6 +125,8 @@ pub async fn run_turn(
     profile: &ProfileRecord,
     provider_registry: &std::collections::HashMap<String, ProviderConfig>,
     mcp: Option<Arc<Mutex<McpSession>>>,
+    sandbox_driver: Arc<dyn SandboxDriver>,
+    sandbox: Option<Arc<Mutex<SandboxHandle>>>,
     acting_client_key_id: &str,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
@@ -145,10 +148,27 @@ pub async fn run_turn(
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
         .collect();
 
+    // The acting client's Auto-mode sandbox tools — the third dispatch bucket,
+    // parallel to the client-tool/MCP-tool split: these are dispatched
+    // server-side against the session's remote sandbox, exactly like an MCP
+    // tool, without ever pausing the turn. Same per-client scoping rule as
+    // `client_tools`.
+    let sandbox_tools: Vec<Value> = session
+        .sandbox_tools
+        .get(acting_client_key_id)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let sandbox_tool_names: HashSet<String> = sandbox_tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+
     // Merge the session's MCP tool definitions (from `tools/list` at connect
     // time) into what we advertise to the provider, and snapshot the
     // `tool_name -> server_name` routes for dispatch and event tagging.
     let mut advertised_tools = client_tools;
+    advertised_tools.extend(sandbox_tools);
     let mcp_routes: std::collections::HashMap<String, String> = match &mcp {
         Some(m) => {
             let guard = m.lock().await;
@@ -307,18 +327,26 @@ pub async fn run_turn(
             });
         }
 
-        // Record every tool call, tagged with how it will be dispatched. MCP
+        // Record every tool call, tagged with how it will be dispatched:
+        // "client" (the acting client's own tools), "sandbox" (Auto-mode
+        // sandbox tools, server-dispatched), or "mcp" (everything else). MCP
         // calls also carry the resolved `server_name` (null if unroutable).
         for tu in &tool_uses {
             let name = tu.name.as_str();
-            let is_client = client_tool_names.contains(name);
+            let dispatch = if client_tool_names.contains(name) {
+                "client"
+            } else if sandbox_tool_names.contains(name) {
+                "sandbox"
+            } else {
+                "mcp"
+            };
             let mut payload = json!({
                 "id": tu.id,
                 "name": name,
                 "input": tu.input,
-                "dispatch": if is_client { "client" } else { "mcp" },
+                "dispatch": dispatch,
             });
-            if !is_client {
+            if dispatch == "mcp" {
                 payload["server_name"] = json!(mcp_routes.get(name));
             }
             events.push(log_event(
@@ -354,15 +382,142 @@ pub async fn run_turn(
             });
         }
 
-        // All tool calls are MCP: dispatch each to the session's live MCP
-        // connections and continue the loop with the real results appended. This
-        // assistant turn is internal (not sent to the client) so it is not
-        // persisted as server.message.send; it is kept in the in-memory history
-        // for the next provider call.
+        // All tool calls are server-dispatched (sandbox or MCP): dispatch each
+        // and continue the loop with the real results appended. This assistant
+        // turn is internal (not sent to the client) so it is not persisted as
+        // server.message.send; it is kept in the in-memory history for the
+        // next provider call.
         history.push(json!({ "role": "assistant", "content": content }));
         let mut result_blocks: Vec<Value> = Vec::new();
         for tu in &tool_uses {
             let name = tu.name.as_str();
+
+            // Auto-mode sandbox tools: dispatched server-side against the
+            // session's remote sandbox, mirroring the MCP round trip below —
+            // sandbox.request / sandbox.response bracket the driver call and
+            // the result becomes an ordinary tool.result. A call with no
+            // started sandbox is handled exactly like a tool with no MCP
+            // server: an error-shaped tool.result, and the turn continues.
+            if sandbox_tool_names.contains(name) {
+                let command = tu
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                events.push(log_event(
+                    store,
+                    broadcaster,
+                    sid,
+                    cid,
+                    EventType::SandboxRequest,
+                    json!({ "tool": name, "input": tu.input, "command": command }),
+                )?);
+
+                let (response_payload, result_content, is_error) = match (&sandbox, &command) {
+                    (Some(sb), Some(cmd)) => {
+                        // Held across the driver await, like an MCP dispatch.
+                        let handle = sb.lock().await;
+                        match sandbox_driver.exec(&handle, cmd).await {
+                            Ok(r) => {
+                                let is_err = r.exit_code != 0;
+                                (
+                                    json!({
+                                        "sandbox_id": handle.id,
+                                        "ok": !is_err,
+                                        "result": {
+                                            "stdout": r.stdout,
+                                            "stderr": r.stderr,
+                                            "exit_code": r.exit_code,
+                                        },
+                                    }),
+                                    exec_result_content(&r),
+                                    is_err,
+                                )
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                // Lifecycle visibility is identical regardless
+                                // of dispatch mode: a failed exec also logs
+                                // session.sandbox.error alongside the
+                                // error-shaped response/tool.result.
+                                events.push(log_event(
+                                    store,
+                                    broadcaster,
+                                    sid,
+                                    cid,
+                                    EventType::SandboxError,
+                                    json!({
+                                        "image": handle.image,
+                                        "sandbox_id": handle.id,
+                                        "phase": "exec",
+                                        "detail": msg,
+                                        "dispatch": "remote",
+                                    }),
+                                )?);
+                                (
+                                    json!({ "sandbox_id": handle.id, "ok": false, "error": msg }),
+                                    sandbox_error_content(&msg),
+                                    true,
+                                )
+                            }
+                        }
+                    }
+                    // No remote sandbox was ever started for this session.
+                    (None, _) => {
+                        let msg = format!(
+                            "no remote sandbox is running for tool '{name}'; \
+                             call session.startRemoteSandbox first"
+                        );
+                        (
+                            json!({ "sandbox_id": Value::Null, "ok": false, "error": msg }),
+                            sandbox_error_content(&msg),
+                            true,
+                        )
+                    }
+                    // The declared input_schema must require a string
+                    // `command`; a model call without one cannot be executed.
+                    (Some(_), None) => {
+                        let msg = format!(
+                            "sandbox tool '{name}' input is missing the required string \"command\""
+                        );
+                        (
+                            json!({ "sandbox_id": Value::Null, "ok": false, "error": msg }),
+                            sandbox_error_content(&msg),
+                            true,
+                        )
+                    }
+                };
+
+                events.push(log_event(
+                    store,
+                    broadcaster,
+                    sid,
+                    cid,
+                    EventType::SandboxResponse,
+                    response_payload,
+                )?);
+                events.push(log_event(
+                    store,
+                    broadcaster,
+                    sid,
+                    cid,
+                    EventType::ToolResult,
+                    json!({
+                        "tool_use_id": tu.id,
+                        "dispatch": "sandbox",
+                        "is_error": is_error,
+                        "content": result_content,
+                    }),
+                )?);
+                result_blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": result_content,
+                    "is_error": is_error,
+                }));
+                continue;
+            }
+
             let server = mcp_routes.get(name).cloned();
 
             events.push(log_event(
@@ -488,6 +643,33 @@ fn finish_failed(
 /// the model sees the failure as tool output rather than the turn aborting.
 fn mcp_error_content(msg: &str) -> Value {
     json!([{ "type": "text", "text": format!("MCP error: {msg}") }])
+}
+
+/// The sandbox twin of [`mcp_error_content`]: same error-shaped tool_result
+/// posture (the model sees the failure as tool output; the turn continues).
+fn sandbox_error_content(msg: &str) -> Value {
+    json!([{ "type": "text", "text": format!("sandbox error: {msg}") }])
+}
+
+/// Render a sandbox exec's captured output as `tool_result` content: stdout,
+/// then a `[stderr]` section when non-empty, then the exit code when non-zero
+/// (a zero exit with clean stderr is just the stdout).
+fn exec_result_content(r: &ExecResult) -> Value {
+    let mut text = r.stdout.clone();
+    if !r.stderr.trim().is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("[stderr]\n");
+        text.push_str(&r.stderr);
+    }
+    if r.exit_code != 0 {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("[exit_code: {}]", r.exit_code));
+    }
+    json!([{ "type": "text", "text": text }])
 }
 
 /// A `tool_use` block extracted from an assistant response.

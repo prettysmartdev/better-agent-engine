@@ -7,6 +7,16 @@ import {
   UnknownToolError,
 } from "./errors.js";
 import type { HookName, Hooks } from "./hooks.js";
+import {
+  SandboxSession,
+  type ExecResult,
+  type RemoteSandboxStarted,
+  type RemoteSandboxStopped,
+  type SandboxLifecycleState,
+  type SandboxRpc,
+  type SandboxTool,
+  type SandboxToolDef,
+} from "./sandbox.js";
 import type { ToolDefinition } from "./tool.js";
 import {
   eventFromFrame,
@@ -52,6 +62,10 @@ export class Harness {
   private readonly transport: Transport;
   private readonly tools = new Map<string, ToolDefinition>();
   private hooks: Hooks = {};
+  /** Late-bound sandbox handle, shared with sandbox tools and the Session. */
+  private readonly sandbox = new SandboxSession();
+  /** Auto-mode sandbox tool declarations, sent in the session-open list. */
+  private readonly sandboxDefs: SandboxToolDef[] = [];
 
   constructor(config: Config, options: HarnessOptions = {}) {
     this.config = config;
@@ -61,6 +75,30 @@ export class Harness {
   /** Register a client-side tool. Returns `this` for chaining. */
   registerTool(tool: ToolDefinition): this {
     this.tools.set(tool.name, tool);
+    return this;
+  }
+
+  /**
+   * A handle to this harness's sandbox capability, for building sandbox tools
+   * **before** `connect()`. Its transport is late-bound at connect; see
+   * {@link SandboxSession}. Pass it to `runShellCommand`/`runShellNamed`, then
+   * register the result with {@link registerSandboxTool}.
+   */
+  sandboxSession(): SandboxSession {
+    return this.sandbox;
+  }
+
+  /**
+   * Register a builtin sandbox tool, routing it correctly: a client-dispatched
+   * tool joins the ordinary registry; an Auto-mode declaration joins the
+   * session-open `sandbox_tools` list. Returns `this` for chaining.
+   */
+  registerSandboxTool(tool: SandboxTool): this {
+    if (tool.kind === "tool") {
+      this.tools.set(tool.tool.name, tool.tool);
+    } else {
+      this.sandboxDefs.push(tool.def);
+    }
     return this;
   }
 
@@ -109,6 +147,11 @@ export class Harness {
         description: t.description,
         input_schema: t.input_schema,
       })),
+      // Only present when Auto-mode sandbox tools are registered, so a session
+      // without them sends the exact same body as before.
+      ...(this.sandboxDefs.length > 0
+        ? { sandbox_tools: this.sandboxDefs.map((d) => ({ ...d })) }
+        : {}),
     };
     const res = await this.transport.request({
       method: "POST",
@@ -120,14 +163,19 @@ export class Harness {
     // Register as a driver before any send: session.sendMessage requires it
     // (a -32001 error otherwise). Application code never calls this.
     await this.registerDriver(open.session_id, open.session_key);
-    return new Session(
+    const session = new Session(
       this.transport,
       open.session_id,
       open.session_key,
       open.profile,
       this.tools,
       this.hooks,
+      this.sandbox,
     );
+    // Late-bind the sandbox transport now that the session exists, so any
+    // sandbox tool built pre-connect can reach the remote RPC methods.
+    this.sandbox.bind(session);
+    return session;
   }
 
   /**
@@ -164,7 +212,7 @@ export class Harness {
  * server-returned tool calls to registered handlers and posting results back
  * until a non-tool-call assistant turn arrives — and `close()` ends it.
  */
-export class Session {
+export class Session implements SandboxRpc {
   /** Monotonic JSON-RPC request id, unique per session. */
   private nextRpcId = 1;
 
@@ -175,7 +223,112 @@ export class Session {
     readonly profile: Profile,
     private readonly tools: Map<string, ToolDefinition>,
     private readonly hooks: Hooks,
+    private readonly sandbox: SandboxSession = new SandboxSession(),
   ) {}
+
+  /**
+   * A handle to this session's sandbox capability, for building sandbox tools
+   * after connect (register the resulting client-dispatched tools with
+   * {@link registerTool}). Auto-mode declarations must instead be registered on
+   * the {@link Harness} before connect.
+   */
+  sandboxSession(): SandboxSession {
+    return this.sandbox;
+  }
+
+  /** Register an additional client-dispatched tool on the live session. */
+  registerTool(tool: ToolDefinition): this {
+    this.tools.set(tool.name, tool);
+    return this;
+  }
+
+  /**
+   * Run `command` in the session's remote sandbox (`session.execRemoteSandbox`).
+   * Available to any tool handler or application code.
+   */
+  async execRemoteSandbox(command: string): Promise<ExecResult> {
+    return this.sandboxRpc("session.execRemoteSandbox", {
+      command,
+    }) as Promise<ExecResult>;
+  }
+
+  /** Report a local sandbox lifecycle transition (`session.reportLocalSandbox`). */
+  async reportLocalSandbox(
+    state: SandboxLifecycleState,
+    image: string,
+    containerId: string | null,
+    detail: string | null,
+  ): Promise<void> {
+    await this.sandboxRpc("session.reportLocalSandbox", {
+      state,
+      image,
+      container_id: containerId,
+      detail,
+    });
+  }
+
+  /**
+   * Eagerly start a local sandbox for `image` (otherwise it starts lazily on the
+   * first local-target tool call), reporting `running` to the server.
+   */
+  async startLocalSandbox(image: string): Promise<void> {
+    await this.sandbox.startLocal(image);
+  }
+
+  /** Stop every local sandbox this session started, reporting `stopped`. */
+  async stopLocalSandbox(): Promise<void> {
+    await this.sandbox.stopAllLocal();
+  }
+
+  /**
+   * Ask the server to start this session's **remote** sandbox from `image`
+   * (`session.startRemoteSandbox`). `image` must be in the session profile's
+   * `available_sandboxes`, or the call rejects with an {@link RpcError} code
+   * `-32011`. One sandbox per session: a second start while one is running
+   * rejects with `-32000`. Required before any `Remote`-target tool
+   * (Auto-dispatched or {@link execRemoteSandbox}) can run.
+   */
+  async startRemoteSandbox(image: string): Promise<RemoteSandboxStarted> {
+    return this.sandboxRpc("session.startRemoteSandbox", {
+      image,
+    }) as Promise<RemoteSandboxStarted>;
+  }
+
+  /**
+   * Stop this session's remote sandbox (`session.stopRemoteSandbox`). Rejects
+   * with an {@link RpcError} code `-32013` if none is running. (Session close
+   * also stops a still-running remote sandbox server-side.)
+   */
+  async stopRemoteSandbox(): Promise<RemoteSandboxStopped> {
+    return this.sandboxRpc(
+      "session.stopRemoteSandbox",
+      {},
+    ) as Promise<RemoteSandboxStopped>;
+  }
+
+  /**
+   * Issue one non-turn sandbox RPC (`execRemoteSandbox`/`reportLocalSandbox`)
+   * over `…/rpc` and return its terminal `result`. Shaped like `registerDriver`:
+   * a single synchronous utility call, no session-loop involvement.
+   */
+  private async sandboxRpc(
+    method: RpcMethod,
+    params: unknown,
+  ): Promise<unknown> {
+    const frames = this.transport.stream({
+      method: "POST",
+      path: `/api/v1/sessions/${this.id}/rpc`,
+      token: this.sessionKey,
+      body: this.rpcRequest(method, params),
+    });
+    for await (const frame of frames) {
+      if (frame.error) {
+        throw new RpcError(frame.error.code, frame.error.message);
+      }
+      if (isTerminalFrame(frame)) return frame.result;
+    }
+    throw new RpcError(-32603, "stream ended without a terminal response");
+  }
 
   /**
    * Send a turn and drive the loop to completion. Returns the final assistant
@@ -256,8 +409,14 @@ export class Session {
     }
   }
 
-  /** Close the session (appends a `session.close` event server-side). */
+  /**
+   * Close the session (appends a `session.close` event server-side). Before
+   * releasing it, stops any still-running **local** sandboxes this session
+   * started — reporting `stopped` for each — mirroring how the server stops its
+   * own remote sandbox at session close.
+   */
   async close(): Promise<void> {
+    await this.sandbox.stopAllLocal();
     const res = await this.transport.request({
       method: "DELETE",
       path: `/api/v1/sessions/${this.id}`,

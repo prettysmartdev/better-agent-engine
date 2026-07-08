@@ -38,6 +38,12 @@ pub struct SessionRecord {
     pub state: String,
     pub client_version: Option<String>,
     pub client_tools: Value,
+    /// Per-client Auto-mode sandbox tool declarations, keyed by client key id
+    /// exactly like [`SessionRecord::client_tools`] but kept in a sibling
+    /// column so the two tool kinds are never confused. These tools are
+    /// dispatched **server-side** against the session's remote sandbox by
+    /// `run_turn`, never returned to the client.
+    pub sandbox_tools: Value,
     pub created_at: String,
     pub closed_at: Option<String>,
 }
@@ -53,8 +59,8 @@ pub struct EventRecord {
     pub created_at: String,
 }
 
-const SESSION_COLS: &str =
-    "id, client_key_id, profile_id, state, client_version, client_tools, created_at, closed_at";
+const SESSION_COLS: &str = "id, client_key_id, profile_id, state, client_version, client_tools, \
+     sandbox_tools, created_at, closed_at";
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
@@ -68,6 +74,11 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Value::Null),
+        sandbox_tools: row
+            .get::<_, String>("sandbox_tools")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null),
         created_at: row.get("created_at")?,
         closed_at: row.get("closed_at")?,
     })
@@ -77,7 +88,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 /// list; it is stored under the creator's own `client_key_id` key in the
 /// per-client `client_tools` object (see [`SessionRecord`]), never as a bare
 /// array — further participants add their own entries via
-/// [`set_client_tools`].
+/// [`set_client_tools`]. `sandbox_tools` is the creator's Auto-mode sandbox
+/// tool list, stored the same per-client way in its own sibling column.
 #[allow(clippy::too_many_arguments)]
 pub fn create_session(
     conn: &Connection,
@@ -86,13 +98,16 @@ pub fn create_session(
     state: &str,
     client_version: Option<&str>,
     client_tools: &Value,
+    sandbox_tools: &Value,
 ) -> rusqlite::Result<SessionRecord> {
     let id = generate_id(SESSION_ID_PREFIX);
     let tools_by_client = serde_json::json!({ client_key_id: client_tools });
+    let sandbox_by_client = serde_json::json!({ client_key_id: sandbox_tools });
     let sql = format!(
         "INSERT INTO sessions \
-           (id, client_key_id, profile_id, state, client_version, client_tools, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, {NOW_SQL}) \
+           (id, client_key_id, profile_id, state, client_version, client_tools, \
+            sandbox_tools, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW_SQL}) \
          RETURNING {SESSION_COLS}"
     );
     conn.query_row(
@@ -104,6 +119,7 @@ pub fn create_session(
             state,
             client_version,
             tools_by_client.to_string(),
+            sandbox_by_client.to_string(),
         ],
         row_to_session,
     )
@@ -121,8 +137,34 @@ pub fn set_client_tools(
     client_key_id: &str,
     tools: &Value,
 ) -> rusqlite::Result<()> {
+    set_per_client_column(conn, session_id, "client_tools", client_key_id, tools)
+}
+
+/// The `sandbox_tools` twin of [`set_client_tools`]: upsert one client's
+/// Auto-mode sandbox tool declarations in the sibling per-client object.
+/// Identical semantics — only the target client's entry is written, and a
+/// repeat call replaces (never merges) that client's own list.
+pub fn set_client_sandbox_tools(
+    conn: &Connection,
+    session_id: &str,
+    client_key_id: &str,
+    tools: &Value,
+) -> rusqlite::Result<()> {
+    set_per_client_column(conn, session_id, "sandbox_tools", client_key_id, tools)
+}
+
+/// Shared upsert behind [`set_client_tools`] / [`set_client_sandbox_tools`].
+/// `column` is a compile-time constant from those two callers only — never
+/// caller-supplied input — so the `format!` cannot inject.
+fn set_per_client_column(
+    conn: &Connection,
+    session_id: &str,
+    column: &'static str,
+    client_key_id: &str,
+    tools: &Value,
+) -> rusqlite::Result<()> {
     let current: Option<String> = conn.query_row(
-        "SELECT client_tools FROM sessions WHERE id = ?1",
+        &format!("SELECT {column} FROM sessions WHERE id = ?1"),
         params![session_id],
         |r| r.get(0),
     )?;
@@ -132,7 +174,7 @@ pub fn set_client_tools(
         .unwrap_or_default();
     by_client.insert(client_key_id.to_owned(), tools.clone());
     conn.execute(
-        "UPDATE sessions SET client_tools = ?2 WHERE id = ?1",
+        &format!("UPDATE sessions SET {column} = ?2 WHERE id = ?1"),
         params![session_id, Value::Object(by_client).to_string()],
     )?;
     Ok(())
@@ -326,6 +368,7 @@ mod tests {
                 STATE_OPEN,
                 Some("1.0.0"),
                 &json!([{ "name": "only_a" }]),
+                &json!([]),
             )
             .unwrap();
 

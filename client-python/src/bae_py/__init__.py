@@ -31,8 +31,33 @@ from .errors import (
     TransportError,
     UnknownToolError,
 )
+from .files import (
+    FileToolConfig,
+    explore_files_tool,
+    read_file_tool,
+    write_file_tool,
+)
 from .harness import Harness, HttpxTransport, Session, Transport, TransportResponse
 from .hooks import Hook, Hooks
+from .sandbox import (
+    AppleContainerDriver,
+    DockerDriver,
+    ExecResult,
+    RemoteMode,
+    RemoteSandboxStarted,
+    RemoteSandboxStopped,
+    SandboxDriver,
+    SandboxError,
+    SandboxHandle,
+    SandboxRpc,
+    SandboxSession,
+    SandboxTarget,
+    SandboxTool,
+    SandboxToolDef,
+    run_shell_command,
+    run_shell_named,
+    shell_quote,
+)
 from .secure import constant_time_equal, random_hex
 from .tool import Tool, ToolHandler, ToolRegistry
 from .types import (
@@ -75,6 +100,29 @@ __all__ = [
     # hooks
     "Hooks",
     "Hook",
+    # sandbox tools
+    "SandboxSession",
+    "SandboxDriver",
+    "DockerDriver",
+    "AppleContainerDriver",
+    "SandboxError",
+    "SandboxHandle",
+    "SandboxRpc",
+    "SandboxTarget",
+    "RemoteMode",
+    "SandboxTool",
+    "SandboxToolDef",
+    "ExecResult",
+    "RemoteSandboxStarted",
+    "RemoteSandboxStopped",
+    "run_shell_command",
+    "run_shell_named",
+    "shell_quote",
+    # file tools
+    "FileToolConfig",
+    "read_file_tool",
+    "write_file_tool",
+    "explore_files_tool",
     # content / event model
     "Message",
     "Content",

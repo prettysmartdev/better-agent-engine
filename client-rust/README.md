@@ -13,7 +13,8 @@ session, and `send()` drives the full model ↔ tool round-trip for you.
 ## Surface
 
 1. **`Config`** — server URL, client key, client version.
-2. **`Tool`** — name, description, JSON input schema, and a callable handler.
+2. **`Tool`** — name, description, JSON input schema, and an **async** handler
+   (see the breaking-change note below).
 3. **`Harness`** — holds the config + tool registry + hooks; async `connect()`
    opens a session and returns a `Session`.
 4. **`Session`** — `send(message)` drives the round-trip until a final
@@ -33,7 +34,7 @@ let get_time = Tool::new(
     "get_current_time",
     "Return the current time as an ISO-8601 string",
     json!({ "type": "object", "properties": {} }),
-    |_input| Ok(json!("2026-07-06T12:00:00Z")),
+    |_input| async move { Ok(json!("2026-07-06T12:00:00Z")) },
 );
 
 let mut session = Harness::new(config).with_tool(get_time).connect().await?;
@@ -42,6 +43,15 @@ println!("{}", reply.text());
 session.close().await?;
 # Ok(()) }
 ```
+
+> **Alpha breaking change (work item 0006).** `ToolHandler` is now **async**:
+> `Tool::new`'s handler closure returns a `Future` instead of a plain
+> `Result`, and `Tool::call` is an `async fn`. Migrate an existing synchronous
+> handler by wrapping its body in `async move { … }` — e.g.
+> `|input| Ok(input)` becomes `|input| async move { Ok(input) }`. This lets a
+> handler `.await` (an HTTP round-trip, a subprocess) without blocking the
+> runtime, which the builtin sandbox tools require. Acceptable per the crate's
+> alpha status, same posture as the WI 0003/0005 wire-protocol changes.
 
 ## Example
 

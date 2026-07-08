@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use crate::api::error::ApiError;
 use crate::api::pagination::{next_cursor, PageQuery};
 use crate::api::AppState;
+use crate::engine::sandbox::{EnsureOutcome, SandboxImageStatus};
 use crate::store::profiles::{self, DeleteOutcome, ProfileInput, ProfileRecord};
 
 /// `POST /admin/v1/profiles` body.
@@ -37,6 +38,9 @@ pub struct CreateProfile {
     pub mcp_servers: Option<Value>,
     #[serde(default)]
     pub allowed_tools: Option<Value>,
+    /// Sandbox container image names this profile's sessions may launch.
+    #[serde(default)]
+    pub available_sandboxes: Option<Value>,
 }
 
 impl CreateProfile {
@@ -66,6 +70,11 @@ impl CreateProfile {
         require_string_array(&mcp_servers, "mcp_servers")?;
         let allowed_tools = self.allowed_tools.unwrap_or_else(|| json!([]));
         require_array(&allowed_tools, "allowed_tools")?;
+        // `available_sandboxes` is an array of container image *names* — the
+        // per-profile allowlist over the host-wide sandbox driver. Same shape
+        // rule as `mcp_servers`.
+        let available_sandboxes = self.available_sandboxes.unwrap_or_else(|| json!([]));
+        require_string_array(&available_sandboxes, "available_sandboxes")?;
 
         Ok(ProfileInput {
             name: self.name,
@@ -76,6 +85,7 @@ impl CreateProfile {
             fallback_configs: fallback_providers,
             mcp_servers,
             allowed_tools,
+            available_sandboxes,
         })
     }
 }
@@ -116,9 +126,56 @@ pub fn profile_view(p: &ProfileRecord) -> Value {
         "fallback_providers": p.fallback_configs,
         "mcp_servers": p.mcp_servers,
         "allowed_tools": p.allowed_tools,
+        "available_sandboxes": p.available_sandboxes,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
     })
+}
+
+/// Kick off background provisioning of a profile's declared sandbox images.
+///
+/// Every image is seeded at `pending` **synchronously** (so a client
+/// connecting the instant after the profile write sees `pending` rather than
+/// nothing), then a detached task — `tokio::spawn`, never awaited by the HTTP
+/// handler, so profile writes return immediately regardless of image size or
+/// registry latency — walks the images **sequentially** (parallel pulls of
+/// large images competing for one host's disk/network bandwidth is not
+/// obviously desirable; serial keeps it simple for v1), calling
+/// `ensure_image` and recording each outcome in `AppState.sandbox_status`.
+///
+/// Fired on profile create, profile replace, and once per declaring profile at
+/// server startup (the status map is in-memory only). Mirrors
+/// `resolve_mcp_servers`' per-name log-and-continue posture, but at
+/// profile-write time instead of every session open.
+pub fn provision_sandbox_images(state: &AppState, profile_id: &str, images: Vec<String>) {
+    state.seed_sandbox_status(profile_id, &images);
+    if images.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let profile_id = profile_id.to_owned();
+    tokio::spawn(async move {
+        for image in images {
+            match state.sandbox_driver.ensure_image(&image).await {
+                Ok(EnsureOutcome::AlreadyPresent) => {
+                    tracing::info!(profile_id, image, "sandbox image already available");
+                    state.set_sandbox_status(&profile_id, &image, SandboxImageStatus::Available);
+                }
+                Ok(EnsureOutcome::Pulled) => {
+                    tracing::info!(profile_id, image, "sandbox image pulled successfully");
+                    state.set_sandbox_status(&profile_id, &image, SandboxImageStatus::Available);
+                }
+                Err(e) => {
+                    tracing::error!(profile_id, image, error = %e, "failed to ensure sandbox image");
+                    state.set_sandbox_status(
+                        &profile_id,
+                        &image,
+                        SandboxImageStatus::Error(e.to_string()),
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// `POST /admin/v1/profiles`
@@ -131,6 +188,9 @@ pub async fn create(
         .store
         .with_conn(|c| profiles::create(c, &input))
         .map_err(map_create_err)?;
+    // Image provisioning happens off the request path: the handler returns
+    // immediately; the detached task pulls in the background.
+    provision_sandbox_images(&state, &record.id, record.sandbox_image_names());
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -184,6 +244,9 @@ pub async fn replace(
         .with_conn(|c| profiles::replace(c, &id, &input))
         .map_err(map_create_err)?
         .ok_or_else(|| ApiError::not_found(format!("no profile {id}")))?;
+    // A replace may add new images to an existing profile; re-provision the
+    // full declared set (ensure_image is idempotent for already-pulled ones).
+    provision_sandbox_images(&state, &record.id, record.sandbox_image_names());
     Ok(Json(profile_view(&record)))
 }
 

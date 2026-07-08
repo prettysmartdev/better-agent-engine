@@ -48,7 +48,10 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
-use super::sessions::{auth_session, event_view, tool_result_blocks, MessageBody};
+use super::sessions::{
+    auth_session, event_view, stop_remote_sandbox, tool_result_blocks, MessageBody,
+    SandboxStopOutcome,
+};
 use crate::api::AppState;
 use crate::engine::{broadcast, session};
 use crate::events::EventType;
@@ -176,6 +179,60 @@ pub async fn rpc(
                         error_obj(req_id, -32603, "Internal error"),
                     );
                 }
+                // Driver-connect sandbox notification, immediately after the
+                // registration event, when the session's profile declares
+                // sandbox images. Scoped strictly to THIS session's own
+                // profile: the list is built by iterating the profile's own
+                // `available_sandboxes` and looking up each name's status
+                // under this profile's id — never by flattening the
+                // server-wide status map, whose other entries belong to other
+                // profiles and must not leak here.
+                match state
+                    .store
+                    .with_conn(|c| profiles::get(c, &session.profile_id))
+                {
+                    Ok(Some(profile)) => {
+                        let images = profile.sandbox_image_names();
+                        if !images.is_empty() {
+                            let listed: Vec<Value> = images
+                                .iter()
+                                .map(|name| {
+                                    let status = state.sandbox_image_status(&profile.id, name);
+                                    let mut entry =
+                                        json!({ "name": name, "status": status.as_str() });
+                                    if let Some(d) = status.detail() {
+                                        entry["detail"] = json!(d);
+                                    }
+                                    entry
+                                })
+                                .collect();
+                            if let Err(e) = broadcast::insert_and_publish(
+                                &state.store,
+                                &state.broadcaster,
+                                &session.id,
+                                Some(&acting_client_key_id),
+                                EventType::SandboxAvailable,
+                                &json!({ "images": listed }),
+                            ) {
+                                tracing::error!("database error in /rpc: {e}");
+                                return single_or_empty(
+                                    id_present,
+                                    error_obj(req_id, -32603, "Internal error"),
+                                );
+                            }
+                        }
+                    }
+                    // A deleted profile is surfaced by sendMessage's own
+                    // profile check; registration itself still succeeds.
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!("database error in /rpc: {e}");
+                        return single_or_empty(
+                            id_present,
+                            error_obj(req_id, -32603, "Internal error"),
+                        );
+                    }
+                }
             }
             single_or_empty(
                 id_present,
@@ -185,6 +242,68 @@ pub async fn rpc(
         "session.sendMessage" => spawn_stream(move |tx| {
             drive_send_message(state, session, acting_client_key_id, resp_id, params, tx)
         }),
+        "session.startRemoteSandbox" => {
+            start_remote_sandbox_rpc(
+                &state,
+                &session,
+                &acting_client_key_id,
+                id_present,
+                req_id,
+                &params,
+            )
+            .await
+        }
+        "session.stopRemoteSandbox" => {
+            // Explicit stop: the same internal helper session close uses, with
+            // reason "explicit" instead of "session_close".
+            if let Some(resp) =
+                require_registered_driver(&state, &session, &acting_client_key_id, &method)
+            {
+                return single_or_empty(id_present, error_obj(req_id, resp.0, resp.1));
+            }
+            match stop_remote_sandbox(&state, &session.id, &acting_client_key_id, "explicit").await
+            {
+                SandboxStopOutcome::NotRunning => single_or_empty(
+                    id_present,
+                    error_obj(
+                        req_id,
+                        -32013,
+                        "sandbox_not_running: no remote sandbox is running for this session",
+                    ),
+                ),
+                SandboxStopOutcome::Stopped { image, sandbox_id } => single_or_empty(
+                    id_present,
+                    result_obj(
+                        req_id,
+                        json!({ "stopped": true, "image": image, "sandbox_id": sandbox_id }),
+                    ),
+                ),
+                // The handle is already removed; report the driver failure.
+                SandboxStopOutcome::Failed { detail } => single_or_empty(
+                    id_present,
+                    error_obj(req_id, -32000, format!("sandbox stop failed: {detail}")),
+                ),
+            }
+        }
+        "session.execRemoteSandbox" => {
+            exec_remote_sandbox_rpc(
+                &state,
+                &session,
+                &acting_client_key_id,
+                id_present,
+                req_id,
+                &params,
+            )
+            .await
+        }
+        "session.reportLocalSandbox" => report_local_sandbox_rpc(
+            &state,
+            &session,
+            &acting_client_key_id,
+            id_present,
+            req_id,
+            &params,
+        ),
         "session.subscribe" => spawn_stream(move |tx| drive_subscribe(state, session, params, tx)),
         "session.unsubscribe" => {
             // Ends active session.subscribe streams for this session. The
@@ -435,6 +554,7 @@ async fn drive_send_message(
     // session-wide MCP tools) are advertised, and every event the turn logs is
     // attributed to it.
     let mcp = state.mcp_session(&session.id);
+    let sandbox = state.sandbox(&session.id);
     let turn_fut = session::run_turn(
         &state.store,
         &state.http,
@@ -443,6 +563,8 @@ async fn drive_send_message(
         &profile,
         &state.provider_registry,
         mcp,
+        state.sandbox_driver.clone(),
+        sandbox,
         &acting_client_key_id,
     );
     tokio::pin!(turn_fut);
@@ -518,6 +640,355 @@ async fn drive_send_message(
         }
     }
     drop(gate_guard);
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox methods (session.startRemoteSandbox / stopRemoteSandbox /
+// execRemoteSandbox / reportLocalSandbox)
+// ---------------------------------------------------------------------------
+
+/// The shared driver-registration gate: every sandbox method requires the
+/// caller to have registered via `session.registerDriver` first — the exact
+/// `-32001` gate `session.sendMessage` uses. Returns the error pair to emit,
+/// or `None` when the caller may proceed.
+fn require_registered_driver(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    method: &str,
+) -> Option<(i64, String)> {
+    if state.is_registered_driver(&session.id, acting_client_key_id) {
+        None
+    } else {
+        Some((
+            -32001,
+            format!("call session.registerDriver before {method}"),
+        ))
+    }
+}
+
+/// Log one sandbox lifecycle event through the broadcast choke point,
+/// swallowing (but tracing) a persistence failure — lifecycle visibility must
+/// never turn a working sandbox operation into an RPC error after the fact.
+fn log_sandbox_event(
+    state: &AppState,
+    session_id: &str,
+    client_key_id: &str,
+    event_type: EventType,
+    payload: &Value,
+) -> Option<crate::store::sessions::EventRecord> {
+    match broadcast::insert_and_publish(
+        &state.store,
+        &state.broadcaster,
+        session_id,
+        Some(client_key_id),
+        event_type,
+        payload,
+    ) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            tracing::error!("failed to log {event_type}: {e}");
+            None
+        }
+    }
+}
+
+/// `session.startRemoteSandbox` (`params: {"image": string}`).
+///
+/// Validates `image` against **this session's own profile's**
+/// `available_sandboxes` only — the profile bound to the session is the only
+/// trust boundary for what the session may launch; an image declared on some
+/// *other* profile is rejected identically to one unknown anywhere
+/// (`-32011 sandbox_image_not_allowed`). On success the handle is retained
+/// session-wide (one remote sandbox per session, shared by every driver, like
+/// MCP servers) and `session.sandbox.start` → `session.sandbox.running`
+/// bracket the driver call; a driver failure logs `session.sandbox.error`
+/// (`phase: "start"`) and returns `-32012 sandbox_start_failed`.
+async fn start_remote_sandbox_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) = require_registered_driver(
+        state,
+        session,
+        acting_client_key_id,
+        "session.startRemoteSandbox",
+    ) {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    if session.state != STATE_OPEN {
+        let state_str = session.state.clone();
+        return single_or_empty(
+            id_present,
+            error_obj(req_id, -32000, format!("session is {state_str}, not open")),
+        );
+    }
+    let image = match params.get("image").and_then(Value::as_str) {
+        Some(i) if !i.trim().is_empty() => i.to_owned(),
+        _ => {
+            return single_or_empty(
+                id_present,
+                error_obj(req_id, -32602, "Invalid params: missing \"image\""),
+            )
+        }
+    };
+
+    // Load this session's own profile — the same lookup sendMessage performs —
+    // and enforce its allowlist. Never any other profile's list.
+    let profile =
+        match state
+            .store
+            .with_conn(|c| profiles::get(c, &session.profile_id))
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32000,
+                    "profile_unavailable: the profile bound to this session is no longer available",
+                ),
+            ),
+            Err(e) => {
+                tracing::error!("database error in /rpc: {e}");
+                return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+            }
+        };
+    if !profile.sandbox_image_names().iter().any(|n| n == &image) {
+        return single_or_empty(
+            id_present,
+            error_obj(
+                req_id,
+                -32011,
+                format!(
+                    "sandbox_image_not_allowed: image {image:?} is not in this session \
+                     profile's available_sandboxes"
+                ),
+            ),
+        );
+    }
+    // One remote sandbox per session: a second start is rejected before any
+    // lifecycle event fires (stop the current one first).
+    if state.sandbox(&session.id).is_some() {
+        return single_or_empty(
+            id_present,
+            error_obj(
+                req_id,
+                -32000,
+                "a remote sandbox is already running for this session; \
+                 call session.stopRemoteSandbox first",
+            ),
+        );
+    }
+
+    // Request accepted: log the intent, then call the driver. ensure_image is
+    // defensive — the profile-write provisioning may not have finished, or the
+    // server may have restarted since.
+    log_sandbox_event(
+        state,
+        &session.id,
+        acting_client_key_id,
+        EventType::SandboxStart,
+        &json!({ "image": image, "dispatch": "remote" }),
+    );
+    let started = async {
+        state.sandbox_driver.ensure_image(&image).await?;
+        state.sandbox_driver.start(&image).await
+    }
+    .await;
+    let handle = match started {
+        Ok(h) => h,
+        Err(e) => {
+            let detail = e.to_string();
+            log_sandbox_event(
+                state,
+                &session.id,
+                acting_client_key_id,
+                EventType::SandboxError,
+                &json!({
+                    "image": image,
+                    "phase": "start",
+                    "detail": detail,
+                    "dispatch": "remote",
+                }),
+            );
+            return single_or_empty(
+                id_present,
+                error_obj(req_id, -32012, format!("sandbox_start_failed: {detail}")),
+            );
+        }
+    };
+
+    let sandbox_id = handle.id.clone();
+    state.insert_sandbox(&session.id, handle);
+    let running = log_sandbox_event(
+        state,
+        &session.id,
+        acting_client_key_id,
+        EventType::SandboxRunning,
+        &json!({ "image": image, "sandbox_id": sandbox_id, "dispatch": "remote" }),
+    );
+    let started_at = running
+        .map(|r| Value::String(r.created_at))
+        .unwrap_or(Value::Null);
+    single_or_empty(
+        id_present,
+        result_obj(
+            req_id,
+            json!({ "sandbox_id": sandbox_id, "image": image, "started_at": started_at }),
+        ),
+    )
+}
+
+/// `session.execRemoteSandbox` (`params: {"command": string}`).
+///
+/// The **manual** remote-dispatch path: a synchronous utility call (no
+/// session-loop involvement) running one fully-interpolated command in the
+/// session's live remote sandbox and returning `{stdout, stderr, exit_code}`
+/// raw — the harness constructs its own tool_result from it. A driver failure
+/// also logs `session.sandbox.error` (`phase: "exec"`) so a broken remote
+/// sandbox is visible in the event log even when dispatched manually.
+async fn exec_remote_sandbox_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) = require_registered_driver(
+        state,
+        session,
+        acting_client_key_id,
+        "session.execRemoteSandbox",
+    ) {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    let command = match params.get("command").and_then(Value::as_str) {
+        Some(c) => c.to_owned(),
+        None => {
+            return single_or_empty(
+                id_present,
+                error_obj(req_id, -32602, "Invalid params: missing \"command\""),
+            )
+        }
+    };
+    let Some(entry) = state.sandbox(&session.id) else {
+        return single_or_empty(
+            id_present,
+            error_obj(
+                req_id,
+                -32013,
+                "sandbox_not_running: no remote sandbox is running for this session",
+            ),
+        );
+    };
+    // The handle lock is held across the driver await, exactly like an MCP
+    // tools/call dispatch holds its session lock.
+    let handle = entry.lock().await;
+    match state.sandbox_driver.exec(&handle, &command).await {
+        Ok(r) => single_or_empty(
+            id_present,
+            result_obj(
+                req_id,
+                json!({ "stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code }),
+            ),
+        ),
+        Err(e) => {
+            let detail = e.to_string();
+            log_sandbox_event(
+                state,
+                &session.id,
+                acting_client_key_id,
+                EventType::SandboxError,
+                &json!({
+                    "image": handle.image,
+                    "sandbox_id": handle.id,
+                    "phase": "exec",
+                    "detail": detail,
+                    "dispatch": "remote",
+                }),
+            );
+            single_or_empty(
+                id_present,
+                error_obj(req_id, -32000, format!("sandbox exec failed: {detail}")),
+            )
+        }
+    }
+}
+
+/// `session.reportLocalSandbox` (`params: {"state", "image", "container_id"?,
+/// "detail"?}`).
+///
+/// Client-originated **local**-sandbox lifecycle telemetry: maps `state` to
+/// the matching lifecycle event with `"dispatch": "local"`, attributed to the
+/// caller's client key, through the same broadcast choke point as everything
+/// else. Deliberately performs **no** `available_sandboxes` validation — a
+/// local sandbox is the harness developer's own trust decision, and this path
+/// is visibility, not a security gate. Scoped to local only (no `scope`
+/// parameter exists), so a client can never forge a *remote* lifecycle event
+/// here; any registered driver may report, current turn owner or not.
+fn report_local_sandbox_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) = require_registered_driver(
+        state,
+        session,
+        acting_client_key_id,
+        "session.reportLocalSandbox",
+    ) {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    let event_type = match params.get("state").and_then(Value::as_str) {
+        Some("running") => EventType::SandboxRunning,
+        Some("stopped") => EventType::SandboxStopped,
+        Some("error") => EventType::SandboxError,
+        _ => {
+            return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32602,
+                    "Invalid params: \"state\" must be \"running\", \"stopped\", or \"error\"",
+                ),
+            )
+        }
+    };
+    let Some(image) = params.get("image").and_then(Value::as_str) else {
+        return single_or_empty(
+            id_present,
+            error_obj(req_id, -32602, "Invalid params: missing \"image\""),
+        );
+    };
+    let payload = json!({
+        "dispatch": "local",
+        "image": image,
+        "container_id": params.get("container_id").cloned().unwrap_or(Value::Null),
+        "detail": params.get("detail").cloned().unwrap_or(Value::Null),
+    });
+    match broadcast::insert_and_publish(
+        &state.store,
+        &state.broadcaster,
+        &session.id,
+        Some(acting_client_key_id),
+        event_type,
+        &payload,
+    ) {
+        Ok(_) => single_or_empty(id_present, result_obj(req_id, json!({ "reported": true }))),
+        Err(e) => {
+            tracing::error!("database error in /rpc: {e}");
+            single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

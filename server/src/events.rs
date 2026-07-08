@@ -62,11 +62,46 @@ pub enum EventType {
     /// JSON-RPC method.
     #[serde(rename = "session.driver.register")]
     SessionDriverRegistered,
+    /// Driver-connect notification listing the session profile's declared
+    /// sandbox images and their provisioning status. Always scoped to the
+    /// session's own profile — never a cross-profile view.
+    #[serde(rename = "session.sandbox.available")]
+    SandboxAvailable,
+    /// A `session.startRemoteSandbox` request was accepted (image validated
+    /// against the profile allowlist) and the driver is about to be called.
+    #[serde(rename = "session.sandbox.start")]
+    SandboxStart,
+    /// A sandbox is up: the server's remote sandbox started (`dispatch:
+    /// "remote"`), or a client reported its own local one (`dispatch: "local"`
+    /// via `session.reportLocalSandbox`).
+    #[serde(rename = "session.sandbox.running")]
+    SandboxRunning,
+    /// A `session.stopRemoteSandbox` request (or a session-close implicit
+    /// stop) was accepted and the driver is about to be called.
+    #[serde(rename = "session.sandbox.stop")]
+    SandboxStop,
+    /// A sandbox is down: the server's remote sandbox stopped (`dispatch:
+    /// "remote"`) or a client reported its local one stopped (`dispatch:
+    /// "local"`).
+    #[serde(rename = "session.sandbox.stopped")]
+    SandboxStopped,
+    /// A sandbox driver call failed at any lifecycle phase — remote
+    /// (`dispatch: "remote"`, with a `phase` of start/stop/exec) or
+    /// client-reported local (`dispatch: "local"`).
+    #[serde(rename = "session.sandbox.error")]
+    SandboxError,
+    /// One Auto-mode sandbox tool dispatch (mirrors `mcp.request` — unprefixed
+    /// on purpose: dispatch events, not lifecycle state transitions).
+    #[serde(rename = "sandbox.request")]
+    SandboxRequest,
+    /// The result of an Auto-mode sandbox dispatch (mirrors `mcp.response`).
+    #[serde(rename = "sandbox.response")]
+    SandboxResponse,
 }
 
 impl EventType {
     /// Every variant, in definition order. Handy for tests and documentation.
-    pub const ALL: [EventType; 14] = [
+    pub const ALL: [EventType; 22] = [
         EventType::ClientMessageSend,
         EventType::ServerMessageSend,
         EventType::ProviderRequest,
@@ -81,6 +116,14 @@ impl EventType {
         EventType::SessionCompaction,
         EventType::SessionJoin,
         EventType::SessionDriverRegistered,
+        EventType::SandboxAvailable,
+        EventType::SandboxStart,
+        EventType::SandboxRunning,
+        EventType::SandboxStop,
+        EventType::SandboxStopped,
+        EventType::SandboxError,
+        EventType::SandboxRequest,
+        EventType::SandboxResponse,
     ];
 
     /// The canonical wire/storage string for this event type.
@@ -103,6 +146,14 @@ impl EventType {
             EventType::SessionCompaction => "session.compaction",
             EventType::SessionJoin => "session.join",
             EventType::SessionDriverRegistered => "session.driver.register",
+            EventType::SandboxAvailable => "session.sandbox.available",
+            EventType::SandboxStart => "session.sandbox.start",
+            EventType::SandboxRunning => "session.sandbox.running",
+            EventType::SandboxStop => "session.sandbox.stop",
+            EventType::SandboxStopped => "session.sandbox.stopped",
+            EventType::SandboxError => "session.sandbox.error",
+            EventType::SandboxRequest => "sandbox.request",
+            EventType::SandboxResponse => "sandbox.response",
         }
     }
 }
@@ -146,7 +197,7 @@ mod tests {
         for ev in EventType::ALL {
             assert!(seen.insert(ev.as_str()), "duplicate wire string: {ev}");
         }
-        assert_eq!(seen.len(), 14);
+        assert_eq!(seen.len(), 22);
     }
 
     #[test]

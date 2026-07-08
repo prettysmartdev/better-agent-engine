@@ -27,6 +27,7 @@ Flag-beats-env-var precedence: when `--config` and `BAE_CONFIG` are both set,
 | `BAE_ADMIN_KEY_FILE` | `/var/lib/bae/admin-key.pem` | Plaintext admin-key file. Written by the server only when it self-generates a key (first boot or `--rotate-admin-key`); read by `baectl`. Overridden by `--admin-key-file`. |
 | `BAE_ADMIN_KEY_HASH_FILE` | `/var/lib/bae/admin-key-hash.pem` | Pre-provisioned Argon2id admin-key hash file (read-only input — the server never writes it). Used for the multi-replica pre-provisioning flow. Overridden by `--admin-key-hash-file`. |
 | `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH` | _(unset)_ | Truthy (`1` or case-insensitive `true`) disables admin-port authentication entirely — the pre-this-feature zero-auth behavior. Also settable via `--dangerously-disable-admin-auth`. **Do not use in production**; see [Admin authentication](../guides/admin-authentication.md#disabling-admin-auth). |
+| `BAE_SANDBOX_DRIVER` | `docker` | Which `SandboxDriver` implementation the server uses to launch sandboxes for [`session.startRemoteSandbox`](client-api.md#sessionstartremotesandbox): `docker` or `apple-container`. Any other value is a startup usage error (exit code 2, `ConfigError::InvalidSandboxDriver`). One driver is chosen server-wide, not per-profile — it reflects what container engine is actually installed on *this host*; `available_sandboxes` (see [Profiles — Available sandboxes](../profiles.md#available-sandboxes)) is the per-profile *image allowlist* layered on top of it. See [Sandboxes](../guides/sandboxes.md). |
 
 Provider credentials (e.g. `ANTHROPIC_API_KEY`) are not BAE variables — they
 are referenced from `[providers]` registry entries in `bae-config.toml` using
@@ -277,6 +278,58 @@ the profile request/response shape.
 
 ---
 
+## Sandbox driver
+
+`BAE_SANDBOX_DRIVER` selects which `SandboxDriver` implementation the server
+uses to launch containers for `session.startRemoteSandbox` — see
+[Sandboxes](../guides/sandboxes.md) for the full feature and
+[Profiles — Available sandboxes](../profiles.md#available-sandboxes) for the
+per-profile image allowlist layered on top of it.
+
+| Value | Driver |
+|---|---|
+| `docker` (default) | Shells out to the `docker` CLI: `docker image inspect`/`pull`, `docker run -d --rm <image> sleep infinity`, `docker exec <id> sh -c <command>`, `docker stop <id>`. |
+| `apple-container` | Shells out to the `container` CLI (`container images inspect`/`pull`/`run`/`exec`/`stop`). Only usable on macOS. |
+
+Any other value is a fatal startup usage error (exit code 2,
+`ConfigError::InvalidSandboxDriver`).
+
+The driver is chosen **once, server-wide** — never per-profile — because it
+reflects what container engine is actually installed on *this host*.
+`available_sandboxes` (a profile field) is a separate, per-profile concern:
+the *image allowlist* on top of whichever host-wide driver is configured.
+
+### `apple-container` on a non-macOS host
+
+Selecting `apple-container` on a host that isn't macOS is only fatal at
+startup **if at least one profile declares a non-empty
+`available_sandboxes`** — a driver that cannot function is only a problem
+once something actually depends on it. If no profile declares any sandbox
+images, the server starts anyway with a driver that fails every call as
+`Unsupported` (so a later profile update that adds `available_sandboxes`
+would need `BAE_SANDBOX_DRIVER` corrected and the server restarted). This
+mirrors the exit-code-2 usage-error posture already used for other
+operator-authoring mistakes (e.g. a malformed `bae-config.toml`).
+
+### Abandoned containers are not automatically cleaned up
+
+**A server that is killed (not gracefully closed) leaves no record of the
+sandbox containers it started, and does not clean them up.** Both the
+in-memory map of running remote sandboxes and the per-profile image-status
+cache are process-local state — the same posture as the MCP session
+registry — so a restarted server has no way to know what a *prior* process
+started. There is **no startup reconciliation pass** that inspects the host
+for stray containers from a previous run.
+
+Operators running the Docker or Apple Containers driver in production should
+rely on `--rm`-equivalent-on-crash host-level hygiene (the containers this
+work item starts are themselves launched with `--rm`, so they are removed
+when they stop cleanly — the gap is specifically containers left **running**
+by an ungracefully-killed server) or a periodic external sweep. Do not
+assume the server will ever clean these up on your behalf.
+
+---
+
 ## Example configs
 
 Ready-to-run examples are in [`examples/bae-config/`](../../examples/bae-config/):
@@ -341,3 +394,39 @@ Items are sorted by name. `base_url` is always the **effective** value
 (resolved default when the entry omitted it, or the explicit value
 otherwise) — never `auth_token`. See
 [Admin API](admin-api.md#get-adminv1providers).
+
+---
+
+## Admin endpoint: `GET /admin/v1/sandbox-status`
+
+Returns the in-memory sandbox-image provisioning status for every profile
+that has declared `available_sandboxes` — useful to confirm an image finished
+pulling without grepping server logs:
+
+```sh
+curl http://127.0.0.1:8081/admin/v1/sandbox-status
+```
+
+```json
+{
+  "items": [
+    {
+      "profile_id": "pro_…",
+      "images": [
+        {"name": "python:3.12", "status": "available"},
+        {"name": "node:22", "status": "error", "detail": "pull failed: unauthorized"}
+      ]
+    }
+  ]
+}
+```
+
+One item **per profile** — never a flat, cross-profile image list, the same
+per-profile scoping [`session.sandbox.available`](message-types.md#sessionsandboxavailable)
+and `session.startRemoteSandbox` enforce (see
+[Sandboxes — The profile-scoping guarantee](../guides/sandboxes.md#the-profile-scoping-guarantee)).
+Items are sorted by `profile_id`, then by image name within each profile.
+`status` is one of `pending`/`available`/`error`; `detail` is present only on
+`error`. Rebuilt from a fresh `pending` state for every declared image at
+server restart (see [Abandoned containers](#abandoned-containers-are-not-automatically-cleaned-up)
+above — this endpoint reflects the current process's view only).

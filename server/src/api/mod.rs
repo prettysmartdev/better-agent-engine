@@ -28,6 +28,7 @@ use crate::config_file::McpServerConfig;
 use crate::engine::broadcast::EventBroadcaster;
 use crate::engine::mcp::McpSession;
 use crate::engine::provider::ProviderConfig;
+use crate::engine::sandbox::{DockerDriver, SandboxDriver, SandboxHandle, SandboxImageStatus};
 use crate::store::Store;
 
 /// Request-logging middleware shared by both routers: one line per request with
@@ -57,6 +58,22 @@ pub async fn log_requests(request: Request, next: Next) -> Response {
 /// session close. Each value is behind a [`tokio::sync::Mutex`] because a
 /// `tools/call` dispatch holds it across `.await`.
 type McpSessions = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<McpSession>>>>>;
+
+/// The one live remote sandbox per session, keyed by session id. Same shape as
+/// [`McpSessions`] (an `exec` dispatch holds the inner lock across an
+/// `.await`). Started by `session.startRemoteSandbox`, removed by
+/// `session.stopRemoteSandbox` or session close.
+type Sandboxes = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<SandboxHandle>>>>>;
+
+/// Pull status of every profile-declared sandbox image, keyed
+/// `profile_id -> image -> status`. In-memory only (like [`McpSessions`]):
+/// rebuilt from `Pending` and re-provisioned for every declaring profile at
+/// server startup, so status is never permanently stale. **Consumers must
+/// always index by a specific `profile_id`** — never flatten/scan the whole
+/// map — because it spans every profile on the server and per-profile scoping
+/// is the trust boundary (see `session.sandbox.available` and
+/// `session.startRemoteSandbox`).
+type SandboxStatusMap = Arc<Mutex<HashMap<String, HashMap<String, SandboxImageStatus>>>>;
 
 /// A paused turn whose FIFO-gate guard is parked between HTTP requests.
 ///
@@ -125,6 +142,14 @@ pub struct AppState {
     /// How long a paused turn may await its owner's continuation before being
     /// treated as abandoned (`BAE_TURN_TIMEOUT`).
     pub turn_timeout: Duration,
+    /// The host-wide sandbox driver (`BAE_SANDBOX_DRIVER`), constructed once
+    /// at startup — same `Arc<...>`, cheap-to-clone shape as
+    /// [`AppState::mcp_registry`] / [`AppState::provider_registry`].
+    pub sandbox_driver: Arc<dyn SandboxDriver>,
+    /// Live remote sandboxes, keyed by session id. See [`Sandboxes`].
+    pub sandboxes: Sandboxes,
+    /// Sandbox image provisioning status per profile. See [`SandboxStatusMap`].
+    pub sandbox_status: SandboxStatusMap,
 }
 
 impl AppState {
@@ -158,6 +183,9 @@ impl AppState {
             turn_gates: Arc::new(Mutex::new(HashMap::new())),
             pending_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_timeout: Duration::from_secs(crate::config::DEFAULT_TURN_TIMEOUT_SECS),
+            sandbox_driver: Arc::new(DockerDriver::new()),
+            sandboxes: Arc::new(Mutex::new(HashMap::new())),
+            sandbox_status: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -191,6 +219,77 @@ impl AppState {
             .lock()
             .expect("mcp_sessions mutex poisoned")
             .remove(session_id)
+    }
+
+    /// Retain the live remote sandbox for a session. Called by
+    /// `session.startRemoteSandbox` once the driver reports the container up.
+    pub fn insert_sandbox(&self, session_id: &str, handle: SandboxHandle) {
+        self.sandboxes
+            .lock()
+            .expect("sandboxes mutex poisoned")
+            .insert(
+                session_id.to_owned(),
+                Arc::new(tokio::sync::Mutex::new(handle)),
+            );
+    }
+
+    /// The session's live remote sandbox, if one was started.
+    pub fn sandbox(&self, session_id: &str) -> Option<Arc<tokio::sync::Mutex<SandboxHandle>>> {
+        self.sandboxes
+            .lock()
+            .expect("sandboxes mutex poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Remove and return a session's remote sandbox (for the shared stop
+    /// helper). The entry is removed up front — before the driver's `stop`
+    /// call — so a failed stop can never leave a phantom handle behind.
+    pub fn take_sandbox(&self, session_id: &str) -> Option<Arc<tokio::sync::Mutex<SandboxHandle>>> {
+        self.sandboxes
+            .lock()
+            .expect("sandboxes mutex poisoned")
+            .remove(session_id)
+    }
+
+    /// Seed every image in `images` at [`SandboxImageStatus::Pending`] for
+    /// `profile_id`, replacing the profile's previous entry. Called
+    /// synchronously at profile write (and per-profile at startup), *before*
+    /// the provisioning task is spawned, so a client connecting immediately
+    /// after sees `pending` rather than nothing.
+    pub fn seed_sandbox_status(&self, profile_id: &str, images: &[String]) {
+        let seeded: HashMap<String, SandboxImageStatus> = images
+            .iter()
+            .map(|i| (i.clone(), SandboxImageStatus::Pending))
+            .collect();
+        self.sandbox_status
+            .lock()
+            .expect("sandbox_status mutex poisoned")
+            .insert(profile_id.to_owned(), seeded);
+    }
+
+    /// Record the provisioning outcome for one profile-declared image.
+    pub fn set_sandbox_status(&self, profile_id: &str, image: &str, status: SandboxImageStatus) {
+        self.sandbox_status
+            .lock()
+            .expect("sandbox_status mutex poisoned")
+            .entry(profile_id.to_owned())
+            .or_default()
+            .insert(image.to_owned(), status);
+    }
+
+    /// The provisioning status of one image **on one specific profile** —
+    /// deliberately the only read shape offered, so callers cannot
+    /// accidentally scan across profiles. An unknown profile/image reads as
+    /// [`SandboxImageStatus::Pending`].
+    pub fn sandbox_image_status(&self, profile_id: &str, image: &str) -> SandboxImageStatus {
+        self.sandbox_status
+            .lock()
+            .expect("sandbox_status mutex poisoned")
+            .get(profile_id)
+            .and_then(|m| m.get(image))
+            .cloned()
+            .unwrap_or(SandboxImageStatus::Pending)
     }
 
     /// Record a `session.registerDriver` call. Returns whether the client key

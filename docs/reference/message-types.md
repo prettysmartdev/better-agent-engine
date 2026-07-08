@@ -182,11 +182,26 @@ The server or harness is about to invoke a tool.
 }
 ```
 
-- `dispatch` is `"client"` for tools declared at session open and `"mcp"` for
-  tools handled server-side by a configured MCP server.
-- `server_name` is the MCP server's name from `bae-config.toml`, or `null` if
-  dispatch is `"client"` or if the tool name was not found in any server's tool
-  list (indicates a mis-routed call).
+**Sandbox dispatch (Auto-mode):**
+
+```json
+{
+  "id":          "tu_def456",
+  "name":        "run_shell_command",
+  "input":       {"command": "python --version"},
+  "dispatch":    "sandbox",
+  "server_name": null
+}
+```
+
+- `dispatch` is `"client"` for tools declared at session open, `"mcp"` for
+  tools handled server-side by a configured MCP server, and `"sandbox"` for
+  Auto-mode sandbox tools declared in the session's `sandbox_tools` array and
+  dispatched server-side against the session's remote sandbox — see
+  [Sandboxes — Auto vs. manual remote dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch).
+- `server_name` is the MCP server's name from `bae-config.toml` for `"mcp"`
+  dispatch, or `null` for `"client"`/`"sandbox"` dispatch, or if the tool name
+  was not found in any server's tool list (indicates a mis-routed call).
 
 ---
 
@@ -230,9 +245,29 @@ The result returned from a tool call.
 }
 ```
 
-- `content` mirrors the `tool_result` block the provider receives.
-- `is_error: true` means the MCP call failed or returned an error; the session
-  continues and the provider receives the error content so it can adjust.
+**Sandbox result (Auto-mode):**
+
+```json
+{
+  "tool_use_id": "tu_def456",
+  "dispatch":    "sandbox",
+  "is_error":    false,
+  "content":     [{"type": "text", "text": "Python 3.12.3\n"}]
+}
+```
+
+- `content` mirrors the `tool_result` block the provider receives. For a
+  sandbox result, it is rendered from the exec result as stdout, then
+  `\n[stderr]\n<stderr>` if stderr is non-empty, then `\n[exit_code: N]` if
+  the exit code is non-zero.
+- `is_error: true` means the MCP or sandbox call failed (or, for sandbox, the
+  command exited non-zero) or returned an error; the session continues and
+  the provider receives the error content so it can adjust.
+- A sandbox-dispatch call with no remote sandbox currently started for the
+  session reuses the exact same error-tool-result shape as an MCP call with
+  no configured server: `[{"type":"text","text":"sandbox error: no remote
+  sandbox is running for tool '<name>'; call session.startRemoteSandbox
+  first"}]`.
 
 ---
 
@@ -280,6 +315,60 @@ A response from an MCP server.
 
 ---
 
+### `sandbox.request`
+
+An Auto-dispatch sandbox tool call about to run — one per `tool_use`, in
+`run_turn`. Deliberately **unprefixed**, mirroring `mcp.request`/
+`mcp.response` (the `session.sandbox.*` prefix is reserved for lifecycle
+state transitions, not per-call dispatch — see
+[Sandboxes](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)).
+
+```json
+{
+  "tool":    "run_shell_command",
+  "input":   {"command": "python --version"},
+  "command": "python --version"
+}
+```
+
+- `command` is `input.command`, or `null` if the tool's input has no string
+  `command` field (a misconfigured Auto-mode tool declaration).
+
+---
+
+### `sandbox.response`
+
+The result of an Auto-dispatch sandbox tool call.
+
+**Success:**
+
+```json
+{
+  "sandbox_id": "…",
+  "ok":         true,
+  "result":     {"stdout": "Python 3.12.3\n", "stderr": "", "exit_code": 0}
+}
+```
+
+**Driver error:**
+
+```json
+{ "sandbox_id": "…", "ok": false, "error": "exec failed: …" }
+```
+
+**No sandbox started / missing `command`:**
+
+```json
+{ "sandbox_id": null, "ok": false, "error": "no remote sandbox is running for tool 'run_shell_command'; call session.startRemoteSandbox first" }
+```
+
+- A non-zero exit code sets `ok: false` and the corresponding `tool.result`'s
+  `is_error: true` — the same posture as an MCP tool call: a non-zero exit is
+  a tool-level error the model sees and can react to, not a transport-level
+  RPC error.
+
+---
+
 ### `session.open`
 
 Emitted when the session is created.
@@ -287,12 +376,17 @@ Emitted when the session is created.
 ```json
 {
   "client_version": "1.0.0",
-  "tools":          ["get_current_time"]
+  "tools":          ["get_current_time"],
+  "sandbox_tools":  ["run_shell_command"]
 }
 ```
 
 - `client_version` is `null` if not provided at session creation.
 - `tools` is the list of tool names declared at open (client-side tools only).
+- `sandbox_tools` is the list of Auto-mode sandbox tool names declared at
+  open (see [Client API — `sandbox_tools`](client-api.md#post-apiv1sessions--open-a-session)
+  and [Sandboxes](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)) —
+  empty when none were registered.
 
 ---
 
@@ -306,13 +400,14 @@ tool set" fact, just via the join path instead of create.
 ```json
 {
   "client_version": "1.2.0",
-  "tools":          ["only_b"]
+  "tools":          ["only_b"],
+  "sandbox_tools":  []
 }
 ```
 
 - `client_version` is `null` if not provided at join.
-- `tools` is the **joining client's own** declared tool list (client-side
-  tools only) — never merged with the creator's or any other joiner's.
+- `tools`/`sandbox_tools` are the **joining client's own** declared tool
+  lists — never merged with the creator's or any other joiner's.
 - The event's `client_key_id` column is the **joiner**, not the session's
   original creator.
 - See [Client API — `POST .../join`](client-api.md#post-apiv1sessionsidjoin--join-an-existing-session)
@@ -336,6 +431,114 @@ it.
   column, not the payload, to identify the acting client).
 - See [Client API — `session.registerDriver`](client-api.md#sessionregisterdriver)
   and [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration).
+
+---
+
+### `session.sandbox.available`
+
+Emitted immediately after `session.driver.register`, when the registering
+client key's session's own profile has a non-empty `available_sandboxes`. A
+profile with an empty `available_sandboxes` emits no such event.
+
+```json
+{
+  "images": [
+    {"name": "python:3.12", "status": "available"},
+    {"name": "node:22", "status": "error", "detail": "pull failed: unauthorized"}
+  ]
+}
+```
+
+- `status` is one of `"pending"`, `"available"`, `"error"`.
+- `detail` is present only when `status` is `"error"`.
+- Built by iterating **this session's own profile's** `available_sandboxes`
+  list only — never a flattened, cross-profile view, even though the
+  server's image-status tracking internally covers every profile. See
+  [Sandboxes — The profile-scoping guarantee](../guides/sandboxes.md#the-profile-scoping-guarantee).
+
+---
+
+### `session.sandbox.start` / `session.sandbox.running`
+
+Emitted by [`session.startRemoteSandbox`](client-api.md#sessionstartremotesandbox):
+`start` when the request is accepted and the image validated, `running` once
+the driver's `start` call actually succeeds.
+
+```json
+{ "image": "python:3.12", "dispatch": "remote" }
+```
+
+```json
+{ "image": "python:3.12", "sandbox_id": "…", "dispatch": "remote" }
+```
+
+`session.sandbox.running` can also originate from a **local** sandbox via
+`session.reportLocalSandbox` (below), distinguished by `"dispatch": "local"`:
+
+```json
+{ "image": "python:3.12", "container_id": "…", "detail": null, "dispatch": "local" }
+```
+
+---
+
+### `session.sandbox.stop` / `session.sandbox.stopped`
+
+Emitted by [`session.stopRemoteSandbox`](client-api.md#sessionstopremotesandbox),
+or automatically at session close for a still-running remote sandbox.
+
+```json
+{ "image": "python:3.12", "sandbox_id": "…", "reason": "explicit", "dispatch": "remote" }
+```
+
+| `reason` | When |
+|---|---|
+| `"explicit"` | Client called `session.stopRemoteSandbox`. |
+| `"session_close"` | The session closed while a remote sandbox was still running. |
+
+`session.sandbox.stopped` mirrors the same shape on success. Like
+`running`, `stopped` can also originate from a local sandbox
+(`session.reportLocalSandbox`, `"dispatch": "local"`):
+
+```json
+{ "dispatch": "local", "image": "python:3.12", "container_id": "…", "detail": null }
+```
+
+---
+
+### `session.sandbox.error`
+
+Emitted whenever a sandbox driver call — remote or client-reported-local —
+fails, at any lifecycle phase.
+
+**Remote** (`phase` present; no `sandbox_id` for a phase-`start` failure,
+since no handle was ever retained):
+
+```json
+{ "image": "python:3.12", "phase": "start", "detail": "…", "dispatch": "remote" }
+```
+
+```json
+{ "image": "python:3.12", "sandbox_id": "…", "phase": "exec", "detail": "…", "dispatch": "remote" }
+```
+
+`phase` is one of `"start"`, `"stop"`, `"exec"`.
+
+**Local** (via `session.reportLocalSandbox`; no `phase` field):
+
+```json
+{ "dispatch": "local", "image": "python:3.12", "container_id": "…", "detail": "…" }
+```
+
+> **`session.sandbox.running`/`stopped`/`error` with `"dispatch": "local"`
+> are self-reported client telemetry, not something the server has
+> verified** — the server cannot confirm a client's claim about its own
+> local container. Contrast with `"dispatch": "remote"`, which the server
+> itself authored by actually driving the underlying container lifecycle.
+> See [Sandboxes — Local sandboxes report their own
+> lifecycle](../guides/sandboxes.md#local-sandboxes-report-their-own-lifecycle)
+> for the full trust-boundary discussion, including the accepted gap where a
+> crashed client leaves a local sandbox with no terminal `stopped`/`error`
+> event.
 
 ---
 
@@ -451,6 +654,29 @@ provider.request
 provider.response      (ok: true)
 server.message.send
 ```
+
+**Remote sandbox: start, Auto-dispatch tool call, stop (single
+`session.sendMessage` call for the tool round-trip, server-side):**
+
+```
+session.registerDriver                              -- session.driver.register, then session.sandbox.available
+session.startRemoteSandbox                          -- session.sandbox.start, session.sandbox.running
+client.message.send
+provider.request
+provider.response      (ok: true)
+tool.call              (dispatch: sandbox)
+sandbox.request        (tool: run_shell_command)
+sandbox.response       (ok: true)
+tool.result            (dispatch: sandbox, is_error: false)
+provider.request
+provider.response      (ok: true)
+server.message.send
+session.stopRemoteSandbox                           -- session.sandbox.stop, session.sandbox.stopped
+```
+
+See [Sandboxes](../guides/sandboxes.md) for the full lifecycle, the
+auto/manual dispatch distinction, and local-sandbox telemetry via
+`session.reportLocalSandbox`.
 
 **Multi-driver session (create, join, both drive):**
 

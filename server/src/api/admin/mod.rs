@@ -17,11 +17,14 @@
 //! - `mcp-servers` — read-only list of the configured MCP registry (no secrets).
 //! - `providers` — read-only list of the configured provider registry (no
 //!   secrets; `base_url` is the effective value).
+//! - `sandbox-status` — read-only, per-profile sandbox image provisioning
+//!   status from the in-memory tracker.
 
 pub mod keys;
 pub mod mcp;
 pub mod profiles;
 pub mod providers;
+pub mod sandbox;
 
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
@@ -57,7 +60,8 @@ pub fn router(state: AppState, auth_enabled: bool) -> Router {
         .route("/admin/v1/keys", post(keys::create).get(keys::list))
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
         .route("/admin/v1/mcp-servers", get(mcp::list))
-        .route("/admin/v1/providers", get(providers::list));
+        .route("/admin/v1/providers", get(providers::list))
+        .route("/admin/v1/sandbox-status", get(sandbox::list));
 
     // Layer auth *below* request logging (added last, so it runs outermost) so
     // that rejected requests are still logged with their 401 status.

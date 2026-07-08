@@ -54,7 +54,11 @@ describe("describeEvent", () => {
       session_id: "ses_1",
       client_key_id: "key_1",
       event_type: "session.open",
-      payload: { client_version: "1.0.0", tools: ["get_time"] },
+      payload: {
+        client_version: "1.0.0",
+        tools: ["get_time"],
+        sandbox_tools: [],
+      },
       created_at: "t",
     };
     expect(describeEvent(open)).toBe("session opened");
@@ -68,5 +72,37 @@ describe("describeEvent", () => {
       created_at: "t",
     };
     expect(describeEvent(toolCall)).toBe("tool call get_time (client)");
+  });
+
+  it("describes the sandbox lifecycle and dispatch events without throwing", () => {
+    const running: SessionEvent = {
+      id: "evt_3",
+      session_id: "ses_1",
+      client_key_id: "key_1",
+      event_type: "session.sandbox.running",
+      payload: {
+        image: "python:3.12",
+        sandbox_id: "c1",
+        dispatch: "remote",
+      },
+      created_at: "t",
+    };
+    expect(describeEvent(running)).toBe(
+      "sandbox running (python:3.12, remote)",
+    );
+
+    const response: SessionEvent = {
+      id: "evt_4",
+      session_id: "ses_1",
+      client_key_id: null,
+      event_type: "sandbox.response",
+      payload: {
+        sandbox_id: "c1",
+        ok: true,
+        result: { stdout: "hi", stderr: "", exit_code: 0 },
+      },
+      created_at: "t",
+    };
+    expect(describeEvent(response)).toBe("sandbox response (ok=true)");
   });
 });

@@ -61,10 +61,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "admin_key_role",
         sql: include_str!("migrations/0006_admin_key_role.sql"),
     },
+    Migration {
+        version: 7,
+        name: "profiles_sandboxes",
+        sql: include_str!("migrations/0007_profiles_sandboxes.sql"),
+    },
 ];
 
 /// The highest migration version this binary knows how to apply.
-pub const LATEST_VERSION: i64 = 6;
+pub const LATEST_VERSION: i64 = 7;
 
 /// A migration-runner failure.
 #[derive(Debug)]

@@ -34,6 +34,29 @@ pub const DEFAULT_SHUTDOWN_SECS: u64 = 30;
 /// as abandoned and releases the session's FIFO gate.
 pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 120;
 
+/// Which container engine backs sandbox execution (`BAE_SANDBOX_DRIVER`).
+///
+/// One driver, chosen server-wide — not per-profile — since it reflects what
+/// container engine is actually installed on *this host*; a profile's
+/// `available_sandboxes` is the per-profile image allowlist on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxDriverKind {
+    /// The `docker` CLI (the default).
+    Docker,
+    /// Apple's `container` CLI (macOS only).
+    AppleContainer,
+}
+
+impl SandboxDriverKind {
+    /// The `BAE_SANDBOX_DRIVER` value naming this driver.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxDriverKind::Docker => "docker",
+            SandboxDriverKind::AppleContainer => "apple-container",
+        }
+    }
+}
+
 /// Fully-validated server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -50,6 +73,9 @@ pub struct Config {
     /// How long a paused turn may await its owner's continuation before being
     /// treated as abandoned (`BAE_TURN_TIMEOUT`).
     pub turn_timeout: Duration,
+    /// Which container engine backs sandbox execution (`BAE_SANDBOX_DRIVER`,
+    /// `docker` by default or `apple-container`).
+    pub sandbox_driver: SandboxDriverKind,
 }
 
 /// A configuration problem detected at startup.
@@ -70,6 +96,9 @@ pub enum ConfigError {
     /// `BAE_ADMIN_ADDR` resolved to a non-loopback address. The admin surface
     /// must never be reachable off-host, so we refuse to start.
     AdminNotLoopback { addr: SocketAddr },
+    /// `BAE_SANDBOX_DRIVER` named something other than `docker` or
+    /// `apple-container`.
+    InvalidSandboxDriver { value: String },
 }
 
 impl ConfigError {
@@ -94,6 +123,11 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "BAE_ADMIN_ADDR: {addr} is not a loopback address; the admin port \
                  must bind to localhost only"
+            ),
+            ConfigError::InvalidSandboxDriver { value } => write!(
+                f,
+                "BAE_SANDBOX_DRIVER: {value:?} is not a supported sandbox driver \
+                 (expected \"docker\" or \"apple-container\")"
             ),
         }
     }
@@ -131,6 +165,7 @@ impl Config {
             "BAE_TURN_TIMEOUT",
             DEFAULT_TURN_TIMEOUT_SECS,
         )?);
+        let sandbox_driver = parse_sandbox_driver(get)?;
 
         Ok(Config {
             addr,
@@ -139,7 +174,21 @@ impl Config {
             log,
             shutdown_timeout,
             turn_timeout,
+            sandbox_driver,
         })
+    }
+}
+
+fn parse_sandbox_driver(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<SandboxDriverKind, ConfigError> {
+    match get("BAE_SANDBOX_DRIVER") {
+        None => Ok(SandboxDriverKind::Docker),
+        Some(v) => match v.trim() {
+            "docker" => Ok(SandboxDriverKind::Docker),
+            "apple-container" => Ok(SandboxDriverKind::AppleContainer),
+            _ => Err(ConfigError::InvalidSandboxDriver { value: v }),
+        },
     }
 }
 
@@ -190,6 +239,7 @@ mod tests {
         assert_eq!(cfg.log, "info");
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
         assert_eq!(cfg.turn_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.sandbox_driver, SandboxDriverKind::Docker);
     }
 
     #[test]
@@ -229,5 +279,42 @@ mod tests {
             Config::resolve(&getter(&[("BAE_SHUTDOWN_TIMEOUT", "soon")])).unwrap_err(),
             ConfigError::InvalidDuration { .. }
         ));
+    }
+
+    #[test]
+    fn sandbox_driver_defaults_to_docker_when_unset() {
+        let cfg = Config::resolve(&getter(&[])).unwrap();
+        assert_eq!(cfg.sandbox_driver, SandboxDriverKind::Docker);
+    }
+
+    #[test]
+    fn sandbox_driver_parses_both_supported_values() {
+        let docker = Config::resolve(&getter(&[("BAE_SANDBOX_DRIVER", "docker")])).unwrap();
+        assert_eq!(docker.sandbox_driver, SandboxDriverKind::Docker);
+        assert_eq!(docker.sandbox_driver.as_str(), "docker");
+
+        let apple = Config::resolve(&getter(&[("BAE_SANDBOX_DRIVER", "apple-container")])).unwrap();
+        assert_eq!(apple.sandbox_driver, SandboxDriverKind::AppleContainer);
+        assert_eq!(apple.sandbox_driver.as_str(), "apple-container");
+    }
+
+    #[test]
+    fn sandbox_driver_value_is_trimmed() {
+        // Surrounding whitespace (a common copy-paste artefact in env files) is
+        // tolerated, matching the `parse_secs` trimming posture.
+        let cfg =
+            Config::resolve(&getter(&[("BAE_SANDBOX_DRIVER", "  apple-container  ")])).unwrap();
+        assert_eq!(cfg.sandbox_driver, SandboxDriverKind::AppleContainer);
+    }
+
+    #[test]
+    fn invalid_sandbox_driver_is_usage_error() {
+        let err = Config::resolve(&getter(&[("BAE_SANDBOX_DRIVER", "podman")])).unwrap_err();
+        match &err {
+            ConfigError::InvalidSandboxDriver { value } => assert_eq!(value, "podman"),
+            other => panic!("expected InvalidSandboxDriver, got {other:?}"),
+        }
+        // A malformed driver name is a usage error (process exit code 2).
+        assert_eq!(err.exit_code(), 2);
     }
 }

@@ -23,6 +23,33 @@ export const VERSION = "0.1.0";
 export { Config, type ConfigOptions } from "./config.js";
 export { Harness, Session, type HarnessOptions } from "./harness.js";
 export type { ToolDefinition, ToolHandler } from "./tool.js";
+export {
+  DockerDriver,
+  AppleContainerDriver,
+  SandboxError,
+  SandboxSession,
+  SandboxTarget,
+  RemoteMode,
+  shellQuote,
+  runShellCommand,
+  runShellNamed,
+  type SandboxDriver,
+  type SandboxHandle,
+  type ExecResult,
+  type RemoteSandboxStarted,
+  type RemoteSandboxStopped,
+  type SandboxErrorKind,
+  type SandboxLifecycleState,
+  type SandboxRpc,
+  type SandboxToolDef,
+  type SandboxTool,
+} from "./sandbox.js";
+export {
+  readFileTool,
+  writeFileTool,
+  exploreFilesTool,
+  type FileToolConfig,
+} from "./files.js";
 export type { Hooks, HookName } from "./hooks.js";
 export {
   FetchTransport,

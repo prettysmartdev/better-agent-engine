@@ -53,7 +53,8 @@ def test_message_from_wire_and_to_wire() -> None:
 
 
 def test_event_type_is_closed_and_complete() -> None:
-    # The exact fourteen strings from the wire contract (§8).
+    # The exact twenty-two strings from the wire contract (§8); WI 0006 added the
+    # eight sandbox events to the original fourteen.
     assert {e.value for e in EventType} == {
         "client.message.send",
         "server.message.send",
@@ -69,6 +70,14 @@ def test_event_type_is_closed_and_complete() -> None:
         "session.close",
         "session.error",
         "session.compaction",
+        "session.sandbox.available",
+        "session.sandbox.start",
+        "session.sandbox.running",
+        "session.sandbox.stop",
+        "session.sandbox.stopped",
+        "session.sandbox.error",
+        "sandbox.request",
+        "sandbox.response",
     }
 
 

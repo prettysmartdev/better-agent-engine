@@ -112,6 +112,14 @@ pub struct CreateSession {
     pub client_version: Option<String>,
     #[serde(default)]
     pub tools: Vec<ClientToolDef>,
+    /// Auto-mode sandbox tools: same `{name, description, input_schema}` shape
+    /// as `tools`, but dispatched **server-side** against the session's remote
+    /// sandbox by `run_turn` (the turn never pauses for them). Kept in a
+    /// sibling list so the two kinds are never confused. Each declared tool's
+    /// input must carry a string `command` property — the server executes
+    /// `input.command` in the sandbox.
+    #[serde(default)]
+    pub sandbox_tools: Vec<ClientToolDef>,
 }
 
 /// Client-safe projection of a profile (no `auth_token`, no env var names).
@@ -210,10 +218,17 @@ pub async fn create(
 
     // Persist the declared tools as-is for the engine to advertise to the LLM
     // (stored under this client's own key in the per-client tools object).
+    // Sandbox tools are deliberately NOT checked against `allowed_tools` —
+    // that allowlist governs client-dispatched tools; the sandbox trust
+    // boundary is the profile's `available_sandboxes` image list, enforced
+    // when a sandbox is started.
     let client_tools = declared_tools_json(&body.tools);
+    let sandbox_tools = declared_tools_json(&body.sandbox_tools);
 
     let session_key = keys::generate_session_key();
     let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
+    let sandbox_tool_names: Vec<&str> =
+        body.sandbox_tools.iter().map(|t| t.name.as_str()).collect();
 
     // Create the session row, its session key, and the session.open event under
     // one lock. The session.open event is inserted inside this transaction (it is
@@ -228,6 +243,7 @@ pub async fn create(
             STATE_OPEN,
             body.client_version.as_deref(),
             &client_tools,
+            &sandbox_tools,
         )
         .map_err(ApiError::from_db)?;
         keys::insert_session_key(c, &session.id, &client_key.id, &profile_id, &session_key)
@@ -243,7 +259,11 @@ pub async fn create(
             &session.id,
             Some(&client_key.id),
             EventType::SessionOpen,
-            &json!({ "client_version": body.client_version, "tools": tool_names }),
+            &json!({
+                "client_version": body.client_version,
+                "tools": tool_names,
+                "sandbox_tools": sandbox_tool_names,
+            }),
         )
         .map_err(ApiError::from_db)?;
         Ok::<_, ApiError>((session, open_event))
@@ -340,15 +360,21 @@ pub async fn join(
     }
 
     // The joiner's own tool declaration, against the same profile's allowlist.
+    // Sandbox tools bypass that allowlist by design (see `create`).
     enforce_tool_allowlist(&profile, &body.tools)?;
     let client_tools = declared_tools_json(&body.tools);
+    let sandbox_tools = declared_tools_json(&body.sandbox_tools);
     let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
+    let sandbox_tool_names: Vec<&str> =
+        body.sandbox_tools.iter().map(|t| t.name.as_str()).collect();
 
     // Upsert this client's tools entry, mint its session key, and log the join
     // under one lock; publish the join event to live watchers afterwards.
     let session_key = keys::generate_session_key();
     let join_event = state.store.with_conn(|c| {
         sessions::set_client_tools(c, &session.id, &client_key.id, &client_tools)
+            .map_err(ApiError::from_db)?;
+        sessions::set_client_sandbox_tools(c, &session.id, &client_key.id, &sandbox_tools)
             .map_err(ApiError::from_db)?;
         keys::insert_session_key(
             c,
@@ -369,7 +395,11 @@ pub async fn join(
             &session.id,
             Some(&client_key.id),
             EventType::SessionJoin,
-            &json!({ "client_version": body.client_version, "tools": tool_names }),
+            &json!({
+                "client_version": body.client_version,
+                "tools": tool_names,
+                "sandbox_tools": sandbox_tool_names,
+            }),
         )
         .map_err(ApiError::from_db)
     })?;
@@ -507,6 +537,7 @@ fn profile_unavailable_at_open(
             STATE_ERROR,
             body.client_version.as_deref(),
             &client_tools,
+            &json!([]),
         )?;
         sessions::insert_event(
             c,
@@ -556,6 +587,7 @@ fn primary_provider_unavailable_at_open(
             STATE_ERROR,
             body.client_version.as_deref(),
             &client_tools,
+            &json!([]),
         )?;
         sessions::insert_event(
             c,
@@ -654,6 +686,85 @@ pub async fn get_events(
 }
 
 // ---------------------------------------------------------------------------
+// Remote sandbox stop (shared by session.stopRemoteSandbox and session close)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a remote-sandbox stop attempt, for the two callers' differing
+/// error reporting (the RPC method surfaces failures; close is best-effort).
+pub(crate) enum SandboxStopOutcome {
+    /// The session had no started remote sandbox; nothing was done.
+    NotRunning,
+    /// The driver stopped the container; `session.sandbox.stopped` was logged.
+    Stopped { image: String, sandbox_id: String },
+    /// The driver's stop failed; `session.sandbox.error` was logged. The
+    /// sandboxes entry is removed anyway — no phantom handle survives.
+    Failed { detail: String },
+}
+
+/// Stop a session's one remote sandbox — the **single** stop path shared by
+/// the explicit `session.stopRemoteSandbox` handler (`reason: "explicit"`) and
+/// session close (`reason: "session_close"`), so the two cannot drift.
+///
+/// The `AppState.sandboxes` entry is removed *before* the driver call: even a
+/// failed stop leaves no handle other calls could still dispatch against.
+/// Emits `session.sandbox.stop` before the driver call, then either
+/// `session.sandbox.stopped` or `session.sandbox.error` (`phase: "stop"`) —
+/// all with `"dispatch": "remote"`, attributed to `client_key_id`.
+pub(crate) async fn stop_remote_sandbox(
+    state: &AppState,
+    session_id: &str,
+    client_key_id: &str,
+    reason: &str,
+) -> SandboxStopOutcome {
+    let Some(entry) = state.take_sandbox(session_id) else {
+        return SandboxStopOutcome::NotRunning;
+    };
+    let handle = entry.lock().await;
+    let payload = json!({
+        "image": handle.image,
+        "sandbox_id": handle.id,
+        "reason": reason,
+        "dispatch": "remote",
+    });
+    let log = |event_type: EventType, payload: &Value| {
+        if let Err(e) = broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            session_id,
+            Some(client_key_id),
+            event_type,
+            payload,
+        ) {
+            tracing::error!("failed to log {event_type}: {e}");
+        }
+    };
+    log(EventType::SandboxStop, &payload);
+    match state.sandbox_driver.stop(&handle).await {
+        Ok(()) => {
+            log(EventType::SandboxStopped, &payload);
+            SandboxStopOutcome::Stopped {
+                image: handle.image.clone(),
+                sandbox_id: handle.id.clone(),
+            }
+        }
+        Err(e) => {
+            let detail = e.to_string();
+            log(
+                EventType::SandboxError,
+                &json!({
+                    "image": handle.image,
+                    "sandbox_id": handle.id,
+                    "phase": "stop",
+                    "detail": detail,
+                    "dispatch": "remote",
+                }),
+            );
+            SandboxStopOutcome::Failed { detail }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DELETE /api/v1/sessions/{id}
 // ---------------------------------------------------------------------------
 
@@ -693,6 +804,14 @@ pub async fn close(
     // until server restart. Both operations are idempotent no-ops when the
     // resources are already gone (e.g. a double DELETE).
     //
+    // Stop the session's remote sandbox first — its stop/stopped lifecycle
+    // events go through the broadcast choke point, so this must run before the
+    // broadcaster entry is dropped for live watchers to see them. A session
+    // with no started sandbox is a no-op here, same as MCP teardown below on a
+    // session with no connected servers; a driver stop failure is logged (as
+    // session.sandbox.error) but never blocks close.
+    stop_remote_sandbox(&state, &session.id, &session.client_key_id, "session_close").await;
+
     // Drop the broadcast channel (dropping the sender ends every live watcher's
     // stream cleanly), tear down any live MCP connections (kill spawned stdio
     // subprocesses and drop the registry entry), then clear the session's
