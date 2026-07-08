@@ -3,7 +3,30 @@
 The admin API is served on `BAE_ADMIN_ADDR` (default `127.0.0.1:8081`). It
 binds to a loopback address only — the server refuses to start with a
 non-loopback admin address. Reach it via `docker exec`, a local process, or
-an SSH tunnel. **No authentication is required on the admin port.**
+an SSH tunnel.
+
+**Every `/admin/v1/*` route requires `Authorization: Bearer <admin_key>`**,
+unless the server was started with `--dangerously-disable-admin-auth`. The
+admin key is generated automatically on first boot and written to
+`BAE_ADMIN_KEY_FILE` (default `/var/lib/bae/admin-key.pem`):
+
+```sh
+docker exec bae cat /var/lib/bae/admin-key.pem
+```
+
+A request with a missing, malformed, or non-matching bearer token gets
+`401 unauthorized`. See the
+[Admin authentication guide](../guides/admin-authentication.md) for the full
+bootstrap/rotation/pre-provisioning lifecycle, and
+[Configuration](configuration.md) for the related env vars
+(`BAE_ADMIN_KEY_FILE`, `BAE_ADMIN_KEY_HASH_FILE`,
+`BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH`).
+
+**[`baectl`](baectl.md) is the recommended way to exercise these endpoints.**
+It auto-discovers the admin address and key with zero configuration when run
+inside the container (`docker exec bae baectl ...`). The examples below use
+raw `curl` to document the exact wire format; every one now includes the
+required `Authorization` header.
 
 All requests and responses use `Content-Type: application/json`. Field names
 are `snake_case`. The admin port is **REST/HTTP throughout** — no JSON-RPC.
@@ -27,6 +50,7 @@ Match on `type` (a short, stable slug) rather than `status` or `title`.
 
 | `type` | HTTP status | When |
 |---|---|---|
+| `unauthorized` | 401 | Missing, malformed, or non-matching `Authorization: Bearer <admin_key>` header. Not returned at all when the server was started with `--dangerously-disable-admin-auth`. |
 | `bad_request` | 400 | Missing or invalid fields. |
 | `not_found` | 404 | Resource does not exist. |
 | `duplicate_name` | 409 | Profile name already taken. |
@@ -269,7 +293,9 @@ from `bae-config.toml` at startup (or reloaded on restart). Useful to confirm
 what a running server has available without reading the config file on disk.
 
 ```sh
-curl http://127.0.0.1:8081/admin/v1/mcp-servers
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+curl http://127.0.0.1:8081/admin/v1/mcp-servers \
+  -H "Authorization: Bearer $ADMIN_KEY"
 ```
 
 **Response `200 OK`:**
@@ -354,3 +380,15 @@ retuning them for a new deployment does not invalidate existing hashes.
 To tune parameters for your hardware: increase memory cost first (more
 resistant to GPU attacks), then iterations. Parallelism can be raised on
 multi-core verifiers but 1 is the conservative default.
+
+### Admin keys vs. client keys
+
+The token that authenticates against `/admin/v1/*` is a **separate role**
+from the client keys this section otherwise describes: admin keys are
+prefixed `bae_admin_` (vs. `bae_` for client keys and `bae_ses_` for session
+keys) and are never returned by any admin-API response — they are only ever
+written to `BAE_ADMIN_KEY_FILE` on the server's local disk. A client or
+session key can never authenticate on the admin port, and an admin key
+cannot be used on the client port. See the
+[Admin authentication guide](../guides/admin-authentication.md) for how
+admin keys are created, rotated, and pre-provisioned.

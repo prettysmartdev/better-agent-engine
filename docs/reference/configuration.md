@@ -24,25 +24,61 @@ Flag-beats-env-var precedence: when `--config` and `BAE_CONFIG` are both set,
 | `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain in-flight requests on SIGTERM. |
 | `BAE_CONFIG` | _(none)_ | Path to a `bae-config.toml` file. Overridden by `--config`. Absence is not an error. |
 | `BAE_TURN_TIMEOUT` | `120` | Seconds a paused turn's owner has to return with its continuation before the turn is considered abandoned and the FIFO gate is released to the next queued driver. See [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration). |
+| `BAE_ADMIN_KEY_FILE` | `/var/lib/bae/admin-key.pem` | Plaintext admin-key file. Written by the server only when it self-generates a key (first boot or `--rotate-admin-key`); read by `baectl`. Overridden by `--admin-key-file`. |
+| `BAE_ADMIN_KEY_HASH_FILE` | `/var/lib/bae/admin-key-hash.pem` | Pre-provisioned Argon2id admin-key hash file (read-only input — the server never writes it). Used for the multi-replica pre-provisioning flow. Overridden by `--admin-key-hash-file`. |
+| `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH` | _(unset)_ | Truthy (`1` or case-insensitive `true`) disables admin-port authentication entirely — the pre-this-feature zero-auth behavior. Also settable via `--dangerously-disable-admin-auth`. **Do not use in production**; see [Admin authentication](../guides/admin-authentication.md#disabling-admin-auth). |
 
 Provider credentials (e.g. `ANTHROPIC_API_KEY`) are not BAE variables — they
 are referenced from `[providers]` registry entries in `bae-config.toml` using
 `${ANTHROPIC_API_KEY}` syntax and resolved by the server at call time. See
 [Profiles](../profiles.md).
 
+### `baectl` environment variables
+
+`baectl` is a separate binary (see [baectl reference](baectl.md)) with its
+own, client-side, environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `BAE_ADMIN_ADDR` | `127.0.0.1:8081` | Admin API address to connect to. Same variable name as the server's listen address — since `baectl` runs inside the same container by default, the value that makes the server listen is also the value that makes `baectl` connect. Overridden by `--admin-addr`. |
+| `BAE_ADMIN_TOKEN` | _(unset)_ | Admin bearer token, sent verbatim. Highest-precedence auth source. Overridden by `--admin-token`. |
+| `BAE_ADMIN_KEY_FILE` | `/var/lib/bae/admin-key.pem` | Path `baectl` reads the plaintext admin key from, if `BAE_ADMIN_TOKEN`/`--admin-token` is not set. Same variable name and default path as the server's own `BAE_ADMIN_KEY_FILE` — `baectl` reads the exact file the server wrote. Overridden by `--admin-key-file`. |
+
+See [baectl reference → Auto-configuration](baectl.md#auto-configuration)
+for the full precedence order on both the address and the token.
+
 ---
 
 ## CLI flags
 
 ```
-baesrv [--config <path>] [serve]   # start the server (default subcommand)
-baesrv [--config <path>] migrate   # run DB migrations and exit
+baesrv [--config <path>] [serve] [SERVE OPTIONS]   # start the server (default subcommand)
+baesrv [--config <path>] migrate                   # run DB migrations and exit
 ```
 
 `--config <path>` and `--config=<path>` are both accepted; the flag may appear
 before or after the subcommand. When `--config` is given it overrides `BAE_CONFIG`.
 A config path pointing to a file that does not exist is **not an error** — the
 server starts with an empty MCP registry.
+
+### `serve` options: admin-port authentication
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--admin-key-file <path>` | `BAE_ADMIN_KEY_FILE` | Plaintext admin-key file path (default `/var/lib/bae/admin-key.pem`). |
+| `--admin-key-hash-file <path>` | `BAE_ADMIN_KEY_HASH_FILE` | Pre-provisioned hash file path (default `/var/lib/bae/admin-key-hash.pem`). |
+| `--rotate-admin-key` | _(none — see below)_ | Revoke the current admin key and mint a fresh one this boot. |
+| `--dangerously-disable-admin-auth` | `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH` | Serve the admin port with no authentication. |
+
+`--rotate-admin-key` is a deliberate exception to this doc's usual
+flag/env-var pairing: it has **no** environment-variable equivalent. An env
+var would rotate the key on every restart of a long-lived deployment (env
+vars persist in compose/Kubernetes manifests across restarts), which is the
+opposite of the one-shot action a rotation should be. Passing
+`--rotate-admin-key` together with `--dangerously-disable-admin-auth` (flag
+or env) is a usage error (exit `2`). See
+[Admin authentication](../guides/admin-authentication.md) for the full
+lifecycle these flags control.
 
 ---
 
@@ -265,7 +301,8 @@ Returns the currently loaded MCP registry — useful to confirm what a running
 server has available without reading the config file:
 
 ```sh
-curl http://127.0.0.1:8081/admin/v1/mcp-servers
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+curl http://127.0.0.1:8081/admin/v1/mcp-servers -H "Authorization: Bearer $ADMIN_KEY"
 ```
 
 ```json

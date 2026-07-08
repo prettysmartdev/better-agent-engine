@@ -8,17 +8,27 @@
 //! Subcommands implemented at this stage: the default `serve`, plus `migrate`
 //! and `version`. `serve` is assumed when no subcommand is given.
 //!
-//! The single global flag is `--config <path>`, giving the path to an optional
-//! `bae-config.toml` (the MCP server and LLM provider registries). It may appear before or after
+//! The `--config <path>` flag gives the path to an optional `bae-config.toml`
+//! (the MCP server and LLM provider registries). It may appear before or after
 //! the subcommand (`baesrv --config x`, `baesrv serve --config x`). When both
 //! `--config` and the `BAE_CONFIG` env var are set, `--config` wins — the
 //! flag-beats-env-var precedence `aspec/uxui/cli.md` commits to.
+//!
+//! `serve` additionally accepts the admin-auth flags `--admin-key-file`,
+//! `--admin-key-hash-file`, `--rotate-admin-key`, and
+//! `--dangerously-disable-admin-auth` (see [`crate::admin_auth`]). Passing
+//! `--rotate-admin-key` together with `--dangerously-disable-admin-auth` is a
+//! usage error (exit 2), caught here at parse time before anything is opened.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 
+use crate::admin_auth::{
+    self, AdminAuthConfig, DEFAULT_ADMIN_KEY_FILE, DEFAULT_ADMIN_KEY_HASH_FILE, ENV_ADMIN_KEY_FILE,
+    ENV_ADMIN_KEY_HASH_FILE, ENV_DISABLE_ADMIN_AUTH,
+};
 use crate::config::Config;
 use crate::config_file::BaeConfigFile;
 
@@ -34,10 +44,29 @@ pub fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let (admin_flags, args) = match parse_admin_flags(&args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("baesrv: {msg}");
+            print_usage();
+            // Usage error.
+            return ExitCode::from(2);
+        }
+    };
+    // Rotating a key that nothing will enforce is contradictory; reject the
+    // combination at parse time, before opening the store or touching any file.
+    if admin_flags.rotate && admin_flags.disable {
+        eprintln!(
+            "baesrv: --rotate-admin-key cannot be combined with \
+             --dangerously-disable-admin-auth"
+        );
+        print_usage();
+        return ExitCode::from(2);
+    }
     let subcommand = args.first().map(String::as_str);
 
     match subcommand {
-        None | Some("serve") => run_serve(config_flag),
+        None | Some("serve") => run_serve(config_flag, admin_flags),
         Some("migrate") => run_migrate(),
         Some("version") | Some("--version") | Some("-V") => {
             print_version();
@@ -98,12 +127,132 @@ fn resolve_config_path_with(flag: Option<PathBuf>, env: Option<PathBuf>) -> Opti
     flag.or(env)
 }
 
-fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
+/// The admin-auth switches parsed off the command line (before the env-var and
+/// default fallbacks are applied in [`resolve_admin_auth_config`]).
+#[derive(Debug, Default)]
+struct AdminFlags {
+    /// `--admin-key-file <path>`; overrides `BAE_ADMIN_KEY_FILE` when set.
+    key_file: Option<PathBuf>,
+    /// `--admin-key-hash-file <path>`; overrides `BAE_ADMIN_KEY_HASH_FILE`.
+    hash_file: Option<PathBuf>,
+    /// `--rotate-admin-key` — one-shot, no env-var equivalent by design.
+    rotate: bool,
+    /// `--dangerously-disable-admin-auth`.
+    disable: bool,
+}
+
+/// Pull the admin-auth flags out of `raw`, returning them plus the remaining
+/// args with those flags removed. Value flags accept both `--flag value` and
+/// `--flag=value`; the two boolean flags take no value. An error string is
+/// returned if a value flag is given without a value.
+fn parse_admin_flags(raw: &[String]) -> Result<(AdminFlags, Vec<String>), String> {
+    let mut flags = AdminFlags::default();
+    let mut rest: Vec<String> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if let Some((value, next)) = take_path_flag(raw, i, "--admin-key-file")? {
+            flags.key_file = Some(value);
+            i = next;
+            continue;
+        }
+        if let Some((value, next)) = take_path_flag(raw, i, "--admin-key-hash-file")? {
+            flags.hash_file = Some(value);
+            i = next;
+            continue;
+        }
+        if arg == "--rotate-admin-key" {
+            flags.rotate = true;
+            i += 1;
+        } else if arg == "--dangerously-disable-admin-auth" {
+            flags.disable = true;
+            i += 1;
+        } else {
+            rest.push(arg.clone());
+            i += 1;
+        }
+    }
+    Ok((flags, rest))
+}
+
+/// Match a `--name <value>` / `--name=<value>` path flag at index `i`. Returns
+/// `Ok(Some((value, next_index)))` on a match, `Ok(None)` if `raw[i]` is not
+/// this flag, and `Err` if the flag is present without a value.
+fn take_path_flag(
+    raw: &[String],
+    i: usize,
+    name: &str,
+) -> Result<Option<(PathBuf, usize)>, String> {
+    let arg = &raw[i];
+    if arg == name {
+        let value = raw
+            .get(i + 1)
+            .ok_or_else(|| format!("{name} requires a path argument"))?;
+        Ok(Some((PathBuf::from(value), i + 2)))
+    } else if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
+        if value.is_empty() {
+            return Err(format!("{name} requires a path argument"));
+        }
+        Ok(Some((PathBuf::from(value), i + 1)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolve the effective admin-auth configuration: each path is the flag value,
+/// else the env var, else the built-in default (flag-beats-env, matching
+/// `--config`). `disabled` is true if the flag is set *or* the
+/// `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH` env var is truthy.
+fn resolve_admin_auth_config(flags: AdminFlags) -> AdminAuthConfig {
+    let key_file = flags
+        .key_file
+        .or_else(|| std::env::var_os(ENV_ADMIN_KEY_FILE).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ADMIN_KEY_FILE));
+    let hash_file = flags
+        .hash_file
+        .or_else(|| std::env::var_os(ENV_ADMIN_KEY_HASH_FILE).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ADMIN_KEY_HASH_FILE));
+    let disabled = flags.disable || env_truthy(ENV_DISABLE_ADMIN_AUTH);
+    AdminAuthConfig {
+        key_file,
+        hash_file,
+        rotate: flags.rotate,
+        disabled,
+    }
+}
+
+/// A `BAE_*` boolean env var is "on" when set to `1` or (case-insensitively)
+/// `true`. Anything else — unset, empty, `0`, `false` — is off.
+fn env_truthy(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
+}
+
+fn run_serve(config_flag: Option<PathBuf>, admin_flags: AdminFlags) -> ExitCode {
     let config = match load_config() {
         Ok(c) => c,
         Err(code) => return code,
     };
     init_tracing(&config.log);
+
+    // Resolve the admin-auth settings (flag > env > default). Re-check the
+    // rotate/disable contradiction here too, since `disabled` may come from the
+    // BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH env var (not only the flag) — still
+    // caught before the store is opened or any file is touched.
+    let admin_cfg = resolve_admin_auth_config(admin_flags);
+    if admin_cfg.rotate && admin_cfg.disabled {
+        eprintln!(
+            "baesrv: --rotate-admin-key cannot be combined with admin auth being \
+             disabled (--dangerously-disable-admin-auth / \
+             BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH)"
+        );
+        return ExitCode::from(2);
+    }
 
     // Load the optional MCP server + provider registries from bae-config.toml
     // (via --config or BAE_CONFIG). A missing file is not an error; a
@@ -122,6 +271,18 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
         }
     };
 
+    // Bootstrap admin authentication after the store opens and before either
+    // listener binds: ensure an active admin key exists (self-generate or ingest
+    // a pre-provisioned hash) unless auth is disabled. Returns whether the admin
+    // router should enforce a bearer key.
+    let admin_auth_enabled = match admin_auth::bootstrap(&store, &admin_cfg) {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            tracing::error!("admin-auth bootstrap failed: {e}");
+            return ExitCode::from(e.exit_code() as u8);
+        }
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -133,7 +294,13 @@ fn run_serve(config_flag: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    match runtime.block_on(crate::serve(config, store, mcp_registry, provider_registry)) {
+    match runtime.block_on(crate::serve(
+        config,
+        store,
+        mcp_registry,
+        provider_registry,
+        admin_auth_enabled,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
@@ -234,7 +401,7 @@ fn print_usage() {
         "baesrv {} — Better Agent Engine server
 
 USAGE:
-    baesrv [COMMAND] [--config <path>]
+    baesrv [COMMAND] [OPTIONS]
 
 COMMANDS:
     serve      Run the HTTP server (default)
@@ -248,6 +415,20 @@ OPTIONS:
                       BAE_CONFIG env var;
                       when both are set, --config wins. A missing file is not
                       an error (empty registry).
+
+SERVE OPTIONS (admin-port authentication):
+    --admin-key-file <path>        Plaintext admin-key file the server writes on
+                                   self-generate and baectl reads. Default
+                                   /var/lib/bae/admin-key.pem; also BAE_ADMIN_KEY_FILE.
+    --admin-key-hash-file <path>   Pre-provisioned Argon2id hash file to ingest
+                                   (read-only). Default
+                                   /var/lib/bae/admin-key-hash.pem; also
+                                   BAE_ADMIN_KEY_HASH_FILE.
+    --rotate-admin-key             Revoke the current admin key and mint a fresh
+                                   one this boot (one-shot; no env-var equivalent).
+    --dangerously-disable-admin-auth
+                                   Serve the admin port with NO authentication
+                                   (also BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH=1).
 
 Server configuration is via BAE_* environment variables; see docs/ and
 aspec/devops/operations.md.",

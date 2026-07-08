@@ -12,6 +12,7 @@
 //! [`serve`] is the top-level entrypoint: open the database and migrate, bind
 //! both listeners, serve until a shutdown signal, drain, then close the database.
 
+pub mod admin_auth;
 pub mod api;
 pub mod cli;
 pub mod config;
@@ -103,11 +104,16 @@ pub fn open_store(config: &Config) -> Result<Store, StoreError> {
 /// `mcp_registry` and `provider_registry` are the (possibly empty) sets of MCP
 /// servers and LLM providers parsed from `bae-config.toml`; both are held
 /// in-memory on [`AppState`] and never persisted.
+///
+/// `admin_auth_enabled` decides whether the admin router enforces a bearer
+/// admin key. It is the result of [`admin_auth::bootstrap`], which the caller
+/// runs before this — after the store opens, before the listeners bind.
 pub async fn serve(
     config: Config,
     store: Store,
     mcp_registry: HashMap<String, McpServerConfig>,
     provider_registry: HashMap<String, ProviderConfig>,
+    admin_auth_enabled: bool,
 ) -> Result<(), RunError> {
     tracing::info!(
         version = VERSION,
@@ -160,7 +166,7 @@ pub async fn serve(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let client_app = api::client::router(state.clone());
-    let admin_app = api::admin::router(state.clone());
+    let admin_app = api::admin::router(state.clone(), admin_auth_enabled);
 
     let client_srv = axum::serve(client_listener, client_app)
         .with_graceful_shutdown(wait_for_flag(shutdown_rx.clone()));

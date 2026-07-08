@@ -23,6 +23,7 @@ Versioning:
 Publishing:
 - server → Docker image (GHCR) tagged `<semver>` and `latest`, built from the root Dockerfile.
 - client-rust → crates.io (`bae-rs`); client-typescript → npm (`@prettysmartdev/bae-ts`); client-python → PyPI (`bae-py`, via uv build/publish).
+- baectl has **no independent release tag or publish job**. It is not published to crates.io, npm, or PyPI — it ships only as a static binary baked into the Docker image build (both `Dockerfile` and `Dockerfile.dev`), so its effective version tracks the image tag (`<semver>`/`latest`) rather than its own SemVer line. Its `Cargo.toml` carries `publish = false` permanently, not just until a first release.
 - Registry credentials live in GitHub Actions secrets; publish jobs run only on tags. Each package manifest keeps its private/no-publish marker until its first release is cut.
 
 Deployment:

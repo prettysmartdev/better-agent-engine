@@ -1,7 +1,7 @@
 # Better Agent Engine (BAE) — local development toolchain image.
 #
-# One image with every toolchain needed to build, test, and lint all four
-# components (server, client-rust, client-typescript, client-python).
+# One image with every toolchain needed to build, test, and lint all five
+# components (server, baectl, client-rust, client-typescript, client-python).
 # Build it with `make dev-image`; the root Makefile runs all component
 # targets inside a container of this image with the repo mounted at
 # /workspace. Also serves as the base image for .awman/Dockerfile.claude.
@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     make \
     build-essential \
+    musl-tools \
     pkg-config \
     libssl-dev \
     sqlite3 \
@@ -33,6 +34,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl -fsSL --retry 5 https://sh.rustup.rs | sh -s -- -y \
         --default-toolchain stable --profile default --no-modify-path \
     && rustc --version && cargo --version && cargo clippy --version && cargo fmt --version \
+    && rustup target add x86_64-unknown-linux-musl \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # Node.js 22 LTS (client-typescript).

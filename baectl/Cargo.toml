@@ -1,0 +1,34 @@
+[package]
+name = "baectl"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line client for the Better Agent Engine (BAE) admin API"
+license = "Apache-2.0"
+# baectl ships only inside the BAE Docker image (its version tracks the image
+# tag), never as a standalone crates.io release — see aspec/devops/cicd.md.
+publish = false
+
+[dependencies]
+# CLI parsing — clap v4 derive macros give the subcommand tree, `--help`
+# generation, and positional/flag validation used across the command surface.
+clap = { version = "4", features = ["derive"] }
+# HTTP transport to the BAE admin API (`/admin/v1`). `default-features = false`
+# with `rustls-tls` keeps the TLS stack pure-Rust (no OpenSSL) — LOAD-BEARING
+# for the static-binary requirement: an OpenSSL/native-tls dependency (direct
+# or transitive) would break static linking under the `x86_64-unknown-linux-musl`
+# target this binary ships as. `json` gives typed request/response bodies and
+# `blocking` keeps the CLI a straight-line synchronous program (no async
+# runtime to manage). Mirrors the `rustls-tls`-only convention in
+# `server/Cargo.toml` and `client-rust/Cargo.toml`.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+# API (de)serialization — mirrors the server's snake_case admin wire contract.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ergonomic error enum for the CLI's error type and its exit-code mapping.
+thiserror = "2"
+# Local admin-key generation for `baectl auth create key` ONLY (every other
+# command is a pure HTTP client). Argon2id + OsRng mirror `server/Cargo.toml`'s
+# choices and parameters so the hash baectl writes is independently verifiable
+# by the server with no shared code (standard PHC Argon2id on both sides).
+argon2 = "0.5"
+rand = "0.8"

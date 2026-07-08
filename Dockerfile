@@ -9,8 +9,21 @@
 
 FROM rust:1-bookworm AS build
 WORKDIR /build
-COPY server/ ./
-RUN cargo build --release
+# Two independently-buildable crates share this stage: baesrv (server/) builds
+# for the native gnu target, baectl builds as a static musl binary. They are
+# COPYed into distinct subdirectories (server/ NOT flattened into /build) so a
+# second crate can live alongside the first — hence the per-crate
+# --manifest-path below rather than one build at the stage root.
+COPY server/ ./server/
+COPY baectl/ ./baectl/
+RUN cargo build --release --manifest-path server/Cargo.toml
+# baectl ships as a fully static musl binary so it drops into the slim runtime
+# base with no libc/OpenSSL dependency (reqwest is pinned to rustls, no
+# native-tls). musl-tools provides the musl-gcc linker the target needs.
+RUN rustup target add x86_64-unknown-linux-musl \
+    && apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo build --release --target x86_64-unknown-linux-musl --manifest-path baectl/Cargo.toml
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,7 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/lib/bae \
     && chown bae:bae /var/lib/bae
 
-COPY --from=build /build/target/release/baesrv /usr/local/bin/baesrv
+COPY --from=build /build/server/target/release/baesrv /usr/local/bin/baesrv
+COPY --from=build /build/baectl/target/x86_64-unknown-linux-musl/release/baectl /usr/local/bin/baectl
 
 USER bae
 ENV BAE_ADDR=0.0.0.0:8080 \
