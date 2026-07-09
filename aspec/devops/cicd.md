@@ -5,8 +5,8 @@ Platform: github
 ## Pipelines:
 
 Build:
-- On every PR and push to main, build all four components using the same entrypoints as local dev: build the dev image (cached), then `make build` — CI must never invent steps that local dev doesn't have.
-- Use per-component paths filters so a client-only change doesn't rebuild the server image.
+- On every PR and push to main, build all components using the same entrypoints as local dev: build the dev image (cached), then `make build` — CI must never invent steps that local dev doesn't have.
+- Use per-component paths filters so a client-only change doesn't rebuild the server image. `max/` is one of the filtered paths, alongside `server/`, `client-rust/`, `client-typescript/`, `client-python/`, and `baectl/` — a change under `max/` (or to `Dockerfile.max`) triggers `max`'s build/test/lint job and the `bae-max` image build, not the others.
 
 Test:
 - `make test` and `make lint` run on every PR; both must pass before merge.
@@ -24,6 +24,7 @@ Publishing:
 - server → Docker image (GHCR) tagged `<semver>` and `latest`, built from the root Dockerfile.
 - client-rust → crates.io (`bae-rs`); client-typescript → npm (`@prettysmartdev/bae-ts`); client-python → PyPI (`bae-py`, via uv build/publish).
 - baectl has **no independent release tag or publish job**. It is not published to crates.io, npm, or PyPI — it ships only as a static binary baked into the Docker image build (both `Dockerfile` and `Dockerfile.dev`), so its effective version tracks the image tag (`<semver>`/`latest`) rather than its own SemVer line. Its `Cargo.toml` carries `publish = false` permanently, not just until a first release.
+- max (`max/`) → **same GHCR image repository as `server`, not a second repository**: an additional pair of tags, `<semver>-max` and `max` (e.g. `ghcr.io/prettysmartdev/better-agent-engine:0.3.0-max`, `:max`), built from `Dockerfile.max` on the same tag push that produces `<semver>`/`latest`. Same posture as `baectl`: **max has no independent `<component>-v<semver>` release tag** — it is not published to npm (both `max/web`'s and `max/server`'s `package.json` carry `"private": true` permanently) and its effective version tracks the image tag rather than its own SemVer line. Keeping it in one repository with suffixed tags rather than a second repository keeps discovery simple — one image name to remember, `-max` for the variant that includes the dashboard.
 - Registry credentials live in GitHub Actions secrets; publish jobs run only on tags. Each package manifest keeps its private/no-publish marker until its first release is cut.
 
 Deployment:

@@ -284,6 +284,89 @@ existing open sessions return `401` on subsequent requests.
 
 ---
 
+## Sessions
+
+Read-only. These two routes exist so admin-side tooling — chiefly
+[MAX](../guides/max-webapp.md) — can list and inspect sessions without ever
+holding a session key. That matters for a `closed`/`error` session in
+particular: `POST /api/v1/sessions/{id}/join` (see
+[Client API](client-api.md#post-apiv1sessionsidjoin--join-an-existing-session))
+rejects a terminal session with `409 session_closed`, so these admin routes
+are the **only** way to read a terminal session's history if nothing was
+still connected to it while it was open.
+
+### `GET /admin/v1/sessions` — list
+
+```
+GET /admin/v1/sessions?limit=50&cursor=&state=open
+```
+
+- `state` — optional. One of `open`, `closed`, `error`. Omit to list every
+  state. Any other value returns `400 bad_request`.
+
+**Response `200 OK`:**
+
+```json
+{
+  "items": [
+    {
+      "id": "ses_…",
+      "profile_id": "pro_…",
+      "state": "open",
+      "client_version": "1.0.0",
+      "created_at": "2026-07-06T18:26:01.000Z",
+      "closed_at": null
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+The list view omits `client_tools` — not secret, but noisy JSON not needed
+for a list of sessions. Fetch a session's events (below) to see what it
+declared and did.
+
+**Errors:** `400 bad_request` — invalid `state` value.
+
+---
+
+### `GET /admin/v1/sessions/{id}/events` — event history
+
+```
+GET /admin/v1/sessions/ses_…/events?limit=100&cursor=
+```
+
+Same pagination, and the same **byte-for-byte** response shape, as the
+client-port
+[`GET /api/v1/sessions/{id}/events`](client-api.md#get-apiv1sessionsidevents--replay-events)
+— but admin-key-authenticated instead of session-key-authenticated, and it
+works against a `closed`/`error` session with no session key ever required.
+
+**Response `200 OK`:**
+
+```json
+{
+  "items": [
+    {
+      "id": "evt_…",
+      "session_id": "ses_…",
+      "client_key_id": "key_…",
+      "event_type": "session.open",
+      "payload": {"client_version": "1.0.0", "tools": ["get_current_time"]},
+      "created_at": "2026-07-06T18:26:01.000Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+See [message-types.md](message-types.md) for the full `event_type` catalog
+and payload shapes.
+
+**Errors:** `404 not_found` — no session with this id.
+
+---
+
 ## MCP Servers
 
 ### `GET /admin/v1/mcp-servers`

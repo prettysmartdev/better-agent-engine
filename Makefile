@@ -18,7 +18,7 @@
 PROJECT    := better-agent-engine
 DEV_IMAGE  ?= awman-$(PROJECT):latest
 IMAGE      ?= $(PROJECT):latest
-COMPONENTS := server baectl client-rust client-typescript client-python
+COMPONENTS := server baectl client-rust client-typescript client-python max
 PORT       ?= 8080
 
 # Pick the container engine: docker if the CLI exists and the daemon is up,
@@ -73,7 +73,7 @@ endif
 # Note: the per-component <verb>-<component> targets are pattern rules and
 # intentionally NOT declared .PHONY — make ignores pattern rules for .PHONY
 # targets.
-.PHONY: help engine dev-image ensure-engine ensure-dev-image shell image run \
+.PHONY: help engine dev-image ensure-engine ensure-dev-image shell image image-max run \
 	build test lint fmt clean check-static image-smoke
 
 help: ## Show available targets
@@ -113,6 +113,9 @@ shell: ensure-dev-image ## Interactive shell inside the dev container
 
 image: ensure-engine ## Build the production server image (Dockerfile)
 	$(ENGINE) build --file Dockerfile --tag $(IMAGE) .
+
+image-max: ensure-engine ## Build the bae-max image variant (Dockerfile.max)
+	$(ENGINE) build --file Dockerfile.max --tag $(IMAGE)-max .
 
 # Static-binary regression guard for baectl. Runs inside the dev image, which
 # carries the x86_64-unknown-linux-musl target + musl-tools, and asserts the

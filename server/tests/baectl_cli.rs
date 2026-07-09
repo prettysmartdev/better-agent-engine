@@ -200,6 +200,7 @@ impl Harness {
                         fallback_configs: json!([]),
                         mcp_servers: json!([]),
                         allowed_tools: json!([]),
+                        available_sandboxes: json!([]),
                     },
                 )
             })

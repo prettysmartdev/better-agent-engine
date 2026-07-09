@@ -19,12 +19,16 @@
 //!   secrets; `base_url` is the effective value).
 //! - `sandbox-status` — read-only, per-profile sandbox image provisioning
 //!   status from the in-memory tracker.
+//! - `sessions` — read-only session visibility: list (cursor-paginated, with an
+//!   optional `?state=` filter) and per-session event history, without ever
+//!   holding a session key (the only path to a `closed`/`error` session's log).
 
 pub mod keys;
 pub mod mcp;
 pub mod profiles;
 pub mod providers;
 pub mod sandbox;
+pub mod sessions;
 
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
@@ -61,7 +65,9 @@ pub fn router(state: AppState, auth_enabled: bool) -> Router {
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
         .route("/admin/v1/mcp-servers", get(mcp::list))
         .route("/admin/v1/providers", get(providers::list))
-        .route("/admin/v1/sandbox-status", get(sandbox::list));
+        .route("/admin/v1/sandbox-status", get(sandbox::list))
+        .route("/admin/v1/sessions", get(sessions::list))
+        .route("/admin/v1/sessions/{id}/events", get(sessions::get_events));
 
     // Layer auth *below* request logging (added last, so it runs outermost) so
     // that rejected requests are still logged with their 401 status.
