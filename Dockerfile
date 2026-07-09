@@ -19,11 +19,19 @@ COPY baectl/ ./baectl/
 RUN cargo build --release --manifest-path server/Cargo.toml
 # baectl ships as a fully static musl binary so it drops into the slim runtime
 # base with no libc/OpenSSL dependency (reqwest is pinned to rustls, no
-# native-tls). musl-tools provides the musl-gcc linker the target needs.
-RUN rustup target add x86_64-unknown-linux-musl \
+# native-tls). musl-tools provides the musl-gcc linker the target needs. The
+# target is derived from the build host's arch (x86_64 or aarch64) so the image
+# builds natively on either; the binary is staged to an arch-independent path so
+# the runtime COPY below need not know the target triple.
+RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
+    && rustup target add "$MUSL_TARGET" \
     && apt-get update && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/* \
-    && cargo build --release --target x86_64-unknown-linux-musl --manifest-path baectl/Cargo.toml
+    # cc-rs (ring, via rustls) invokes the C compiler as `<arch>-linux-musl-gcc`;
+    # musl-tools only ships the native `musl-gcc`, so expose it under that name.
+    && ln -sf "$(command -v musl-gcc)" "/usr/local/bin/$(uname -m)-linux-musl-gcc" \
+    && cargo build --release --target "$MUSL_TARGET" --manifest-path baectl/Cargo.toml \
+    && cp "baectl/target/$MUSL_TARGET/release/baectl" /build/baectl-static
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown bae:bae /var/lib/bae
 
 COPY --from=build /build/server/target/release/baesrv /usr/local/bin/baesrv
-COPY --from=build /build/baectl/target/x86_64-unknown-linux-musl/release/baectl /usr/local/bin/baectl
+COPY --from=build /build/baectl-static /usr/local/bin/baectl
 
 USER bae
 ENV BAE_ADDR=0.0.0.0:8080 \

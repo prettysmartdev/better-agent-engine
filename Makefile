@@ -118,7 +118,7 @@ image-max: ensure-engine ## Build the bae-max image variant (Dockerfile.max)
 	$(ENGINE) build --file Dockerfile.max --tag $(IMAGE)-max .
 
 # Static-binary regression guard for baectl. Runs inside the dev image, which
-# carries the x86_64-unknown-linux-musl target + musl-tools, and asserts the
+# carries the host-arch <arch>-unknown-linux-musl target + musl-tools, and asserts the
 # release binary links statically (no transitive OpenSSL/glibc). Catches a
 # dependency regression that would break the dependency-free runtime image.
 check-static: ensure-dev-image ## Verify baectl builds as a static musl binary

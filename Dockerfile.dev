@@ -34,7 +34,12 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl -fsSL --retry 5 https://sh.rustup.rs | sh -s -- -y \
         --default-toolchain stable --profile default --no-modify-path \
     && rustc --version && cargo --version && cargo clippy --version && cargo fmt --version \
-    && rustup target add x86_64-unknown-linux-musl \
+    && rustup target add "$(uname -m)-unknown-linux-musl" \
+    # cc-rs (ring, via rustls) invokes the C compiler under the target-prefixed
+    # name `<arch>-linux-musl-gcc`; Debian's musl-tools only ships the native
+    # `musl-gcc`, so symlink it under the name cc-rs expects (works on x86_64
+    # and aarch64 alike, since musl-gcc targets the native arch).
+    && ln -sf "$(command -v musl-gcc)" "/usr/local/bin/$(uname -m)-linux-musl-gcc" \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # Node.js 22 LTS (client-typescript).

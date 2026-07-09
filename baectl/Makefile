@@ -9,7 +9,10 @@
 
 .PHONY: help build test lint fmt clean check-static
 
-MUSL_TARGET := x86_64-unknown-linux-musl
+# Derive the musl target from the build host's architecture (x86_64 or aarch64)
+# so the static binary is native to whatever machine runs the build — no x86-only
+# assumption, and no cross-linker needed since target arch == host arch.
+MUSL_TARGET := $(shell uname -m)-unknown-linux-musl
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
