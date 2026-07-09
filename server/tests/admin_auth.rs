@@ -489,6 +489,38 @@ async fn enforcement_rejects_missing_garbage_and_client_keys_on_every_route() {
 // Usage-error flag combination (driven through the real binary)
 // ---------------------------------------------------------------------------
 
+/// Stage a private copy of the `baesrv` binary under `dir` and return its path.
+///
+/// `CARGO_BIN_EXE_baesrv` points at Cargo's shared "uplift" path
+/// (`target/debug/baesrv`), which Cargo refreshes with a remove-then-hardlink
+/// whenever an invocation's build configuration differs from the last one
+/// (e.g. `make build`/`make lint` running concurrently with `make test`, or a
+/// differing `CARGO_INCREMENTAL`) — and the build lock is not held while tests
+/// run. Exec'ing that path directly can therefore transiently fail with
+/// ENOENT mid-suite. Copying the binary into the test's own temp dir (with a
+/// short retry in case a refresh is in flight) makes the spawns hermetic
+/// without changing anything the test asserts.
+fn stage_baesrv_copy(dir: &std::path::Path) -> PathBuf {
+    let src = std::path::Path::new(env!("CARGO_BIN_EXE_baesrv"));
+    let dst = dir.join("baesrv");
+    let mut last = None;
+    for _ in 0..50 {
+        match std::fs::copy(src, &dst) {
+            Ok(_) => return dst,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("staging baesrv from {}: {e}", src.display()),
+        }
+    }
+    panic!(
+        "baesrv never became copyable at {}: {}",
+        src.display(),
+        last.unwrap()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotate_plus_disable_exits_2_without_touching_db_or_fs() {
     // Both the flag+flag form (rejected at parse time, before config load) and
@@ -496,13 +528,14 @@ async fn rotate_plus_disable_exits_2_without_touching_db_or_fs() {
     // store opens) must exit 2 and leave the DB file uncreated.
     let dir = std::env::temp_dir().join(format!("baesrv-flagcombo-{}", generate_id("")));
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = env!("CARGO_BIN_EXE_baesrv");
+    let bin = stage_baesrv_copy(&dir);
 
     // Case 1: both flags.
     let db1 = dir.join("case1.db");
     let db1c = db1.clone();
+    let bin1 = bin.clone();
     let out1 = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(bin)
+        std::process::Command::new(&bin1)
             .args([
                 "serve",
                 "--rotate-admin-key",
@@ -526,7 +559,7 @@ async fn rotate_plus_disable_exits_2_without_touching_db_or_fs() {
     let db2 = dir.join("case2.db");
     let db2c = db2.clone();
     let out2 = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(bin)
+        std::process::Command::new(&bin)
             .args(["serve", "--rotate-admin-key"])
             .env("BAE_DB_PATH", &db2c)
             .env("BAE_LOG", "error")

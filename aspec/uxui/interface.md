@@ -2,10 +2,13 @@
 
 (use cli.md if solely designing a CLI-based UX)
 
-BAE currently has no graphical interface: the product surface is the REST
-API, the `baesrv` CLI (see uxui/cli.md), and the three client
-libraries. This file records the constraints an eventual admin/debug web
-dashboard must follow, and the machine-use guidance that applies today.
+BAE's product surface is the REST API, the `baesrv` CLI (see uxui/cli.md),
+the three client libraries, and — as of work item 0007 — **MAX**, a browser
+dashboard shipped in the `bae-max` container image variant (`max/`, see
+architecture/design.md's Component 6 and
+[docs/guides/max-webapp.md](../../docs/guides/max-webapp.md)). MAX is the
+admin/debug web dashboard this file anticipated; the sections below describe
+what it actually is rather than what a hypothetical future one might be.
 
 ## Style
 
@@ -16,12 +19,12 @@ Brand and colors:
 - Neutral dark/light palette with a single accent color; no branding decisions locked in yet.
 
 Desktop vs mobile:
-- Desktop-first (it's an operator/developer tool); responsive enough to check a run from a phone, but no mobile-specific features.
+- Mobile and tablet friendly, not just "responsive enough to check from a phone" — every MAX view (Keys, Profiles, Sessions, and the event graph specifically) is fully usable on a phone or tablet browser, not a shrunk-down desktop layout. The event graph in particular falls back to pan/zoom or a list-first view on narrow viewports rather than assuming a wide canvas, and paginates/virtualizes large sessions so it stays usable on tighter mobile memory/CPU budgets.
 
 ## Usage
 
 Layout:
-- If/when a dashboard exists: left navigation of resource types (agents, sessions, runs, keys), main pane of lists and detail views mirroring the API objects one-to-one — the UI should teach the API, not hide it.
+- MAX's shipped layout: a `max` wordmark top-left, and top-bar tabs — `Keys` / `Profiles` / `Sessions` — not left navigation. This intentionally departs from an earlier left-navigation sketch: top-bar tabs read better across the full mobile-to-desktop width range this dashboard has to support, where a persistent side rail competes with content on narrow viewports. Each tab's main pane is a list and detail view mirroring the API objects one-to-one — the UI still teaches the API rather than hiding it, that part of the original intent is unchanged.
 
 Menus:
 - Shallow: no more than two levels; every screen reachable within two clicks and addressable by URL.

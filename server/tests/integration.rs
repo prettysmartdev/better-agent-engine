@@ -1673,15 +1673,19 @@ async fn subscribe_receives_live_turn_events_from_a_second_connection() {
     let (frames, (send_status, _res, _raw)) = tokio::join!(subscriber, driver);
     assert_eq!(send_status, 200, "the driving sendMessage succeeded");
 
-    // The subscribe feed carries the same live, ordered, client-filtered events.
+    // A genuine observer on a *separate* connection receives every event live,
+    // in order — including the driver's `client.message.send`. Echo suppression
+    // is per-connection (only the sender's own stream omits its own input), so
+    // it never hides another participant's messages from observers.
     assert_eq!(
         notification_event_types(&frames),
         vec![
+            "client.message.send",
             "provider.request",
             "provider.response",
             "server.message.send"
         ],
-        "subscribe delivered the turn's events in order, client-authored events excluded"
+        "subscribe delivered every event live, in order, including client.message.send"
     );
 }
 
@@ -3302,4 +3306,257 @@ async fn mixed_kind_fallback_chain_either_direction() {
             responses[1]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Admin session-visibility endpoints (WI 0007 section B)
+//   GET /admin/v1/sessions           — list, cursor pagination, ?state= filter
+//   GET /admin/v1/sessions/{id}/events — history, admin-authed, no session key
+// ---------------------------------------------------------------------------
+
+/// `GET /admin/v1/sessions` paginates by insertion order (same cursor
+/// convention as profiles/keys) and its list view carries exactly
+/// `{id, profile_id, state, client_version, created_at, closed_at}` — never the
+/// noisy `client_tools` blob nor the internal `client_key_id`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_sessions_list_pagination_and_view_shape() {
+    let ts = start_server().await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+
+    // Open three sessions (insertion order fixes the pagination order).
+    let (s1, _k1, _) = ts.open_session(&client_key, json!([])).await;
+    let (s2, _k2, _) = ts.open_session(&client_key, json!([])).await;
+    let (s3, _k3, _) = ts.open_session(&client_key, json!([])).await;
+
+    // First page of two → cursor points past the second row.
+    let (status, page1, raw) = ts.admin_get("/admin/v1/sessions?limit=2").await;
+    assert_eq!(status, 200, "list page 1: {raw}");
+    let items1 = page1["items"].as_array().unwrap();
+    assert_eq!(items1.len(), 2, "limit honoured: {raw}");
+    assert_eq!(items1[0]["id"], json!(s1));
+    assert_eq!(items1[1]["id"], json!(s2));
+    let cursor = page1["next_cursor"].as_str().expect("more rows remain");
+
+    // View shape: exactly the six documented fields, no client_tools/client_key_id.
+    let row = &items1[0];
+    let obj = row.as_object().unwrap();
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "client_version",
+            "closed_at",
+            "created_at",
+            "id",
+            "profile_id",
+            "state",
+        ],
+        "list view must carry exactly the documented fields: {raw}"
+    );
+    assert_eq!(row["profile_id"], json!(profile_id));
+    assert_eq!(row["state"], json!("open"));
+    assert_eq!(row["client_version"], json!("1.0.0"));
+    assert!(
+        row["closed_at"].is_null(),
+        "an open session has no closed_at"
+    );
+    assert!(
+        !raw.contains("client_tools"),
+        "client_tools must be omitted from the list view: {raw}"
+    );
+
+    // Second page → the final row, and next_cursor null (no more rows).
+    let (status, page2, raw) = ts
+        .admin_get(&format!("/admin/v1/sessions?limit=2&cursor={cursor}"))
+        .await;
+    assert_eq!(status, 200, "list page 2: {raw}");
+    let items2 = page2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1, "one row left: {raw}");
+    assert_eq!(items2[0]["id"], json!(s3));
+    assert!(page2["next_cursor"].is_null(), "no further pages: {raw}");
+}
+
+/// The `?state=` filter isolates a single lifecycle state, rejects an unknown
+/// value with a 400, and returns an empty page (never a 404/500) when a valid
+/// state simply has no matching sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_sessions_list_state_filter_and_empty_result() {
+    let ts = start_server().await;
+
+    // One open session (never messaged, stays open).
+    let open_profile = ts.create_profile("text", json!([]), json!([])).await;
+    let open_key = ts.create_key(&open_profile).await;
+    let (open_sid, _ok, _) = ts.open_session(&open_key, json!([])).await;
+
+    // One closed session (open → send → delete).
+    let (closed_sid, closed_skey, _) = ts.open_session(&open_key, json!([])).await;
+    ts.send_message(&closed_sid, &closed_skey, json!({ "content": "hi" }))
+        .await;
+    let (status, _v, raw) = ts
+        .client_delete(
+            &format!("/api/v1/sessions/{closed_sid}"),
+            Some(&closed_skey),
+        )
+        .await;
+    assert_eq!(status, 200, "close: {raw}");
+
+    // One error session (a "fail" provider drives it to the error state).
+    let fail_profile = ts.create_profile("fail", json!([]), json!([])).await;
+    let fail_key = ts.create_key(&fail_profile).await;
+    let (error_sid, error_skey, _) = ts.open_session(&fail_key, json!([])).await;
+    ts.send_message(&error_sid, &error_skey, json!({ "content": "boom" }))
+        .await;
+
+    // Each filter returns exactly its own session.
+    let ids_for = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, open_list, raw) = ts.admin_get("/admin/v1/sessions?state=open").await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(ids_for(&open_list), vec![open_sid.clone()]);
+
+    let (status, closed_list, raw) = ts.admin_get("/admin/v1/sessions?state=closed").await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(ids_for(&closed_list), vec![closed_sid.clone()]);
+    // A closed session carries a non-null closed_at in the list view.
+    assert!(
+        !closed_list["items"][0]["closed_at"].is_null(),
+        "a closed session records closed_at: {raw}"
+    );
+
+    let (status, error_list, raw) = ts.admin_get("/admin/v1/sessions?state=error").await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(ids_for(&error_list), vec![error_sid.clone()]);
+
+    // An unknown filter value is a 400, not a silent empty list.
+    let (status, err, raw) = ts.admin_get("/admin/v1/sessions?state=bogus").await;
+    assert_eq!(status, 400, "unknown state → 400: {raw}");
+    assert!(
+        err["detail"].as_str().unwrap_or_default().contains("bogus"),
+        "the 400 names the offending value: {raw}"
+    );
+
+    // Empty-result case: filter a valid state that no session is in. Drive every
+    // open session terminal first so `state=open` genuinely matches nothing.
+    ts.client_delete(&format!("/api/v1/sessions/{open_sid}"), Some(&_ok))
+        .await;
+    let (status, none, raw) = ts.admin_get("/admin/v1/sessions?state=open").await;
+    assert_eq!(status, 200, "empty result is a 200, not a 404: {raw}");
+    assert_eq!(
+        none["items"].as_array().unwrap().len(),
+        0,
+        "no open sessions remain: {raw}"
+    );
+    assert!(none["next_cursor"].is_null(), "{raw}");
+}
+
+/// `GET /admin/v1/sessions/{id}/events` serves the **exact same** body — byte
+/// for byte — as the client-port `GET /api/v1/sessions/{id}/events` for the same
+/// session, but authenticated by the admin port rather than a session key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_sessions_events_byte_for_byte_parity_with_client_port() {
+    let ts = start_server().await;
+    let profile_id = ts.create_profile("text", json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, skey, _) = ts.open_session(&client_key, json!([])).await;
+    // Generate a spread of event types.
+    ts.send_message(&sid, &skey, json!({ "content": "hi" }))
+        .await;
+
+    // Admin port: no session key, just the (auth-disabled in tests) admin port.
+    let (astatus, _av, admin_raw) = ts
+        .admin_get(&format!("/admin/v1/sessions/{sid}/events"))
+        .await;
+    assert_eq!(astatus, 200, "admin events: {admin_raw}");
+
+    // Client port: the session key holder's own view of the same session.
+    let (cstatus, _cv, client_raw) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&skey))
+        .await;
+    assert_eq!(cstatus, 200, "client events: {client_raw}");
+
+    assert_eq!(
+        admin_raw, client_raw,
+        "admin and client event bodies must be byte-for-byte identical"
+    );
+    // Sanity: the body actually has the expected opening events, so parity is
+    // over real content rather than two identical empty pages.
+    let types = event_types(&_av["items"]);
+    assert!(types.contains(&"session.open".to_string()), "{admin_raw}");
+    assert!(
+        types.contains(&"server.message.send".to_string()),
+        "{admin_raw}"
+    );
+}
+
+/// The admin events endpoint reads a `closed` and an `error` session's full
+/// history without any session key ever being presented, and 404s an unknown id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_sessions_events_readable_for_terminal_sessions_and_404_unknown() {
+    let ts = start_server().await;
+
+    // A closed session.
+    let text_profile = ts.create_profile("text", json!([]), json!([])).await;
+    let text_key = ts.create_key(&text_profile).await;
+    let (closed_sid, closed_skey, _) = ts.open_session(&text_key, json!([])).await;
+    ts.send_message(&closed_sid, &closed_skey, json!({ "content": "hi" }))
+        .await;
+    ts.client_delete(
+        &format!("/api/v1/sessions/{closed_sid}"),
+        Some(&closed_skey),
+    )
+    .await;
+
+    // An error session.
+    let fail_profile = ts.create_profile("fail", json!([]), json!([])).await;
+    let fail_key = ts.create_key(&fail_profile).await;
+    let (error_sid, error_skey, _) = ts.open_session(&fail_key, json!([])).await;
+    ts.send_message(&error_sid, &error_skey, json!({ "content": "boom" }))
+        .await;
+
+    // Both terminal sessions are fully readable through the admin port with no
+    // session key in play.
+    let (status, closed_events, raw) = ts
+        .admin_get(&format!("/admin/v1/sessions/{closed_sid}/events"))
+        .await;
+    assert_eq!(status, 200, "closed session readable: {raw}");
+    let closed_types = event_types(&closed_events["items"]);
+    assert_eq!(
+        closed_types.first().map(String::as_str),
+        Some("session.open")
+    );
+    assert!(
+        closed_types.contains(&"session.close".to_string()),
+        "closed history ends with the close event: {raw}"
+    );
+
+    let (status, error_events, raw) = ts
+        .admin_get(&format!("/admin/v1/sessions/{error_sid}/events"))
+        .await;
+    assert_eq!(status, 200, "error session readable: {raw}");
+    assert!(
+        event_types(&error_events["items"]).contains(&"session.error".to_string()),
+        "error history carries the session.error event: {raw}"
+    );
+
+    // An unknown session id is a 404 (not an empty 200 page).
+    let (status, err, raw) = ts
+        .admin_get("/admin/v1/sessions/ses_does_not_exist/events")
+        .await;
+    assert_eq!(status, 404, "unknown session id → 404: {raw}");
+    assert!(
+        err["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ses_does_not_exist"),
+        "the 404 names the missing id: {raw}"
+    );
 }

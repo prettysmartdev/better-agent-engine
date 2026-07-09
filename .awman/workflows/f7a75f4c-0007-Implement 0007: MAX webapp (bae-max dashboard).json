@@ -1,0 +1,106 @@
+{
+  "schema_version": 4,
+  "invocation_id": "074abdd5-9a65-4b06-aa81-4598311e34c3",
+  "workflow_name": "Implement 0007: MAX webapp (bae-max dashboard)",
+  "workflow_hash": "5fca31398affff3c997be3c6ec615399f2796816402e756e22c1dd6130d9e88a",
+  "work_item": 7,
+  "step_states": {
+    "docs": "Pending",
+    "scaffold-max": "Succeeded",
+    "dashboard": "Pending",
+    "max-backend": "Succeeded",
+    "container-image": "Succeeded",
+    "admin-endpoints": "Succeeded",
+    "tests": "Pending",
+    "review": "Pending"
+  },
+  "completed_steps": [
+    "scaffold-max",
+    "admin-endpoints",
+    "container-image",
+    "max-backend"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-07-08T15:58:14.538600Z",
+  "updated_at": "2026-07-08T16:38:49.437165Z",
+  "steps": [
+    {
+      "name": "admin-endpoints",
+      "depends_on": [],
+      "model": "claude-opus-4-8"
+    },
+    {
+      "name": "scaffold-max",
+      "depends_on": [],
+      "model": "claude-sonnet-5"
+    },
+    {
+      "name": "max-backend",
+      "depends_on": [
+        "admin-endpoints",
+        "scaffold-max"
+      ],
+      "model": "claude-opus-4-8"
+    },
+    {
+      "name": "container-image",
+      "depends_on": [
+        "scaffold-max"
+      ],
+      "model": "claude-sonnet-5"
+    },
+    {
+      "name": "dashboard",
+      "depends_on": [
+        "max-backend"
+      ],
+      "model": "claude-opus-4-8"
+    },
+    {
+      "name": "tests",
+      "depends_on": [
+        "dashboard",
+        "container-image"
+      ],
+      "model": "claude-opus-4-8"
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "dashboard",
+        "container-image"
+      ],
+      "model": "claude-sonnet-5"
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "tests",
+        "docs"
+      ],
+      "model": "claude-fable-5"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": true,
+  "teardown_completed": false,
+  "setup_step_states": [
+    {
+      "description": "run_shell: test -f server/src/admin_auth.rs && test -d baectl || { echo 'BLOCKING PREREQUISITE MISSING: work item 0004 (baectl CLI + server/src/admin_auth.rs admin-key-file auth) has not landed on this branch. Work item 0007 requires it and must not route around it.' >&2; exit 1; }",
+      "status": "Succeeded"
+    },
+    {
+      "description": "checkout_create_branch: feature/0007-max-webapp",
+      "status": "Succeeded"
+    },
+    {
+      "description": "run_shell: cargo fetch --locked",
+      "status": {
+        "Failed": {
+          "error": "error: could not find `Cargo.toml` in `/Users/cohix-studio/.awman/worktrees/better-agent-engine/0007` or any parent directory\n"
+        }
+      }
+    }
+  ],
+  "teardown_step_states": []
+}

@@ -171,7 +171,9 @@ async def run() -> int:
             # bogus since_event_id forces a replay from the start; we stop after
             # the first event (returning False) so the demo terminates.
             if os.environ.get("BAE_SUBSCRIBE_DEMO"):
-                print("[subscribe] replaying session events (stopping after first)…", file=sys.stderr)
+                print(
+                    "[subscribe] replaying session events (stopping after first)…", file=sys.stderr
+                )
 
                 def _stop_after_first(event: SessionEvent) -> bool:
                     print(f"[subscribe] {describe_event(event)}", file=sys.stderr)

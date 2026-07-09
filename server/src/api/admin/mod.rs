@@ -17,11 +17,15 @@
 //! - `mcp-servers` — read-only list of the configured MCP registry (no secrets).
 //! - `providers` — read-only list of the configured provider registry (no
 //!   secrets; `base_url` is the effective value).
+//! - `sessions` — read-only session visibility: list (cursor-paginated, with an
+//!   optional `?state=` filter) and per-session event history, without ever
+//!   holding a session key (the only path to a `closed`/`error` session's log).
 
 pub mod keys;
 pub mod mcp;
 pub mod profiles;
 pub mod providers;
+pub mod sessions;
 
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
@@ -57,7 +61,9 @@ pub fn router(state: AppState, auth_enabled: bool) -> Router {
         .route("/admin/v1/keys", post(keys::create).get(keys::list))
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
         .route("/admin/v1/mcp-servers", get(mcp::list))
-        .route("/admin/v1/providers", get(providers::list));
+        .route("/admin/v1/providers", get(providers::list))
+        .route("/admin/v1/sessions", get(sessions::list))
+        .route("/admin/v1/sessions/{id}/events", get(sessions::get_events));
 
     // Layer auth *below* request logging (added last, so it runs outermost) so
     // that rejected requests are still logged with their 401 status.

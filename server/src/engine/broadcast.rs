@@ -3,7 +3,7 @@
 //! Every event that is persisted to `session_events` is *also* published, live,
 //! to any connection currently watching that session — the driving
 //! `session.sendMessage` call and any `session.subscribe` observers. This module
-//! owns three things:
+//! owns two things:
 //!
 //! - [`EventBroadcaster`] — the in-process registry of per-session
 //!   [`tokio::sync::broadcast`] channels (created lazily on first subscribe) plus
@@ -13,9 +13,12 @@
 //!   channel. Every place that used to call [`sessions::insert_event`] directly
 //!   goes through here (or, for events inserted inside a larger transaction,
 //!   through [`EventBroadcaster::publish`] once the transaction commits).
-//! - [`should_broadcast`] — the shared filter predicate deciding which event
-//!   types are forwarded to live watchers, so the rule lives in exactly one
-//!   place.
+//!
+//! Every event is broadcast to every watcher unconditionally — there is no
+//! type-based filtering. The sole exception is that `session.sendMessage` does
+//! not echo, back to the caller's own stream, the events that same request
+//! literally sent; that suppression is per-connection and lives in `rpc.rs`, so
+//! genuine observers on other connections still receive those events live.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -76,14 +79,17 @@ impl EventBroadcaster {
         (entry.sender.subscribe(), entry.cancel.clone())
     }
 
-    /// Publish an event to its session's channel, if one exists and the event is
-    /// forwardable per [`should_broadcast`]. A `send` with no live receivers is a
-    /// harmless no-op (its `Err` is ignored), and a session nobody is watching
-    /// has no channel at all, so this is cheap on the hot path.
+    /// Publish an event to its session's channel, if one exists. *Every*
+    /// persisted event is forwarded to *every* live watcher — nothing is
+    /// filtered by type here. The one exception (a client's own
+    /// `client.message.send` / client-dispatched `tool.result` is not echoed
+    /// straight back to the very request that sent it) is enforced per-connection
+    /// in `session.sendMessage`'s forward loop, not globally, so genuine
+    /// observers on other connections still receive those events live. A `send`
+    /// with no live receivers is a harmless no-op (its `Err` is ignored), and a
+    /// session nobody is watching has no channel at all, so this is cheap on the
+    /// hot path.
     pub fn publish(&self, event: &EventRecord) {
-        if !should_broadcast(event) {
-            return;
-        }
         let map = self.lock();
         if let Some(entry) = map.get(&event.session_id) {
             let _ = entry.sender.send(event.clone());
@@ -128,31 +134,6 @@ pub fn insert_and_publish(
     Ok(record)
 }
 
-/// The shared filter predicate: which persisted events are forwarded to live
-/// watchers. Everything is forwarded **except** the events a client generates in
-/// the very request that produces them, which would just be echoed back:
-///
-/// - `client.message.send` — the driving client's own turn input;
-/// - `tool.result` with `dispatch == "client"` — the client returning output for
-///   a tool it dispatched itself.
-///
-/// Everything else — `provider.request`/`provider.response`, `tool.call`,
-/// MCP-dispatched `tool.result`, `mcp.request`/`mcp.response`,
-/// `server.message.send`, and every `session.*` event — is forwarded. This rule
-/// lives here and only here; both `session.sendMessage` and `session.subscribe`
-/// share it via [`EventBroadcaster::publish`].
-pub fn should_broadcast(event: &EventRecord) -> bool {
-    if event.event_type == EventType::ClientMessageSend.as_str() {
-        return false;
-    }
-    if event.event_type == EventType::ToolResult.as_str()
-        && event.payload.get("dispatch").and_then(Value::as_str) == Some("client")
-    {
-        return false;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,94 +150,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn client_message_send_is_not_broadcast() {
-        assert!(!should_broadcast(&record(
-            EventType::ClientMessageSend,
-            json!({ "role": "user", "content": "hi" })
-        )));
-    }
-
-    #[test]
-    fn client_dispatched_tool_result_is_not_broadcast() {
-        assert!(!should_broadcast(&record(
-            EventType::ToolResult,
-            json!({ "dispatch": "client", "content": "42" })
-        )));
-    }
-
-    #[test]
-    fn mcp_dispatched_tool_result_is_broadcast() {
-        assert!(should_broadcast(&record(
-            EventType::ToolResult,
-            json!({ "dispatch": "mcp", "content": "42" })
-        )));
-    }
-
-    #[test]
-    fn should_broadcast_is_exhaustive_over_every_event_type() {
-        // Assert the filter for every EventType variant. The `match` below has no
-        // wildcard arm, so adding a 13th variant forces a deliberate decision
-        // here rather than silently defaulting its broadcast behaviour.
+    /// Every event type — including a client's own `client.message.send` and a
+    /// client-dispatched `tool.result` — is delivered to a live watcher. No type
+    /// is filtered at the broadcast layer; the only echo-suppression is
+    /// per-connection in `session.sendMessage`'s forward loop, so genuine
+    /// observers always receive everything live.
+    #[tokio::test]
+    async fn every_event_type_is_delivered_to_a_watcher() {
         for et in EventType::ALL {
-            // With a neutral payload (no client dispatch marker), only the
-            // client's own message-send is withheld from live watchers.
-            let expected = match et {
-                EventType::ClientMessageSend => false,
-                EventType::ServerMessageSend
-                | EventType::ProviderRequest
-                | EventType::ProviderResponse
-                | EventType::ToolCall
-                | EventType::ToolResult
-                | EventType::McpRequest
-                | EventType::McpResponse
-                | EventType::SessionOpen
-                | EventType::SessionClose
-                | EventType::SessionError
-                | EventType::SessionCompaction
-                | EventType::SessionJoin
-                | EventType::SessionDriverRegistered => true,
-            };
-            assert_eq!(
-                should_broadcast(&record(et, json!({}))),
-                expected,
-                "unexpected default broadcast decision for {et}"
-            );
+            let b = EventBroadcaster::new();
+            let (mut rx, _cancel) = b.subscribe("ses_test");
+            b.publish(&record(et, json!({})));
+            let got = rx.recv().await.expect("event delivered");
+            assert_eq!(got.event_type, et.as_str(), "{et} should reach a watcher");
         }
-
-        // The one payload-scoped exclusion: a client-dispatched tool.result is
-        // withheld (it would be echoed back to its author), while the same event
-        // type from an MCP dispatch is forwarded.
-        assert!(!should_broadcast(&record(
-            EventType::ToolResult,
-            json!({ "dispatch": "client", "content": "x" })
-        )));
-        assert!(should_broadcast(&record(
-            EventType::ToolResult,
-            json!({ "dispatch": "mcp", "content": "x" })
-        )));
     }
 
-    #[test]
-    fn provider_and_session_events_are_broadcast() {
-        for et in [
-            EventType::ProviderRequest,
-            EventType::ProviderResponse,
-            EventType::ToolCall,
-            EventType::McpRequest,
-            EventType::McpResponse,
-            EventType::ServerMessageSend,
-            EventType::SessionOpen,
-            EventType::SessionClose,
-            EventType::SessionError,
-            EventType::SessionJoin,
-            EventType::SessionDriverRegistered,
-        ] {
-            assert!(
-                should_broadcast(&record(et, json!({}))),
-                "{et} should broadcast"
-            );
-        }
+    #[tokio::test]
+    async fn client_message_send_and_client_tool_result_are_broadcast() {
+        let b = EventBroadcaster::new();
+        let (mut rx, _cancel) = b.subscribe("ses_test");
+        b.publish(&record(
+            EventType::ClientMessageSend,
+            json!({ "role": "user", "content": "hi" }),
+        ));
+        b.publish(&record(
+            EventType::ToolResult,
+            json!({ "dispatch": "client", "content": "42" }),
+        ));
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("client.message.send delivered")
+                .event_type,
+            "client.message.send"
+        );
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("client tool.result delivered")
+                .event_type,
+            "tool.result"
+        );
     }
 
     #[test]

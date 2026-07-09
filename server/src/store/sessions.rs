@@ -144,6 +144,47 @@ pub fn get_session(conn: &Connection, id: &str) -> rusqlite::Result<Option<Sessi
     conn.query_row(&sql, params![id], row_to_session).optional()
 }
 
+/// One page of sessions ordered by insertion (rowid), optionally filtered to a
+/// single lifecycle `state` (`open`/`closed`/`error`). `after` is the exclusive
+/// rowid cursor; `limit` rows are returned. The returned bool is true when more
+/// rows remain after this page. Mirrors [`crate::store::profiles::list`]'s
+/// cursor-pagination shape (fetch `limit + 1` to detect a further page).
+pub fn list_sessions(
+    conn: &Connection,
+    after: i64,
+    limit: i64,
+    state: Option<&str>,
+) -> rusqlite::Result<(Vec<(i64, SessionRecord)>, bool)> {
+    use rusqlite::types::ToSql;
+
+    let state_clause = if state.is_some() {
+        "AND state = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT rowid, {SESSION_COLS} FROM sessions \
+         WHERE rowid > ?1 {state_clause} \
+         ORDER BY rowid LIMIT ?2"
+    );
+    let fetch = limit + 1;
+    let mut sql_params: Vec<&dyn ToSql> = vec![&after, &fetch];
+    if let Some(ref s) = state {
+        sql_params.push(s);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(sql_params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row_to_session(row)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    let has_more = out.len() as i64 > limit;
+    out.truncate(limit as usize);
+    Ok((out, has_more))
+}
+
 /// Move a session to a terminal state and stamp `closed_at`. No-op on a session
 /// that is already not `open`; returns whether the transition happened.
 pub fn close_session(conn: &Connection, id: &str, state: &str) -> rusqlite::Result<bool> {
@@ -352,6 +393,57 @@ mod tests {
                 row.client_tools["key_a"], key_a_before,
                 "another client's entry is left byte-for-byte untouched"
             );
+        });
+    }
+
+    /// `list_sessions` paginates by rowid (insertion order) and honours the
+    /// optional lifecycle-state filter, reusing `SESSION_COLS`/`row_to_session`.
+    #[test]
+    fn list_sessions_paginates_and_filters_by_state() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            seed_parents(c);
+            // Three sessions in insertion order: open, closed, error.
+            let s_open =
+                create_session(c, "key_a", "pro_1", STATE_OPEN, Some("1.0.0"), &json!([])).unwrap();
+            let s_closed =
+                create_session(c, "key_a", "pro_1", STATE_CLOSED, None, &json!([])).unwrap();
+            let s_error =
+                create_session(c, "key_a", "pro_1", STATE_ERROR, None, &json!([])).unwrap();
+
+            // --- Pagination: first page of 2 signals has_more, then the tail. ---
+            let (page1, has_more) = list_sessions(c, 0, 2, None).unwrap();
+            assert_eq!(page1.len(), 2);
+            assert!(has_more, "a third row remains after a page of 2");
+            assert_eq!(page1[0].1.id, s_open.id);
+            assert_eq!(page1[1].1.id, s_closed.id);
+
+            let cursor = page1.last().unwrap().0;
+            let (page2, has_more) = list_sessions(c, cursor, 2, None).unwrap();
+            assert_eq!(page2.len(), 1, "one row left on the second page");
+            assert!(!has_more, "no rows remain after the last page");
+            assert_eq!(page2[0].1.id, s_error.id);
+            // The row parses back through row_to_session with its fields intact.
+            assert_eq!(page2[0].1.state, STATE_ERROR);
+            assert_eq!(page2[0].1.profile_id, "pro_1");
+
+            // --- State filter isolates a single lifecycle state. ---
+            let (open_only, has_more) = list_sessions(c, 0, 50, Some(STATE_OPEN)).unwrap();
+            assert_eq!(open_only.len(), 1);
+            assert!(!has_more);
+            assert_eq!(open_only[0].1.id, s_open.id);
+            assert_eq!(open_only[0].1.client_version.as_deref(), Some("1.0.0"));
+
+            let (closed_only, _) = list_sessions(c, 0, 50, Some(STATE_CLOSED)).unwrap();
+            assert_eq!(closed_only.len(), 1);
+            assert_eq!(closed_only[0].1.id, s_closed.id);
+
+            // Scanning past the final row yields an empty page with no further
+            // rows (the admin endpoint's empty-result path).
+            let last_rowid = page2[0].0;
+            let (empty, has_more) = list_sessions(c, last_rowid, 50, None).unwrap();
+            assert!(empty.is_empty(), "no rows past the final cursor");
+            assert!(!has_more);
         });
     }
 

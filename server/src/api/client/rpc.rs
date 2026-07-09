@@ -363,15 +363,19 @@ async fn drive_send_message(
 
     // Subscribe *before* running the turn so no event the turn produces slips
     // past us — but only after the gate is held, so a queued caller's stream
-    // stays silent while another driver's turn is in flight. The client's own
-    // `client.message.send` / client-dispatch `tool.result` are filtered out
-    // of the broadcast, so they are never echoed.
+    // stays silent while another driver's turn is in flight. Every event is
+    // broadcast to all watchers; the only events withheld from *this caller's*
+    // own feed are the ones it literally sent in this request (its
+    // `client.message.send` and any client-dispatched `tool.result`), tracked in
+    // `self_event_ids` below so they are never echoed straight back to the
+    // sender — while genuine observers on other connections still see them live.
     let (mut rx, _cancel) = state.broadcaster.subscribe(&session.id);
 
     // Record the incoming client turn (and any returned tool_result blocks),
     // attributed to the acting client key (the driver sending this message,
     // not necessarily the session's creator). These go through the publish
-    // choke point but are filtered from broadcast.
+    // choke point and are broadcast to observers, but suppressed from the
+    // sender's own stream via `self_event_ids`.
     let mut all_events = Vec::new();
     let msg_payload = json!({ "role": message.role, "content": message.content });
     match broadcast::insert_and_publish(
@@ -398,6 +402,10 @@ async fn drive_send_message(
             Err(e) => return emit_internal(&tx, &resp_id, e).await,
         }
     }
+
+    // The events this request's client literally sent — never echoed back to it
+    // on its own stream (other observers still receive them live).
+    let self_event_ids: HashSet<String> = all_events.iter().map(|e| e.id.clone()).collect();
 
     // The profile could have been deleted mid-session.
     let profile = match state
@@ -456,6 +464,10 @@ async fn drive_send_message(
             biased;
             recv = rx.recv(), if watching => match recv {
                 Ok(record) => {
+                    // Never echo the caller's own sent events back to it.
+                    if self_event_ids.contains(&record.id) {
+                        continue;
+                    }
                     if !emit(&tx, &notification(&record)).await {
                         return; // client disconnected
                     }
@@ -472,6 +484,9 @@ async fn drive_send_message(
 
     // Flush any events published between the last poll and the turn returning.
     while let Ok(record) = rx.try_recv() {
+        if self_event_ids.contains(&record.id) {
+            continue;
+        }
         if !emit(&tx, &notification(&record)).await {
             return;
         }

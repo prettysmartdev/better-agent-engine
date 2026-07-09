@@ -97,9 +97,7 @@ class HttpxTransport:
         auth), raised before the first frame; the stream body itself is HTTP 200.
         """
         try:
-            async with self._client.stream(
-                method, url, headers=dict(headers), json=json
-            ) as resp:
+            async with self._client.stream(method, url, headers=dict(headers), json=json) as resp:
                 if not (200 <= resp.status_code < 300):
                     await resp.aread()
                     body: Any = None

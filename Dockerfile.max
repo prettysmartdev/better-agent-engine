@@ -1,0 +1,94 @@
+# Better Agent Engine (BAE) — bae-max image variant.
+#
+# Bundles the same baesrv/baectl Rust binaries as the plain `Dockerfile`,
+# PLUS max/ (the MAX dashboard: a Vite/React frontend and an Express/ws
+# backend), started together by docker/bae-max-entrypoint.sh. This image
+# independently re-does the Rust build stage rather than sharing it with
+# `Dockerfile` — per aspec/architecture/design.md Principle 3 ("independent
+# components, no lockstep"), the small duplication is preferred over coupling
+# the two image builds together.
+#
+#   docker build -f Dockerfile.max -t better-agent-engine-max .
+#   docker run -p 8080:8080 -p 3000:3000 -v bae-data:/var/lib/bae better-agent-engine-max
+
+FROM rust:1-bookworm AS rust-build
+WORKDIR /build
+# See Dockerfile's identical stage for why server/ and baectl/ are COPYed into
+# distinct subdirectories rather than flattened.
+COPY server/ ./server/
+COPY baectl/ ./baectl/
+RUN cargo build --release --manifest-path server/Cargo.toml
+RUN rustup target add x86_64-unknown-linux-musl \
+    && apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo build --release --target x86_64-unknown-linux-musl --manifest-path baectl/Cargo.toml
+
+# Node build stage: compiles max/web (Vite dist/) and max/server (tsc -> JS).
+# Uses the official Node 22 image rather than Dockerfile.dev's nodesource
+# install, since this stage is discarded after build — only the runtime
+# stage below needs Node actually installed on debian:bookworm-slim.
+FROM node:22-bookworm AS node-build
+
+WORKDIR /build/web
+COPY max/web/package.json max/web/package-lock.json ./
+RUN npm ci
+COPY max/web/ ./
+RUN npm run build
+
+WORKDIR /build/server
+COPY max/server/package.json max/server/package-lock.json ./
+RUN npm ci
+COPY max/server/ ./
+RUN npm run build
+# Prune devDependencies (typescript, vitest, tsx, prettier, @types/*, etc.) —
+# only express + ws are needed to run the compiled dist/index.js.
+RUN npm prune --omit=dev
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && curl -fsSL --retry 5 https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version \
+    # bash is Priority: required / Essential: yes in Debian, so bookworm-slim
+    # carries it already (unlike non-essential packages the slim variant
+    # strips) — verify at build time and install explicitly if that ever
+    # changes, since docker/bae-max-entrypoint.sh needs bash's `wait -n`.
+    # Parenthesized so `||`/`&&` don't fall through to reinstalling
+    # unconditionally: (A || B) would otherwise short-circuit past this into
+    # an unconditional `&& C` regardless of which side succeeded.
+    && (command -v bash || (apt-get update \
+        && apt-get install -y --no-install-recommends bash \
+        && rm -rf /var/lib/apt/lists/*)) \
+    && useradd --system --user-group --home-dir /var/lib/bae bae \
+    && mkdir -p /var/lib/bae \
+    && chown bae:bae /var/lib/bae
+
+COPY --from=rust-build /build/server/target/release/baesrv /usr/local/bin/baesrv
+COPY --from=rust-build /build/baectl/target/x86_64-unknown-linux-musl/release/baectl /usr/local/bin/baectl
+
+COPY --from=node-build /build/server/dist/ /usr/local/lib/max/server/
+COPY --from=node-build /build/server/node_modules/ /usr/local/lib/max/server/node_modules/
+COPY --from=node-build /build/server/package.json /usr/local/lib/max/server/package.json
+COPY --from=node-build /build/web/dist/ /usr/local/lib/max/web/dist/
+
+COPY docker/bae-max-entrypoint.sh /usr/local/bin/bae-max-entrypoint.sh
+RUN chmod +x /usr/local/bin/bae-max-entrypoint.sh
+
+USER bae
+ENV BAE_ADDR=0.0.0.0:8080 \
+    BAE_DB_PATH=/var/lib/bae/bae.db \
+    BAE_LOG=info \
+    BAE_MAX_ADDR=0.0.0.0:3000 \
+    BAE_MAX_WEB_DIST=/usr/local/lib/max/web/dist
+# Client port (8080) and MAX's own dashboard port (3000, BAE_MAX_ADDR) are
+# exposed. The admin port (BAE_ADMIN_ADDR, default 127.0.0.1:8081) binds to
+# loopback inside the container and is intentionally NOT exposed — max/server
+# reaches it over 127.0.0.1:8081 in-container, exactly as baectl does; reach
+# it from outside the container via `docker exec` / an SSH tunnel, never the
+# network. TLS terminates upstream; both ports speak plain HTTP.
+EXPOSE 8080 3000
+VOLUME ["/var/lib/bae"]
+ENTRYPOINT ["/usr/local/bin/bae-max-entrypoint.sh"]

@@ -49,9 +49,7 @@ export class ProvidersFailedError extends BaeError {
     readonly assistantMessage: Message,
     readonly events: SessionEvent[],
   ) {
-    super(
-      "all providers failed — check the profile's provider config / key",
-    );
+    super("all providers failed — check the profile's provider config / key");
   }
 }
 

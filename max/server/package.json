@@ -1,0 +1,36 @@
+{
+  "name": "@prettysmartdev/bae-max-server",
+  "version": "0.1.0",
+  "description": "Node.js backend for the MAX dashboard: serves the built web/ frontend and bridges to the BAE server's admin/client ports.",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.json --noEmit && prettier --check src",
+    "fmt": "prettier --write src",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.1",
+    "@types/supertest": "^7.2.0",
+    "@types/ws": "^8.18.1",
+    "prettier": "^3.9.4",
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}
