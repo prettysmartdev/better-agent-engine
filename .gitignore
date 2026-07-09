@@ -20,6 +20,8 @@ __pycache__/
 .env
 .env.*
 data/
+bae-examples.env
+
 
 # reference-assistant file-tool workspace (created at runtime by the example)
 examples/reference-assistant/workspace/
