@@ -11,9 +11,6 @@
         "gpt-5.6-luna",
         "gpt-5.6-terra",
         "gpt-5.6-sol"
-      ],
-      "opencode": [
-        "omlx/Qwen3.6-35B-A3B-UD-MLX-4bit"
       ]
     },
     "defaultLeader": "claude::claude-fable-5",
