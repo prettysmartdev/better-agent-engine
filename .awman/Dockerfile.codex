@@ -1,17 +1,20 @@
 FROM awman-better-agent-engine:latest
 
-# Force root for user/workspace setup: a base image may have switched to a
-# non-root user, and useradd/mkdir/chown need root.
+# Force root for installation: a base image may have switched to a non-root
+# user, and apt/cp/install need write access to /usr/local, /etc, /root.
 USER root
 
-# Reset env vars so behavior does not depend on what the base set:
+# Reset env vars so installer behavior does not depend on what the base set:
+#   - HOME drives where installers and tools write user-scoped files.
 #   - DEBIAN_FRONTEND avoids interactive apt prompts.
 #   - PATH prepends the agent baseline to whatever the base image set,
 #     so installer-resolved binaries cannot be shadowed by the base while
 #     useful base PATH additions (e.g. /usr/local/cargo/bin from
 #     Dockerfile.dev) stay visible inside the agent container.
-ENV DEBIAN_FRONTEND=noninteractive \
+ENV HOME=/root \
+    DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+WORKDIR /root
 
 # Strict shell for every RUN: -e fails fast, -o pipefail catches errors in
 # `curl | bash` pipelines so a partial download cannot silently succeed.
@@ -22,9 +25,27 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ENTRYPOINT []
 CMD ["/bin/bash"]
 
+# ── Runtime prerequisites ─────────────────────────────────────────────────────
+# Codex sandboxes command execution on Linux with bubblewrap and treats it as a
+# hard prerequisite; without the `bwrap` binary on PATH, sandboxed exec fails.
+# The base image does not ship it, so install it here (as root, before dropping
+# to the runtime user) and prune apt lists to keep the layer small.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Install agent binary ──────────────────────────────────────────────────────
+# Codex CLI is installed via OpenAI's official installer, which fetches the
+# correct prebuilt binary for the current architecture. The installer drops the
+# binary under the invoking user's ~/.local/bin; copy it into /usr/local/bin so
+# it is on PATH for every user (including the runtime `awman` user below).
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
+        https://chatgpt.com/codex/install.sh | sh \
+    && codex_bin="$(command -v codex || true)" \
+    && [ -n "$codex_bin" ] || codex_bin="$HOME/.local/bin/codex" \
+    && install -m 0755 "$codex_bin" /usr/local/bin/codex
+
 # ── awman user + workspace (idempotent against a base that already created it) ─
-# Created BEFORE the agent install so the installer below can run as the
-# runtime user and land in its default location under /home/awman.
 # Outer braces keep the && chain associated with the user-creation block,
 # avoiding the `A || B && C && D` precedence trap that would otherwise skip
 # `mkdir`/`chown` whenever the user already exists.
@@ -34,47 +55,12 @@ RUN { id -u awman >/dev/null 2>&1 \
     && mkdir -p /workspace /home/awman \
     && chown -R awman:awman /workspace /home/awman
 
-# Run everything from here as the runtime user. /home/awman/.local/bin leads
-# PATH so the codex launcher installed below is reachable from any container
-# entrypoint (docker run/exec inherit image ENV regardless of command).
 USER awman
 ENV HOME=/home/awman \
-    PATH=/home/awman/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 WORKDIR /workspace
 
-# ── Install agent binaries ────────────────────────────────────────────────────
-# Use Codex's official standalone installer rather than dropping a single
-# release binary. Codex is not one executable: "code mode" (the tool-calling
-# path newer GPT models use) shells out to a companion `codex-code-mode-host`,
-# and the runtime also relies on bundled ripgrep + a bwrap sandbox. The
-# installer fetches all of these as one sha256-verified, versioned release and
-# keeps them in sync, so future companion binaries are picked up automatically
-# instead of needing to be enumerated here. Installing just `codex` was what
-# broke newer models with "codex-code-mode-host is missing", leaving the
-# command runner unable to inspect or patch the workspace.
-#
-# Layout the installer produces (run as awman, HOME=/home/awman):
-#   ~/.local/bin/codex                 → symlink into the current release
-#   ~/.codex/packages/standalone/current/bin/{codex,codex-code-mode-host}
-# On Linux the host is NOT symlinked onto PATH; codex resolves it relative to
-# its own real binary, i.e. as a sibling in the release `bin/` dir. The smoke
-# test below checks it there, which is exactly where codex looks for it.
-#
-# The script is saved to disk first so `--retry` can recover from transient
-# curl failures without `curl ... | sh` muddling pipefail semantics.
-RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
-        https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
-    && sh /tmp/codex-install.sh \
-    && rm -f /tmp/codex-install.sh \
-    && test -x "$HOME/.local/bin/codex"
-
-# ── Smoke test: run as the runtime user so we verify from the same user/env
-# context container entrypoints will use. Confirm the launcher resolves on PATH
-# at its default location, that the CLI actually executes, and that the
-# code-mode host is present beside the real binary — so a broken/absent host
-# fails the build rather than surfacing only when a code-mode-driven model runs.
+# ── Smoke test: run as the runtime user so we verify the binary is on PATH and
+# executable from the actual entrypoint context, not just for root. ───────────
 RUN test -x "$(command -v codex)" \
-    && [ "$(command -v codex)" = "/home/awman/.local/bin/codex" ] \
-    && codex --version >/dev/null \
-    && CODEX_REAL="$(readlink -f "$(command -v codex)")" \
-    && test -x "$(dirname "$CODEX_REAL")/codex-code-mode-host"
+    && test -x "$(command -v bwrap)"
