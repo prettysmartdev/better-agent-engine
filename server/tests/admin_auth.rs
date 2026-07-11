@@ -493,33 +493,33 @@ async fn enforcement_rejects_missing_garbage_and_client_keys_on_every_route() {
 /// Stage a private copy of the `baesrv` binary under `dir` and return its path.
 ///
 /// `CARGO_BIN_EXE_baesrv` points at Cargo's shared "uplift" path
-/// (`target/debug/baesrv`), which Cargo refreshes with a remove-then-hardlink
+/// (`target/debug/baesrv`), which Cargo refreshes with a remove-then-write
 /// whenever an invocation's build configuration differs from the last one
 /// (e.g. `make build`/`make lint` running concurrently with `make test`, or a
 /// differing `CARGO_INCREMENTAL`) — and the build lock is not held while tests
-/// run. Exec'ing that path directly can therefore transiently fail with
-/// ENOENT mid-suite. Copying the binary into the test's own temp dir (with a
-/// short retry in case a refresh is in flight) makes the spawns hermetic
-/// without changing anything the test asserts.
+/// run. While an overlapping build re-links that path the source is missing
+/// (ENOENT) or briefly busy (ETXTBSY) for the *entire* duration of the link,
+/// which for a `--all-targets` clippy/build is tens of seconds, not the few
+/// milliseconds of a lone uplift. Copying the binary into the test's own temp
+/// dir — retrying on any transient error across a deadline that comfortably
+/// outlasts such a build — makes the spawns hermetic without changing anything
+/// the test asserts.
 fn stage_baesrv_copy(dir: &std::path::Path) -> PathBuf {
     let src = std::path::Path::new(env!("CARGO_BIN_EXE_baesrv"));
     let dst = dir.join("baesrv");
-    let mut last = None;
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
         match std::fs::copy(src, &dst) {
             Ok(_) => return dst,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                last = Some(e);
+            Err(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => panic!("staging baesrv from {}: {e}", src.display()),
+            Err(e) => panic!(
+                "baesrv never became copyable at {} within 90s: {e}",
+                src.display()
+            ),
         }
     }
-    panic!(
-        "baesrv never became copyable at {}: {}",
-        src.display(),
-        last.unwrap()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

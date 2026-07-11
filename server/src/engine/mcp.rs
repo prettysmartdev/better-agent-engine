@@ -41,7 +41,7 @@
 //!
 //! # Secrets
 //!
-//! `http`/`sse` header values may contain `${ENV_VAR}` tokens. They are resolved
+//! `http`/`sse` header values and `stdio` command arguments may contain `${ENV_VAR}` tokens. They are resolved
 //! by [`super::provider::resolve_tokens`] immediately before connecting, held
 //! only for the request, and never written to an event, a log line, or the
 //! database — the same convention as provider `auth_token`.
@@ -278,8 +278,21 @@ impl StdioConn {
             .command
             .as_deref()
             .ok_or_else(|| McpError::Connect("stdio transport requires `command`".into()))?;
-        let mut cmd = Command::new(command);
-        cmd.args(&cfg.args)
+        let command = resolve_tokens(command)
+            .map_err(|e| McpError::Connect(format!("stdio command: {e}")))?;
+        // Resolve arguments immediately before spawn. This is deliberately the
+        // same secret-handling boundary as HTTP headers: values live only in
+        // the child argv and are never persisted or logged.
+        let args: Result<Vec<_>, _> = cfg
+            .args
+            .iter()
+            .map(|arg| {
+                resolve_tokens(arg).map_err(|e| McpError::Connect(format!("stdio arg: {e}")))
+            })
+            .collect();
+        let args = args?;
+        let mut cmd = Command::new(&command);
+        cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

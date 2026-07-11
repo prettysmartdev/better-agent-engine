@@ -1,0 +1,26 @@
+# bae-config.toml — GitHub MCP server, hosted (Streamable HTTP)
+#
+# Prerequisite: a GITHUB_TOKEN scoped to the narrowest permission that works
+# for the task at hand (e.g. "Issues: write" on the target repositories
+# only) — never a broad or admin-scoped token. See aspec/architecture/security.md's
+# "Enforce least privilege" guidance.
+#
+# Upstream server: github/github-mcp-server
+#   https://github.com/github/github-mcp-server
+#
+# Alternative: to run the server locally via Docker instead of using GitHub's
+# hosted endpoint, see github-local.toml.
+#
+# Point the server at this file with either:
+#   baesrv --config examples/bae-config/github.toml
+#   BAE_CONFIG=examples/bae-config/github.toml baesrv
+#
+# Then opt a profile into it with:  mcp_servers = ["github"]
+
+[mcp]
+
+[[mcp.servers]]
+name = "github"
+transport = "http"
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }

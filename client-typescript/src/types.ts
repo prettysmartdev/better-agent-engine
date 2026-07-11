@@ -271,6 +271,8 @@ export type SandboxLifecyclePayload =
   | {
       dispatch: "remote";
       image: string;
+      /** Remote execution is always containerized. */
+      unsandboxed: false;
       /** Absent on a `phase: "start"` error (no container was created). */
       sandbox_id?: string;
       /** Present on `session.sandbox.error`: the driver call that failed. */
@@ -282,7 +284,9 @@ export type SandboxLifecyclePayload =
     }
   | {
       dispatch: "local";
-      image: string;
+      image: string | null;
+      /** True when the command ran directly on the harness host. */
+      unsandboxed: boolean;
       container_id: string | null;
       detail: string | null;
     };

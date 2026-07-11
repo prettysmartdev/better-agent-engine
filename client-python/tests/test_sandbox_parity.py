@@ -160,8 +160,26 @@ async def test_local_lifecycle_reports_running_before_exec_and_stopped_on_close(
 
     # Verified via the recorded outbound reportLocalSandbox RPC calls.
     assert mock.report_calls[0]["state"] == "running"
+    assert mock.report_calls[0]["image"] == "alpine"
+    assert mock.report_calls[0]["unsandboxed"] is False
     assert mock.report_calls[0]["container_id"] == "cid-1"
     assert mock.report_calls[-1]["state"] == "stopped"
+
+
+async def test_none_lifecycle_marks_host_execution_unsandboxed_on_wire() -> None:
+    mock = RpcMock()
+    harness = Harness(_config(), transport=mock)
+    sbx = harness.sandbox_session()
+    tool = run_shell_command(sbx, SandboxTarget.none(), RemoteMode.auto())
+    harness.register_sandbox_tool(tool)
+
+    await harness.connect()
+    assert tool.tool is not None
+    await tool.tool.handler({"command": "printf host"})
+
+    assert [call["state"] for call in mock.report_calls] == ["running", "stopped"]
+    assert all(call["image"] is None for call in mock.report_calls)
+    assert all(call["unsandboxed"] is True for call in mock.report_calls)
 
 
 # ---------------------------------------------------------------------------

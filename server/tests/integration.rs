@@ -113,11 +113,224 @@ async fn mock_handler(req: Request) -> Response {
                 { "type": "tool_use", "id": "tu_sbx", "name": "run_shell_command",
                   "input": { "command": "echo hi" } }] })
         }
+    } else if path.starts_with("/triage") {
+        // A stateful scripted issue-triage agent driving the GitHub MCP fixture
+        // (`tests/fixtures/github_mock_server.py`). It reads the conversation to
+        // decide its next tool call: list → filter PRs → per issue: fetch, then
+        // either skip (marker present) or label + comment. See
+        // [`triage_provider_response`].
+        triage_provider_response(&body)
     } else {
         json!({ "role": "assistant", "stop_reason": "end_turn",
                 "content": [{ "type": "text", "text": "Hello from mock" }] })
     };
     (StatusCode::OK, Json(out)).into_response()
+}
+
+/// The triage marker the example embeds in every comment; its presence in an
+/// issue's existing comments makes a re-run idempotent (issue skipped).
+const TRIAGE_MARKER: &str = "<!-- issue-triage:v1 -->";
+
+/// A stateful scripted issue-triage agent, played by the mock provider on the
+/// `/triage` path. It is a pure function of the conversation `body` (the
+/// Anthropic Messages request the server posts each provider turn), so it needs
+/// no external state: it inspects the message history to decide the next step,
+/// exactly as a real agent following the example's prompts would.
+///
+/// Control flow it realizes end to end against the GitHub MCP fixture:
+/// - list phase: `list_issues` → parse the result, EXCLUDE any entry with a
+///   `pull_request` field → reply with a fenced JSON array of the remaining
+///   issue numbers (what the example parses into its per-issue loop);
+/// - per-issue phase for issue N: `get_issue(N)` → if a comment already carries
+///   the marker, reply `already triaged` with NO further tool calls; otherwise
+///   `add_labels(N, …)` then exactly one `add_comment(N, body)` whose body
+///   begins with the marker, then a one-line summary.
+fn triage_provider_response(body: &Value) -> Value {
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let last = messages.last().cloned().unwrap_or(Value::Null);
+
+    // A fresh task prompt (the last message is a plain user turn, not a
+    // tool_result carrier) starts a phase; otherwise we are answering the
+    // tool_result of our own most-recent tool_use.
+    let uid = format!("tu{}", messages.len());
+    if !message_has_tool_result(&last) {
+        let text = user_message_text(&last);
+        if text.contains("TASK (list phase)") {
+            return tool_use_turn(&uid, "list_issues", json!({ "state": "open" }));
+        }
+        if let Some(n) = issue_number_from_task(&text) {
+            return tool_use_turn(&uid, "get_issue", json!({ "issue_number": n }));
+        }
+        return final_text_turn("nothing to do");
+    }
+
+    // Answering a tool_result: branch on which tool we just called.
+    let (called, called_input) = last_assistant_tool_use(&messages);
+    let result_text = last_tool_result_text(&last);
+    match called.as_str() {
+        "list_issues" => {
+            let numbers = open_issue_numbers_excluding_prs(&result_text);
+            let arr = numbers
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            final_text_turn(&format!("```json\n[{arr}]\n```"))
+        }
+        "get_issue" => {
+            if result_text.contains(TRIAGE_MARKER) {
+                // Idempotency skip: no label, no comment.
+                final_text_turn("already triaged")
+            } else {
+                let n = called_input
+                    .get("issue_number")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                tool_use_turn(
+                    &uid,
+                    "add_labels",
+                    json!({ "issue_number": n, "labels": ["bug", "sev-medium"] }),
+                )
+            }
+        }
+        "add_labels" => {
+            let n = called_input
+                .get("issue_number")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let comment =
+                format!("{TRIAGE_MARKER}\n\nPlan: reproduce, add a regression test, fix.");
+            tool_use_turn(
+                &uid,
+                "add_comment",
+                json!({ "issue_number": n, "body": comment }),
+            )
+        }
+        "add_comment" => final_text_turn("triaged: applied labels and posted a plan comment"),
+        _ => final_text_turn("done"),
+    }
+}
+
+/// An assistant turn with a single `tool_use` block.
+fn tool_use_turn(id: &str, name: &str, input: Value) -> Value {
+    json!({
+        "role": "assistant",
+        "stop_reason": "tool_use",
+        "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }],
+    })
+}
+
+/// An assistant turn with a single final text block.
+fn final_text_turn(text: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "stop_reason": "end_turn",
+        "content": [{ "type": "text", "text": text }],
+    })
+}
+
+/// Does this message carry at least one `tool_result` block? (Marks a message
+/// the server appended to feed a tool's output back to the provider.)
+fn message_has_tool_result(msg: &Value) -> bool {
+    msg.get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+        .unwrap_or(false)
+}
+
+/// The concatenated text of a user message whose `content` is either a plain
+/// string or an array of blocks.
+fn user_message_text(msg: &Value) -> String {
+    match msg.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Parse the issue number out of a per-issue task prompt (`… for issue #N of …`).
+fn issue_number_from_task(text: &str) -> Option<u64> {
+    let marker = "issue #";
+    let start = text.find(marker)? + marker.len();
+    let digits: String = text[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// The `(name, input)` of the most recent assistant `tool_use` block in the
+/// history — the call whose result the current turn is answering.
+fn last_assistant_tool_use(messages: &[Value]) -> (String, Value) {
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for b in blocks.iter().rev() {
+            if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let name = b
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let input = b.get("input").cloned().unwrap_or(Value::Null);
+                return (name, input);
+            }
+        }
+    }
+    (String::new(), Value::Null)
+}
+
+/// The text carried by the first `tool_result` block of a message. The block's
+/// `content` may be a string or an array of `{type:"text", text}` blocks.
+fn last_tool_result_text(msg: &Value) -> String {
+    let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    for b in blocks {
+        if b.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        return match b.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(inner)) => inner
+                .iter()
+                .filter_map(|x| x.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+    }
+    String::new()
+}
+
+/// Parse a `list_issues` result (a JSON array of issue objects, embedded as
+/// text) and return the numbers of entries WITHOUT a `pull_request` field, in
+/// the order given — the PR-exclusion the list phase performs.
+fn open_issue_numbers_excluding_prs(result_text: &str) -> Vec<u64> {
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(result_text.trim()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|it| it.get("pull_request").is_none())
+        .filter_map(|it| it.get("number").and_then(Value::as_u64))
+        .collect()
 }
 
 /// Start the mock provider on an ephemeral port; returns its base origin URL
@@ -173,6 +386,7 @@ fn default_provider_registry(
         entry("tool", "tool", "test-token"),
         entry("mcp", "mcp", "test-token"),
         entry("sandbox", "sandbox", "test-token"),
+        entry("triage", "triage", "test-token"),
         entry("fail", "fail", "test-token"),
         entry("badenv", "text", "${BAE_TEST_DEFINITELY_UNSET_XYZ}"),
     ]
@@ -1474,6 +1688,16 @@ fn echo_registry(name: &str, pidfile: Option<&str>) -> HashMap<String, McpServer
     ))
 }
 
+/// A registry with one stdio server (`name`) backed by the GitHub-issues mock
+/// fixture (`tests/fixtures/github_mock_server.py`) — the offline stand-in for
+/// the GitHub MCP server the `issue-triage` example (WI 0008) drives.
+fn github_registry(name: &str) -> HashMap<String, McpServerConfig> {
+    let fixture_path = fixture("github_mock_server.py");
+    registry_from_toml(&format!(
+        "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = [{fixture_path:?}]\n"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Log capture (for the "not found is logged every session" assertion)
 // ---------------------------------------------------------------------------
@@ -1880,6 +2104,179 @@ async fn mcp_round_trip_emits_real_payloads() {
         .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&key))
         .await;
     assert_eq!(status, 200, "close tears down the MCP subprocess");
+}
+
+// ---------------------------------------------------------------------------
+// issue-triage example — two-phase loop against a scripted GitHub MCP server
+// ---------------------------------------------------------------------------
+
+/// Extract a JSON array of integers from the first fenced code block of `text`
+/// (the list-phase reply shape the `issue-triage` example parses).
+fn parse_fenced_numbers(text: &str) -> Vec<u64> {
+    let start = match text.find("```") {
+        Some(i) => i + 3,
+        None => return Vec::new(),
+    };
+    let after = &text[start..];
+    let body_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
+    let body = &after[body_start..];
+    let end = match body.find("```") {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    serde_json::from_str::<Vec<u64>>(body[..end].trim()).unwrap_or_default()
+}
+
+/// Every GitHub MCP tool call in a persisted event list, as `(tool, input)`
+/// pairs in order, read from the real `mcp.request` events.
+fn mcp_tool_calls(evs: &[Value]) -> Vec<(String, Value)> {
+    evs.iter()
+        .filter(|e| e["event_type"] == json!("mcp.request"))
+        .map(|e| {
+            (
+                e["payload"]["tool"].as_str().unwrap_or("").to_string(),
+                e["payload"]["input"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// The `issue_number` argument of every call to `tool`, in order.
+fn issue_numbers_for(calls: &[(String, Value)], tool: &str) -> Vec<u64> {
+    calls
+        .iter()
+        .filter(|(t, _)| t == tool)
+        .filter_map(|(_, input)| input["issue_number"].as_u64())
+        .collect()
+}
+
+fn count_tool(calls: &[(String, Value)], tool: &str) -> usize {
+    calls.iter().filter(|(t, _)| t == tool).count()
+}
+
+/// WI 0008 Integration — the two-phase issue-triage loop driven end to end
+/// against the GitHub MCP fixture with a scripted (no real LLM) provider,
+/// following the `harness-smoke` posture (real server + real stdio MCP fixture,
+/// fully offline). Asserts the observable GitHub tool-call sequence:
+/// - the pull-request entry (#103) is EXCLUDED from the per-issue phase;
+/// - the already-marked issue (#102) is skipped with NO label or comment call;
+/// - every other issue produces exactly one label mutation AND exactly one
+///   comment creation whose body contains the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_triage_two_phase_loop_excludes_prs_skips_marked_labels_others() {
+    let ts = start_server_with_registry(github_registry("github")).await;
+    let profile_id = ts
+        .create_profile_with_mcp("triage", json!(["github"]), json!([]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    // Accumulate every turn's events (each `send_message` result carries the
+    // full per-turn `events` array; the GET /events log is paginated, so we
+    // aggregate here to see the whole run).
+    let mut all_events: Vec<Value> = Vec::new();
+
+    // --- Phase 1: list. The scripted agent calls list_issues, drops the PR
+    // entry, and replies with a fenced JSON array of the remaining numbers.
+    let (status, resp, raw) = ts
+        .send_message(
+            &sid,
+            &key,
+            json!({ "content": "TASK (list phase). List the OPEN issues of \
+                `acme/widget` using the GitHub tools. EXCLUDE any entry with a \
+                `pull_request` field. Reply with ONLY a fenced JSON array of the \
+                open issue NUMBERS, newest first." }),
+        )
+        .await;
+    assert_eq!(status, 200, "list phase: {raw}");
+    all_events.extend(resp["events"].as_array().cloned().unwrap_or_default());
+    let list_text = resp["message"]["content"][0]["text"].as_str().unwrap_or("");
+    let numbers = parse_fenced_numbers(list_text);
+    assert_eq!(
+        numbers,
+        vec![104, 102, 101],
+        "PR #103 excluded, newest-first: {list_text:?}"
+    );
+
+    // --- Phase 2: one send() per issue on the SAME session (the example's
+    // single-session simplification).
+    for n in &numbers {
+        let (status, resp, raw) = ts
+            .send_message(
+                &sid,
+                &key,
+                json!({ "content": format!(
+                    "TASK (per-issue phase) for issue #{n} of `acme/widget`. Fetch \
+                     issue #{n} with the GitHub tools. IDEMPOTENCY: if any existing \
+                     comment already contains the marker `{TRIAGE_MARKER}`, reply \
+                     exactly `already triaged`. Otherwise apply exactly one label and \
+                     post exactly one comment beginning with `{TRIAGE_MARKER}`."
+                ) }),
+            )
+            .await;
+        assert_eq!(status, 200, "issue #{n}: {raw}");
+        all_events.extend(resp["events"].as_array().cloned().unwrap_or_default());
+    }
+
+    // --- Assert on the aggregated event log: the GitHub tool-call shape.
+    let evs = all_events;
+    let calls = mcp_tool_calls(&evs);
+
+    // list_issues: exactly once, up front.
+    assert_eq!(
+        count_tool(&calls, "list_issues"),
+        1,
+        "one list call: {calls:?}"
+    );
+    assert_eq!(calls.first().map(|(t, _)| t.as_str()), Some("list_issues"));
+
+    // get_issue: once per triaged number, in order — and NEVER for the PR #103.
+    let fetched = issue_numbers_for(&calls, "get_issue");
+    assert_eq!(
+        fetched,
+        vec![104, 102, 101],
+        "each listed issue fetched once"
+    );
+    assert!(
+        !fetched.contains(&103),
+        "the PR entry #103 is never fetched"
+    );
+
+    // add_labels / add_comment: for the two normal issues (#104, #101) only —
+    // the already-marked #102 is skipped with no mutation.
+    let labeled = issue_numbers_for(&calls, "add_labels");
+    let commented = issue_numbers_for(&calls, "add_comment");
+    assert_eq!(labeled, vec![104, 101], "marked #102 gets no label");
+    assert_eq!(commented, vec![104, 101], "marked #102 gets no comment");
+    assert!(!labeled.contains(&102) && !commented.contains(&102));
+
+    // Exactly one label AND one comment per triaged issue (no duplicates).
+    assert_eq!(count_tool(&calls, "add_labels"), 2);
+    assert_eq!(count_tool(&calls, "add_comment"), 2);
+
+    // Every posted comment body carries the idempotency marker.
+    for (tool, input) in &calls {
+        if tool == "add_comment" {
+            let body = input["body"].as_str().unwrap_or("");
+            assert!(
+                body.contains(TRIAGE_MARKER),
+                "comment body must carry the marker: {body:?}"
+            );
+        }
+    }
+
+    // A real, non-stub MCP response flowed for the list call.
+    let list_resp = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("mcp.response"))
+        .expect("an mcp.response event");
+    assert_eq!(list_resp["payload"]["server_name"], json!("github"));
+    assert_eq!(list_resp["payload"]["ok"], json!(true));
+
+    let (status, _v, _raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&key))
+        .await;
+    assert_eq!(status, 200, "session close tears down the MCP subprocess");
 }
 
 // ---------------------------------------------------------------------------
@@ -4162,7 +4559,91 @@ async fn report_local_sandbox_maps_state_skips_allowlist_and_gates_on_driver() {
         assert_eq!(ev["payload"]["dispatch"], json!("local"), "{state_str}");
         assert_eq!(ev["payload"]["image"], json!("totally-unlisted:latest"));
         assert_eq!(ev["payload"]["container_id"], json!("local-abc"));
+        assert_eq!(
+            ev["payload"],
+            json!({
+                "dispatch": "local",
+                "image": "totally-unlisted:latest",
+                "unsandboxed": false,
+                "container_id": "local-abc",
+                "detail": "from the harness",
+            }),
+            "existing Local{{image}} event payload changed for {state_str}",
+        );
     }
+
+    // Host-shell reports are valid only when explicitly marked unsandboxed.
+    // Exercise every lifecycle state so the nullable image and additive flag
+    // are carried consistently by running/stopped/error events.
+    for (state_str, event_type) in [
+        ("running", "session.sandbox.running"),
+        ("stopped", "session.sandbox.stopped"),
+        ("error", "session.sandbox.error"),
+    ] {
+        let t = ts
+            .rpc_terminal(
+                &sid,
+                &skey,
+                "session.reportLocalSandbox",
+                json!({
+                    "state": state_str,
+                    "image": null,
+                    "unsandboxed": true,
+                }),
+            )
+            .await;
+        assert_eq!(t["result"]["reported"], json!(true), "{state_str}: {t}");
+        let evs = ts.session_events(&sid, &skey).await;
+        let ev = evs
+            .iter()
+            .rev()
+            .find(|candidate| candidate["event_type"] == json!(event_type))
+            .unwrap_or_else(|| panic!("missing unsandboxed {event_type}: {evs:?}"));
+        assert_eq!(
+            ev["payload"],
+            json!({
+                "dispatch": "local",
+                "image": null,
+                "unsandboxed": true,
+                "container_id": null,
+                "detail": null,
+            }),
+            "{state_str}: {ev}",
+        );
+    }
+
+    for params in [
+        json!({ "state": "running", "image": null }),
+        json!({ "state": "running", "image": null, "unsandboxed": false }),
+        json!({ "state": "running", "image": "alpine", "unsandboxed": true }),
+        json!({ "state": "running", "image": 1 }),
+        json!({ "state": "running", "image": "alpine", "unsandboxed": "true" }),
+    ] {
+        let t = ts
+            .rpc_terminal(&sid, &skey, "session.reportLocalSandbox", params)
+            .await;
+        assert_eq!(
+            t["error"]["code"],
+            json!(-32602),
+            "invalid host report: {t}"
+        );
+    }
+
+    // An omitted image is equivalent to an explicit null for a host-shell
+    // report, but only when the explicit unsandboxed marker is present.
+    let t = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.reportLocalSandbox",
+            json!({ "state": "running", "unsandboxed": true }),
+        )
+        .await;
+    assert_eq!(
+        t["result"]["reported"],
+        json!(true),
+        "omitted host image: {t}"
+    );
 
     // No sandbox was ever started server-side; the local report never touches
     // the driver.

@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const execFileMock = vi.hoisted(() => vi.fn());
+vi.mock("node:child_process", () => ({ execFile: execFileMock }));
 
 import { Config } from "./config.js";
 import { RpcError } from "./errors.js";
@@ -149,6 +152,115 @@ function toolOf(t: SandboxTool) {
   return t.tool;
 }
 
+function bindRecordingRpc(
+  reports: Array<{
+    state: string;
+    image: string | null;
+    containerId: string | null;
+  }>,
+) {
+  return {
+    execRemoteSandbox: async () => ({
+      stdout: "remote",
+      stderr: "",
+      exit_code: 0,
+    }),
+    reportLocalSandbox: async (
+      state: "running" | "stopped" | "error",
+      image: string | null,
+      containerId: string | null,
+    ) => {
+      reports.push({ state, image, containerId });
+    },
+  };
+}
+
+function mockHostShell(stdout = "none-out") {
+  execFileMock.mockImplementation(
+    (
+      program: string,
+      args: string[],
+      _options: unknown,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      callback(null, stdout, "");
+      return undefined;
+    },
+  );
+}
+
+describe("SandboxTarget.none dispatch", () => {
+  it("runs run_shell_command through the host shell and never the container driver", async () => {
+    const timeline: string[] = [];
+    const reports: Array<{
+      state: string;
+      image: string | null;
+      containerId: string | null;
+    }> = [];
+    const sbx = new SandboxSession();
+    sbx.bind(bindRecordingRpc(reports));
+    sbx.setLocalDriver(new FakeDriver(timeline));
+    execFileMock.mockReset();
+    mockHostShell();
+
+    const tool = toolOf(
+      runShellCommand(sbx, SandboxTarget.none(), RemoteMode.auto()),
+    );
+    const result = await tool.handler({ command: "printf none-out" });
+
+    expect(JSON.parse(result as string)).toMatchObject({
+      stdout: "none-out",
+      stderr: "",
+      exit_code: 0,
+    });
+    expect(execFileMock).toHaveBeenCalledWith(
+      "/bin/sh",
+      ["-c", "printf none-out"],
+      expect.anything(),
+      expect.any(Function),
+    );
+    expect(timeline).toEqual([]);
+    expect(reports).toEqual([
+      { state: "running", image: null, containerId: null },
+      { state: "stopped", image: null, containerId: null },
+    ]);
+  });
+
+  it("runs run_shell_named through the host shell and never the container driver", async () => {
+    const timeline: string[] = [];
+    const reports: Array<{
+      state: string;
+      image: string | null;
+      containerId: string | null;
+    }> = [];
+    const sbx = new SandboxSession();
+    sbx.bind(bindRecordingRpc(reports));
+    sbx.setLocalDriver(new FakeDriver(timeline));
+    execFileMock.mockReset();
+    mockHostShell();
+
+    const tool = toolOf(
+      runShellNamed(
+        sbx,
+        "echo_it",
+        "echo the name",
+        "echo {name}",
+        SandboxTarget.none(),
+        RemoteMode.auto(),
+      ),
+    );
+    await tool.handler({ name: "hello" });
+
+    expect(execFileMock).toHaveBeenCalledWith(
+      "/bin/sh",
+      ["-c", "echo 'hello'"],
+      expect.anything(),
+      expect.any(Function),
+    );
+    expect(timeline).toEqual([]);
+  });
+});
+
 // ===========================================================================
 // Command-injection resistance — the single most important test.
 //
@@ -170,24 +282,55 @@ const INJECTION_CASES: [string, string][] = [
 ];
 
 describe("run_shell_named command-injection resistance", () => {
-  it("shell-escapes every payload into one literal argument to echo", async () => {
+  it("shell-escapes every payload into one literal argument to echo for local and none targets", async () => {
     for (const [payload, expected] of INJECTION_CASES) {
-      const timeline: string[] = [];
-      const sbx = new SandboxSession();
-      sbx.setLocalDriver(new FakeDriver(timeline));
-      const tool = toolOf(
-        runShellNamed(
-          sbx,
-          "echo_it",
-          "echo the name",
-          "echo {name}",
-          SandboxTarget.local("alpine"),
-          RemoteMode.auto(),
-        ),
-      );
-      await tool.handler({ name: payload });
-      const exec = timeline.find((e) => e.startsWith("exec:"));
-      expect(exec).toBe(`exec:${expected}`);
+      for (const target of [
+        SandboxTarget.local("alpine"),
+        SandboxTarget.none(),
+      ]) {
+        const timeline: string[] = [];
+        const hostCalls: string[] = [];
+        const sbx = new SandboxSession();
+        sbx.bind(bindRecordingRpc([]));
+        sbx.setLocalDriver(new FakeDriver(timeline));
+        execFileMock.mockReset();
+        execFileMock.mockImplementation(
+          (
+            _program: string,
+            args: string[],
+            _options: unknown,
+            callback: (
+              error: Error | null,
+              stdout: string,
+              stderr: string,
+            ) => void,
+          ) => {
+            hostCalls.push(args[1]!);
+            callback(null, "", "");
+            return undefined;
+          },
+        );
+        const tool = toolOf(
+          runShellNamed(
+            sbx,
+            "echo_it",
+            "echo the name",
+            "echo {name}",
+            target,
+            RemoteMode.auto(),
+          ),
+        );
+        await tool.handler({ name: payload });
+
+        if (target.type === "local") {
+          const exec = timeline.find((e) => e.startsWith("exec:"));
+          expect(exec).toBe(`exec:${expected}`);
+          expect(hostCalls).toEqual([]);
+        } else {
+          expect(hostCalls).toEqual([expected]);
+          expect(timeline).toEqual([]);
+        }
+      }
     }
   });
 
@@ -232,9 +375,40 @@ describe("local sandbox lifecycle reporting", () => {
     // container id) then stopped.
     expect(mock.reportCalls[0]).toMatchObject({
       state: "running",
+      image: "alpine",
+      unsandboxed: false,
       container_id: "cid-1",
     });
     expect(mock.reportCalls.at(-1)).toMatchObject({ state: "stopped" });
+  });
+
+  it("sends unsandboxed host lifecycle reports over the real harness transport", async () => {
+    const mock = new RpcMock();
+    const harness = new Harness(config(), { transport: mock });
+    const tool = runShellCommand(
+      harness.sandboxSession(),
+      SandboxTarget.none(),
+      RemoteMode.auto(),
+    );
+    harness.registerSandboxTool(tool);
+    execFileMock.mockReset();
+    mockHostShell();
+
+    await harness.connect();
+    await toolOf(tool).handler({ command: "printf host" });
+
+    expect(mock.reportCalls).toEqual([
+      expect.objectContaining({
+        state: "running",
+        image: null,
+        unsandboxed: true,
+      }),
+      expect.objectContaining({
+        state: "stopped",
+        image: null,
+        unsandboxed: true,
+      }),
+    ]);
   });
 });
 

@@ -829,6 +829,7 @@ async fn start_remote_sandbox_rpc(
                     "phase": "start",
                     "detail": detail,
                     "dispatch": "remote",
+                    "unsandboxed": false,
                 }),
             );
             return single_or_empty(
@@ -845,7 +846,12 @@ async fn start_remote_sandbox_rpc(
         &session.id,
         acting_client_key_id,
         EventType::SandboxRunning,
-        &json!({ "image": image, "sandbox_id": sandbox_id, "dispatch": "remote" }),
+        &json!({
+            "image": image,
+            "sandbox_id": sandbox_id,
+            "dispatch": "remote",
+            "unsandboxed": false,
+        }),
     );
     let started_at = running
         .map(|r| Value::String(r.created_at))
@@ -926,6 +932,7 @@ async fn exec_remote_sandbox_rpc(
                     "phase": "exec",
                     "detail": detail,
                     "dispatch": "remote",
+                    "unsandboxed": false,
                 }),
             );
             single_or_empty(
@@ -936,8 +943,8 @@ async fn exec_remote_sandbox_rpc(
     }
 }
 
-/// `session.reportLocalSandbox` (`params: {"state", "image", "container_id"?,
-/// "detail"?}`).
+/// `session.reportLocalSandbox` (`params: {"state", "image", "unsandboxed"?,
+/// "container_id"?, "detail"?}`).
 ///
 /// Client-originated **local**-sandbox lifecycle telemetry: maps `state` to
 /// the matching lifecycle event with `"dispatch": "local"`, attributed to the
@@ -978,15 +985,56 @@ fn report_local_sandbox_rpc(
             )
         }
     };
-    let Some(image) = params.get("image").and_then(Value::as_str) else {
-        return single_or_empty(
-            id_present,
-            error_obj(req_id, -32602, "Invalid params: missing \"image\""),
-        );
+    let unsandboxed = match params.get("unsandboxed") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return single_or_empty(
+                    id_present,
+                    error_obj(
+                        req_id,
+                        -32602,
+                        "Invalid params: \"unsandboxed\" must be a boolean",
+                    ),
+                )
+            }
+        },
+        None => false,
+    };
+    let image = match params.get("image") {
+        Some(Value::String(_)) if unsandboxed => {
+            return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32602,
+                    "Invalid params: \"image\" must be null when \"unsandboxed\" is true",
+                ),
+            )
+        }
+        Some(Value::String(image)) => Value::String(image.clone()),
+        Some(Value::Null) | None if unsandboxed => Value::Null,
+        Some(Value::Null) | None => {
+            return single_or_empty(
+                id_present,
+                error_obj(req_id, -32602, "Invalid params: missing \"image\""),
+            )
+        }
+        Some(_) => {
+            return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32602,
+                    "Invalid params: \"image\" must be a string or null",
+                ),
+            )
+        }
     };
     let payload = json!({
         "dispatch": "local",
         "image": image,
+        "unsandboxed": unsandboxed,
         "container_id": params.get("container_id").cloned().unwrap_or(Value::Null),
         "detail": params.get("detail").cloned().unwrap_or(Value::Null),
     });

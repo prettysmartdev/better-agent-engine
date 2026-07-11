@@ -486,14 +486,48 @@ fn interpolate(template: &str, input: &Value) -> Result<String, BoxError> {
 pub struct LocalSandboxReport {
     /// One of `"running"`, `"stopped"`, `"error"`.
     pub state: String,
-    /// The local image name.
-    pub image: String,
+    /// The local image name, or `None` for unsandboxed host execution.
+    pub image: Option<String>,
+    /// Whether this command ran directly on the host rather than in a container.
+    pub unsandboxed: bool,
     /// The local container id, if one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     /// A human-readable detail (e.g. the failure message on `"error"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// Values accepted by [`SandboxSession::report_local_sandbox`] for its image.
+/// This keeps the previous string and string-slice call sites source-compatible
+/// while allowing `None` for genuinely unsandboxed execution.
+pub trait IntoLocalSandboxImage {
+    /// Convert into the nullable wire image.
+    fn into_local_sandbox_image(self) -> Option<String>;
+}
+
+impl IntoLocalSandboxImage for String {
+    fn into_local_sandbox_image(self) -> Option<String> {
+        Some(self)
+    }
+}
+
+impl IntoLocalSandboxImage for &str {
+    fn into_local_sandbox_image(self) -> Option<String> {
+        Some(self.to_string())
+    }
+}
+
+impl IntoLocalSandboxImage for &String {
+    fn into_local_sandbox_image(self) -> Option<String> {
+        Some(self.clone())
+    }
+}
+
+impl IntoLocalSandboxImage for Option<String> {
+    fn into_local_sandbox_image(self) -> Option<String> {
+        self
+    }
 }
 
 /// The object-safe transport seam a [`SandboxSession`] calls into for the two
@@ -588,14 +622,16 @@ impl SandboxSession {
     pub async fn report_local_sandbox(
         &self,
         state: &str,
-        image: &str,
+        image: impl IntoLocalSandboxImage,
         container_id: Option<&str>,
         detail: Option<&str>,
     ) -> Result<(), Error> {
+        let image = image.into_local_sandbox_image();
         self.rpc()?
             .report_local_sandbox(LocalSandboxReport {
                 state: state.to_string(),
-                image: image.to_string(),
+                unsandboxed: image.is_none(),
+                image,
                 container_id: container_id.map(str::to_string),
                 detail: detail.map(str::to_string),
             })
@@ -614,7 +650,7 @@ impl SandboxSession {
         let driver = self.driver();
         if let Err(e) = driver.ensure_image(image).await {
             let _ = self
-                .report_local_sandbox("error", image, None, Some(&e.to_string()))
+                .report_local_sandbox("error", Some(image.to_string()), None, Some(&e.to_string()))
                 .await;
             return Err(Error::Sandbox(e.to_string()));
         }
@@ -622,13 +658,18 @@ impl SandboxSession {
             Ok(h) => h,
             Err(e) => {
                 let _ = self
-                    .report_local_sandbox("error", image, None, Some(&e.to_string()))
+                    .report_local_sandbox(
+                        "error",
+                        Some(image.to_string()),
+                        None,
+                        Some(&e.to_string()),
+                    )
                     .await;
                 return Err(Error::Sandbox(e.to_string()));
             }
         };
         let _ = self
-            .report_local_sandbox("running", image, Some(&handle.id), None)
+            .report_local_sandbox("running", Some(image.to_string()), Some(&handle.id), None)
             .await;
         started.insert(image.to_string(), handle.clone());
         Ok(handle)
@@ -643,7 +684,12 @@ impl SandboxSession {
             Ok(result) => Ok(result),
             Err(e) => {
                 let _ = self
-                    .report_local_sandbox("error", image, Some(&handle.id), Some(&e.to_string()))
+                    .report_local_sandbox(
+                        "error",
+                        Some(image.to_string()),
+                        Some(&handle.id),
+                        Some(&e.to_string()),
+                    )
                     .await;
                 Err(Error::Sandbox(e.to_string()))
             }
@@ -662,19 +708,59 @@ impl SandboxSession {
             match driver.stop(&handle).await {
                 Ok(()) => {
                     let _ = self
-                        .report_local_sandbox("stopped", &image, Some(&handle.id), None)
+                        .report_local_sandbox(
+                            "stopped",
+                            Some(image.clone()),
+                            Some(&handle.id),
+                            None,
+                        )
                         .await;
                 }
                 Err(e) => {
                     let _ = self
                         .report_local_sandbox(
                             "error",
-                            &image,
+                            Some(image.clone()),
                             Some(&handle.id),
                             Some(&e.to_string()),
                         )
                         .await;
                 }
+            }
+        }
+    }
+
+    /// Run `command` directly through the host's POSIX shell. This intentionally
+    /// creates no tracked resource, so `stop_all_local` has nothing to clean up.
+    /// Lifecycle telemetry identifies this execution with `image: null` and
+    /// `unsandboxed: true`.
+    pub async fn exec_none(&self, command: &str) -> Result<ExecResult, Error> {
+        let _ = self
+            .report_local_sandbox("running", None::<String>, None, None)
+            .await;
+        match TokioCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .await
+        {
+            Ok(output) => {
+                let result = ExecResult {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code: output.status.code().unwrap_or(-1),
+                };
+                let _ = self
+                    .report_local_sandbox("stopped", None::<String>, None, None)
+                    .await;
+                Ok(result)
+            }
+            Err(e) => {
+                let detail = format!("failed to spawn `/bin/sh`: {e}");
+                let _ = self
+                    .report_local_sandbox("error", None::<String>, None, Some(&detail))
+                    .await;
+                Err(Error::Sandbox(detail))
             }
         }
     }
@@ -694,6 +780,8 @@ impl std::fmt::Debug for SandboxSession {
 
 /// Where a shell tool's commands run.
 pub enum SandboxTarget {
+    /// No isolation: run directly through the local host shell.
+    None,
     /// The harness's own local container engine (`docker`/`container`).
     Local {
         /// The image to start the local container from.
@@ -704,7 +792,8 @@ pub enum SandboxTarget {
 }
 
 /// For a [`SandboxTarget::Remote`] tool, how the result is handled. Ignored for
-/// [`SandboxTarget::Local`] tools (which always dispatch client-side).
+/// [`SandboxTarget::Local`] and [`SandboxTarget::None`] tools (which always
+/// dispatch client-side).
 pub enum RemoteMode {
     /// **Server-dispatched.** The tool is declared in the session-open
     /// `sandbox_tools` list; the server runs it and continues the turn itself.
@@ -795,6 +884,7 @@ impl std::fmt::Debug for SandboxTool {
 /// clonable) by the handler closure.
 #[derive(Clone)]
 enum TargetKind {
+    None,
     Local(String),
     Remote,
 }
@@ -913,6 +1003,7 @@ fn build_tool(
 
     let session = session.clone();
     let target_kind = match &target {
+        SandboxTarget::None => TargetKind::None,
         SandboxTarget::Local { image } => TargetKind::Local(image.clone()),
         SandboxTarget::Remote => TargetKind::Remote,
     };
@@ -927,6 +1018,13 @@ fn build_tool(
         Box::pin(async move {
             let command = source.build(&input)?;
             match &target_kind {
+                TargetKind::None => {
+                    let result = session
+                        .exec_none(&command)
+                        .await
+                        .map_err(|e| Box::new(e) as BoxError)?;
+                    Ok(exec_result_content(&result))
+                }
                 TargetKind::Local(image) => {
                     let result = session
                         .exec_local(image, &command)
@@ -1093,41 +1191,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_shell_named_shell_escapes_every_injection_payload() {
+    async fn run_shell_named_shell_escapes_every_injection_payload_for_local_and_none() {
         for (payload, expected) in injection_cases() {
-            let timeline = Arc::new(Mutex::new(Vec::new()));
-            let session = SandboxSession::new();
-            session.bind(FakeRpc::new(timeline.clone()));
-            session.set_local_driver(Arc::new(FakeDriver {
-                timeline: timeline.clone(),
-                exec_stdout: String::new(),
-            }));
+            for unsandboxed in [false, true] {
+                let timeline = Arc::new(Mutex::new(Vec::new()));
+                let session = SandboxSession::new();
+                let rpc = FakeRpc::new(timeline.clone());
+                session.bind(rpc.clone());
+                session.set_local_driver(Arc::new(FakeDriver {
+                    timeline: timeline.clone(),
+                    exec_stdout: String::new(),
+                }));
 
-            let tool = run_shell_named(
-                &session,
-                "echo_it",
-                "echo the name",
-                "echo {name}",
-                SandboxTarget::Local {
-                    image: "alpine".into(),
-                },
-                RemoteMode::Auto,
-            )
-            .into_tool()
-            .expect("local target yields a client-dispatched tool");
+                let target = if unsandboxed {
+                    SandboxTarget::None
+                } else {
+                    SandboxTarget::Local {
+                        image: "alpine".into(),
+                    }
+                };
+                let tool = run_shell_named(
+                    &session,
+                    "echo_it",
+                    "echo the name",
+                    "echo {name}",
+                    target,
+                    RemoteMode::Auto,
+                )
+                .into_tool()
+                .expect("local and none targets yield client-dispatched tools");
 
-            call(&tool, json!({ "name": payload })).await;
+                let result = call(&tool, json!({ "name": payload })).await;
 
-            // The exact command string that reached the container's `sh -c`.
-            let exec = timeline
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|e| e.starts_with("exec:"))
-                .cloned()
-                .expect("exec recorded");
-            assert_eq!(exec, format!("exec:{expected}"), "payload {payload:?}");
+                if unsandboxed {
+                    // The real POSIX shell executes `echo` with the escaped
+                    // value as one literal argument. The hostile payload is
+                    // therefore printed, never evaluated as shell syntax.
+                    let result: Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+                    assert_eq!(result["stdout"], json!(format!("{payload}\n")));
+                    assert_eq!(result["exit_code"], json!(0));
+                    let seen = timeline.lock().unwrap().clone();
+                    assert!(seen.iter().all(|e| !e.starts_with("exec:")));
+                    assert!(seen.iter().all(|e| e != "start"));
+                    assert_eq!(rpc.execs.lock().unwrap().len(), 0);
+                } else {
+                    // The exact command string that reached the container's
+                    // `sh -c` is identical to the None path's interpolated
+                    // command.
+                    let exec = timeline
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e.starts_with("exec:"))
+                        .cloned()
+                        .expect("exec recorded");
+                    assert_eq!(exec, format!("exec:{expected}"), "payload {payload:?}");
+                }
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn none_target_runs_shell_command_directly_and_never_calls_container_driver() {
+        let timeline = Arc::new(Mutex::new(Vec::new()));
+        let session = SandboxSession::new();
+        let rpc = FakeRpc::new(timeline.clone());
+        session.bind(rpc.clone());
+        session.set_local_driver(Arc::new(FakeDriver {
+            timeline: timeline.clone(),
+            exec_stdout: "container-driver-must-not-run".into(),
+        }));
+
+        let tool = run_shell_command(&session, SandboxTarget::None, RemoteMode::Auto)
+            .into_tool()
+            .expect("None target yields a client-dispatched tool");
+        let result = call(&tool, json!({ "command": "printf none-out" })).await;
+
+        let result: Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(result["stdout"], json!("none-out"));
+        assert_eq!(result["stderr"], json!(""));
+        assert_eq!(result["exit_code"], json!(0));
+        let seen = timeline.lock().unwrap().clone();
+        assert!(seen.iter().all(|e| e != "ensure_image"));
+        assert!(seen.iter().all(|e| e != "start"));
+        assert!(seen.iter().all(|e| !e.starts_with("exec:")));
+        assert_eq!(rpc.execs.lock().unwrap().len(), 0);
+        let reports = rpc.reports.lock().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(|r| r.unsandboxed && r.image.is_none()));
     }
 
     #[test]

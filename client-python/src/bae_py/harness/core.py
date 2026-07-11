@@ -285,14 +285,20 @@ class Session:
     async def report_local_sandbox(
         self,
         state: str,
-        image: str,
+        image: str | None,
         container_id: str | None = None,
         detail: str | None = None,
     ) -> None:
         """Report a local sandbox lifecycle transition (``session.reportLocalSandbox``)."""
         await self._sandbox_rpc(
             "session.reportLocalSandbox",
-            {"state": state, "image": image, "container_id": container_id, "detail": detail},
+            {
+                "state": state,
+                "image": image,
+                "unsandboxed": image is None,
+                "container_id": container_id,
+                "detail": detail,
+            },
         )
 
     async def start_local_sandbox(self, image: str) -> None:

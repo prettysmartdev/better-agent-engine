@@ -353,7 +353,7 @@ export interface SandboxRpc {
   /** `session.reportLocalSandbox` — log a local sandbox lifecycle transition. */
   reportLocalSandbox(
     state: SandboxLifecycleState,
-    image: string,
+    image: string | null,
     containerId: string | null,
     detail: string | null,
   ): Promise<void>;
@@ -404,7 +404,7 @@ export class SandboxSession {
   /** Report a local sandbox lifecycle transition (`session.reportLocalSandbox`). */
   reportLocalSandbox(
     state: SandboxLifecycleState,
-    image: string,
+    image: string | null,
     containerId: string | null,
     detail: string | null,
   ): Promise<void> {
@@ -443,6 +443,19 @@ export class SandboxSession {
     }
   }
 
+  /** Run `command` directly through the host's POSIX shell, without cleanup. */
+  async execNone(command: string): Promise<ExecResult> {
+    await this.safeReport("running", null, null, null);
+    try {
+      const out = await runHostShell(command);
+      await this.safeReport("stopped", null, null, null);
+      return out;
+    } catch (cause) {
+      await this.safeReport("error", null, null, errorDetail(cause));
+      throw cause;
+    }
+  }
+
   /** Stop every local container this session started, reporting `stopped`/`error`. */
   async stopAllLocal(): Promise<void> {
     const entries = [...this.started.entries()];
@@ -460,7 +473,7 @@ export class SandboxSession {
   /** Report, swallowing telemetry failures (the report never masks the tool result). */
   private async safeReport(
     state: SandboxLifecycleState,
-    image: string,
+    image: string | null,
     containerId: string | null,
     detail: string | null,
   ): Promise<void> {
@@ -482,10 +495,14 @@ function errorDetail(cause: unknown): string {
 
 /** Where a shell tool's commands run. */
 export type SandboxTarget =
-  { type: "local"; image: string } | { type: "remote" };
+  { type: "none" } | { type: "local"; image: string } | { type: "remote" };
 
 /** Constructors for {@link SandboxTarget}. */
 export const SandboxTarget = {
+  /** No isolation: run directly through the local host shell. */
+  none(): SandboxTarget {
+    return { type: "none" };
+  },
   /** The harness's own local container engine. */
   local(image: string): SandboxTarget {
     return { type: "local", image };
@@ -652,6 +669,10 @@ function buildTool(
 
   const handler = async (input: Record<string, unknown>): Promise<Content> => {
     const command = buildCommand(source, input);
+    if (target.type === "none") {
+      const result = await session.execNone(command);
+      return execResultContent(result);
+    }
     if (target.type === "local") {
       const result = await session.execLocal(target.image, command);
       return execResultContent(result);
@@ -664,4 +685,10 @@ function buildTool(
   };
 
   return { kind: "tool", tool: { name, description, input_schema, handler } };
+}
+
+/** Execute through `/bin/sh -c`, capturing non-zero exits as normal results. */
+async function runHostShell(command: string): Promise<ExecResult> {
+  const out = await runCli("/bin/sh", ["-c", command]);
+  return { stdout: out.stdout, stderr: out.stderr, exit_code: out.exitCode };
 }

@@ -821,7 +821,7 @@ impl Session {
     pub async fn report_local_sandbox(
         &self,
         state: &str,
-        image: &str,
+        image: impl crate::sandbox::IntoLocalSandboxImage,
         container_id: Option<&str>,
         detail: Option<&str>,
     ) -> Result<(), Error> {

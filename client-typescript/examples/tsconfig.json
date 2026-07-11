@@ -5,6 +5,10 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["reference-assistant/**/*.ts", "../src/**/*.ts"],
+  "include": [
+    "reference-assistant/**/*.ts",
+    "issue-triage/**/*.ts",
+    "../src/**/*.ts"
+  ],
   "exclude": ["../src/**/*.test.ts"]
 }

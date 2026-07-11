@@ -741,7 +741,16 @@ pub(crate) async fn stop_remote_sandbox(
     log(EventType::SandboxStop, &payload);
     match state.sandbox_driver.stop(&handle).await {
         Ok(()) => {
-            log(EventType::SandboxStopped, &payload);
+            log(
+                EventType::SandboxStopped,
+                &json!({
+                    "image": handle.image,
+                    "sandbox_id": handle.id,
+                    "reason": reason,
+                    "dispatch": "remote",
+                    "unsandboxed": false,
+                }),
+            );
             SandboxStopOutcome::Stopped {
                 image: handle.image.clone(),
                 sandbox_id: handle.id.clone(),
@@ -757,6 +766,7 @@ pub(crate) async fn stop_remote_sandbox(
                     "phase": "stop",
                     "detail": detail,
                     "dispatch": "remote",
+                    "unsandboxed": false,
                 }),
             );
             SandboxStopOutcome::Failed { detail }

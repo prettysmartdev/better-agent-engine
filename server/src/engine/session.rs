@@ -452,6 +452,7 @@ pub async fn run_turn(
                                         "phase": "exec",
                                         "detail": msg,
                                         "dispatch": "remote",
+                                        "unsandboxed": false,
                                     }),
                                 )?);
                                 (

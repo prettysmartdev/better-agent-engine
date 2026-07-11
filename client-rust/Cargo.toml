@@ -37,3 +37,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 [[example]]
 name = "reference-assistant"
 path = "examples/reference-assistant/main.rs"
+
+# The issue-triage example (Agent 3): a repo-scoped issue-triage agent composing
+# file tools, a sandbox shell tool, and the GitHub MCP server. Declared
+# explicitly for the same reason as reference-assistant — Cargo does not
+# auto-discover nested examples.
+[[example]]
+name = "issue-triage"
+path = "examples/issue-triage/main.rs"

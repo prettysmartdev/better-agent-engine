@@ -3,10 +3,12 @@
 BAE can run shell commands for an agent inside a sandboxed container — either
 the **server's** sandbox (a container the server starts via Docker or Apple
 Containers and execs into on the agent's behalf) or the **client harness's**
-own local container engine. This guide walks through declaring which images a
-profile may use, starting a remote sandbox, binding the builtin
-`run_shell_command`/`run_shell_named` tools in each of the three client SDKs,
-and the full lifecycle event trail both kinds of sandbox produce.
+own local container engine. It can also deliberately run a command directly
+on the harness host with no container. This guide walks through declaring
+which images a profile may use, starting a remote sandbox, binding the
+builtin `run_shell_command`/`run_shell_named` tools in each of the three
+client SDKs, and the full lifecycle event trail all execution targets
+produce.
 
 ---
 
@@ -162,8 +164,8 @@ Each SDK ships a `sandbox` module exposing two builder types and two tool
 constructors:
 
 - **`SandboxTarget`** — `Local { image }` (the harness's own Docker/Apple
-  Containers engine) or `Remote` (the sandbox the server started for this
-  session in Step 3).
+  Containers engine), `Remote` (the sandbox the server started for this
+  session in Step 3), or `None` (the harness host, with no isolation).
 - **`RemoteMode`** — only meaningful for `Remote` targets: `Auto` (the server
   dispatches and continues the turn itself, never involving the client) or
   `Manual` (the client fetches the raw result and builds the `tool_result`
@@ -318,6 +320,45 @@ the tool result should carry.
 
 A `Local`-target tool is always client-dispatched (there is no "auto" for a
 container the client itself started) — `RemoteMode` is ignored for `Local`.
+
+## None: unsandboxed local execution
+
+`SandboxTarget::None` (or `SandboxTarget.none()` in TypeScript and Python) is
+the explicit **no-isolation** target. The SDK runs the command through the
+host shell — `sh -c` on Unix-like systems — instead of calling a Docker or
+Apple Containers driver. It uses the same tool construction, placeholder
+escaping, `ExecResult` shape, and in-band error behavior as the container
+targets; `RemoteMode` has no effect because there is no remote sandbox.
+
+This target is not a weaker container. The command and any cloned files run
+with the harness process's real host privileges, filesystem, and network. A
+`run_shell_command` tool is intentionally unconstrained, so a model can
+choose any shell command. Treat `None` as the highest-risk mode and use it
+only with a fully trusted repository or in a disposable/CI-throwaway
+environment. For issue-triage or any repository the operator does not fully
+trust, prefer `Local` or `Remote`; issue text, comments, and repository files
+are untrusted input and can attempt prompt injection.
+
+Unlike a container, the host filesystem is not reclaimed when a `None` command
+finishes. Cloned repositories and other output persist until the harness or
+application explicitly removes them. The issue-triage example always removes
+its `work_root` before closing the session for this reason; a general client
+must make its own cleanup decision.
+
+Host execution still reports lifecycle telemetry so it is visible in the
+shared event log. These reports use `image: null` and `unsandboxed: true` for
+`running`, `stopped`, and `error` events. The telemetry is not a security
+control: the server records what the client reports and cannot verify or tear
+down a process running on the client's host.
+
+The `report_local_sandbox` API widened its `image` argument from `String` to
+`Option<String>` (or the equivalent nullable/optional type) to represent that
+null image. This is a small breaking change to an already-alpha public API,
+in the same spirit as WI 0006's `ToolHandler` change. Existing call sites
+that pass a plain image string — including `reference-assistant` and the SDK
+tests — remain source-compatible: Rust's conversion accepts the existing
+string forms, and TypeScript/Python continue to accept `string`/`str` values
+alongside the nullable form. Existing callers do not need a wider migration.
 
 ---
 

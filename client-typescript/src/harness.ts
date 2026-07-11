@@ -255,13 +255,14 @@ export class Session implements SandboxRpc {
   /** Report a local sandbox lifecycle transition (`session.reportLocalSandbox`). */
   async reportLocalSandbox(
     state: SandboxLifecycleState,
-    image: string,
+    image: string | null,
     containerId: string | null,
     detail: string | null,
   ): Promise<void> {
     await this.sandboxRpc("session.reportLocalSandbox", {
       state,
       image,
+      unsandboxed: image === null,
       container_id: containerId,
       detail,
     });

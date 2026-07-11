@@ -323,7 +323,7 @@ class SandboxRpc(Protocol):
     async def report_local_sandbox(
         self,
         state: str,
-        image: str,
+        image: str | None,
         container_id: str | None,
         detail: str | None,
     ) -> None: ...
@@ -375,7 +375,7 @@ class SandboxSession:
     async def report_local_sandbox(
         self,
         state: str,
-        image: str,
+        image: str | None,
         container_id: str | None = None,
         detail: str | None = None,
     ) -> None:
@@ -383,7 +383,7 @@ class SandboxSession:
         await self._require_rpc().report_local_sandbox(state, image, container_id, detail)
 
     async def _safe_report(
-        self, state: str, image: str, container_id: str | None, detail: str | None
+        self, state: str, image: str | None, container_id: str | None, detail: str | None
     ) -> None:
         """Report, swallowing telemetry failures (never masks the tool result)."""
         try:
@@ -418,6 +418,29 @@ class SandboxSession:
             await self._safe_report("error", image, handle.id, str(exc))
             raise
 
+    async def exec_none(self, command: str) -> ExecResult:
+        """Run ``command`` through the host shell, with no tracked cleanup."""
+        await self._safe_report("running", None, None, None)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            await self._safe_report("stopped", None, None, None)
+            return ExecResult(
+                stdout=stdout.decode(errors="replace"),
+                stderr=stderr.decode(errors="replace"),
+                exit_code=proc.returncode if proc.returncode is not None else -1,
+            )
+        except SandboxError as exc:
+            await self._safe_report("error", None, None, str(exc))
+            raise
+        except Exception as exc:
+            await self._safe_report("error", None, None, str(exc))
+            raise SandboxError("runtime", f"failed to spawn /bin/sh: {exc}") from exc
+
     async def stop_all_local(self) -> None:
         """Stop every local container this session started, reporting ``stopped``/``error``."""
         async with self._lock:
@@ -438,15 +461,20 @@ class SandboxSession:
 
 @dataclass(frozen=True, slots=True)
 class SandboxTarget:
-    """Where a shell tool's commands run. Build with :meth:`local`/:meth:`remote`."""
+    """Where a shell tool's commands run. Build with :meth:`none`/:meth:`local`/:meth:`remote`."""
 
-    kind: str  # "local" | "remote"
+    kind: str  # "none" | "local" | "remote"
     image: str | None = None
 
     @classmethod
     def local(cls, image: str) -> "SandboxTarget":
         """The harness's own local container engine, running ``image``."""
         return cls("local", image)
+
+    @classmethod
+    def none(cls) -> "SandboxTarget":
+        """No isolation: run directly through the local host shell."""
+        return cls("none")
 
     @classmethod
     def remote(cls) -> "SandboxTarget":
@@ -633,6 +661,9 @@ def _build_tool(
 
     async def handler(input: dict[str, Any]) -> Content:
         command = source.build(input)
+        if target.kind == "none":
+            result = await session.exec_none(command)
+            return _exec_result_content(result)
         if target.kind == "local":
             assert target.image is not None
             result = await session.exec_local(target.image, command)
