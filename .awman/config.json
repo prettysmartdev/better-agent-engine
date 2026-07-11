@@ -15,8 +15,7 @@
     },
     "defaultLeader": "claude::claude-fable-5",
     "guidance": [
-      "Attempt to split the workflow evenly among the available agent types. Do not use claude for everything, claude, codex, and opencode should get rougly even usage so long as their models are appropriate.",
-      "Use Qwen 3.6 for simpler, well-scoped tasks like writing tests and docs",
+      "Attempt to split the workflow evenly among the available agent types. Do not use claude for everything, claude and codex should get rougly even usage so long as their models are appropriate.",
       "Use Sonnet 5 or GPT 5.6 Luna evenly for simpler, well-scoped tasks like writing pre-designed functions and modules",
       "Use Opus or GPT 5.6 Terra evenly for more complex tasks like building large modules from scratch or complex refactors",
       "Use Fable or GPT 5.6 Sol only when there is truly complex or multi-part work that needs to be done, extremely difficult research, or coordination/planning for large groups of sub-agents.",
