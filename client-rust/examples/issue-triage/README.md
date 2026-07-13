@@ -11,7 +11,9 @@ It composes three capability families onto **one session** kept open for the
 whole run:
 
 1. the builtin **file tools** (`read_file`/`write_file`/`explore_files`), scoped
-   to a fresh throwaway `work_root`;
+   to a fresh throwaway `work_root` — attached **only in `none` mode**, since in
+   a sandbox the clone lives inside the container, out of these host-scoped
+   tools' reach;
 2. **one sandbox shell tool** (`run_shell_command`), whose execution target is
    chosen by `TRIAGE_EXEC_MODE`;
 3. the **GitHub MCP server**, declared by the profile (`mcp_servers =

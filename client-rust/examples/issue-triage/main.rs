@@ -11,7 +11,9 @@
 //! session** kept open for the whole run:
 //!
 //! 1. the builtin **file tools** (`read_file`/`write_file`/`explore_files`),
-//!    scoped to a fresh throwaway `work_root` directory;
+//!    scoped to a fresh throwaway `work_root` directory, attached **only in
+//!    `none` mode** — in a sandbox the clone lives inside the container, out of
+//!    these host-scoped tools' reach, so they are not attached there;
 //! 2. **one sandbox shell tool** (`run_shell_command`), whose execution target
 //!    is chosen by `TRIAGE_EXEC_MODE` (`none` → host, `local-sandbox` → a local
 //!    container, `remote-sandbox` → the server's sandbox) — the *same*
@@ -103,8 +105,10 @@ invent new labels or casing variants (no `Bug`, `bugs`, `severity:high`, etc.).
 TOOLS — GitHub access is provided by an MCP server whose tools you can see via
 tool discovery (issue listing, fetching, label mutation, comment creation). A
 shell tool (`run_shell_command`) runs commands in the configured sandbox. File
-tools (`read_file`/`explore_files`) read files under the work directory. Use the
-tools that are actually available to you; do not assume specific tool names.
+tools (`read_file`/`explore_files`) are attached ONLY when the shell runs
+directly on the host (no sandbox); in a sandbox they are absent because they
+cannot reach files inside the container. Use the tools that are actually
+available to you; do not assume specific tool names.
 
 RATE LIMITS — if a GitHub tool call fails with a rate-limit error, do NOT retry
 in a loop. Stop, and report the rate-limit failure plainly in your reply for the
@@ -164,19 +168,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .to_string_lossy()
         .into_owned();
 
-    // --- 2b. Builtin file tools, scoped to work_root -----------------------
-    // `.env` is denied unconditionally so a cloned repo's secrets file can never
-    // be read back even though no `allowed_extensions` allowlist is set.
-    let file_config = FileToolConfig::new([PathBuf::from(&work_root)]).denied_extensions(["env"]);
-    let read_file = read_file_tool(file_config.clone());
-    let write_file = write_file_tool(file_config.clone());
-    let explore_files = explore_files_tool(file_config);
-
     // --- 3. The one sandbox shell tool, target chosen by TRIAGE_EXEC_MODE ---
     // `RemoteMode::Auto`: for `remote-sandbox` this yields a server-dispatched
     // `SandboxTool::Def`; for `none`/`local-sandbox` a client-dispatched tool.
-    // `with_sandbox_tool` routes either variant correctly, so the registration
-    // below is identical across all three modes.
+    // `with_sandbox_tool` routes either variant correctly, so this registration
+    // is identical across all three modes.
     let harness = Harness::new(config);
     let sandbox_session = harness.sandbox_session();
     let target = match settings.mode {
@@ -190,16 +186,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
         ExecMode::RemoteSandbox => SandboxTarget::Remote,
     };
     let run_shell = run_shell_command(&sandbox_session, target, RemoteMode::Auto);
+    let mut harness = harness.with_sandbox_tool(run_shell);
+
+    // --- 3b. Builtin file tools — ONLY in `none` mode ----------------------
+    // The file tools read/write under the host `work_root`, so they are useful
+    // only when the clone lands on the host (`none`). In a sandbox the cloned
+    // files live inside the container, unreachable by these host-scoped tools,
+    // so we do not attach them at all — the model uses the shell tool there.
+    // `.env` is denied unconditionally so a cloned repo's secrets file can never
+    // be read back even though no `allowed_extensions` allowlist is set.
+    if settings.mode == ExecMode::None {
+        let file_config =
+            FileToolConfig::new([PathBuf::from(&work_root)]).denied_extensions(["env"]);
+        harness = harness
+            .with_tool(read_file_tool(file_config.clone()))
+            .with_tool(write_file_tool(file_config.clone()))
+            .with_tool(explore_files_tool(file_config));
+    }
 
     // --- 4. Open one session for the whole run -----------------------------
-    let mut session = match harness
-        .with_tool(read_file)
-        .with_tool(write_file)
-        .with_tool(explore_files)
-        .with_sandbox_tool(run_shell)
-        .connect()
-        .await
-    {
+    let mut session = match harness.connect().await {
         Ok(session) => session,
         Err(error) => {
             remove_work_root(&work_root);
@@ -355,9 +361,10 @@ fn per_issue_prompt(settings: &Settings, work_root: &str, number: u64) -> String
          shell tool: `mkdir -p {parent} && git clone --depth 1 {url} {dir}`. \
          Git was already bootstrapped by the harness for container modes.\n\
          4. Explore the cloned repository under `{issue_dir}` to assess the \
-         issue's validity/feasibility — in `none` mode use the scoped file tools; \
-         in container modes use the shell tool because container files are not \
-         host-mounted.\n\
+         issue's validity/feasibility — in `none` mode use the scoped file tools \
+         (attached only in this mode); in container modes use the shell tool \
+         because container files are not host-mounted and the file tools are \
+         not attached.\n\
          5. Apply EXACTLY ONE type label (bug | enhancement | question | \
          invalid) and, for a `bug`, EXACTLY ONE severity label (sev-critical | \
          sev-high | sev-medium | sev-low) via the GitHub label tool. First remove \

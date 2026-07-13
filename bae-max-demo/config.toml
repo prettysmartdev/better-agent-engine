@@ -1,0 +1,22 @@
+# bae-config.toml for the bae-max end-to-end demo.
+# Combines the [providers] registry (providers.toml) and the hosted GitHub MCP
+# server (github.toml) into one file, because BAE_CONFIG points at a single path.
+# ${ANTHROPIC_API_KEY} / ${GITHUB_TOKEN} resolve from the *server* process env
+# at call time — never persisted. Pass both into the container with `-e`.
+
+[providers]
+
+[[providers.entries]]
+name       = "anthropic-sonnet"
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+auth_token = "${ANTHROPIC_API_KEY}"
+max_tokens = 8096
+
+[mcp]
+
+[[mcp.servers]]
+name = "github"
+transport = "http"
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }

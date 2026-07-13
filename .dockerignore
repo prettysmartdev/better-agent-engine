@@ -2,14 +2,41 @@
 .awman/
 aspec/
 
+# Language-client workspaces and docs: no Dockerfile (plain, .max, or .dev)
+# COPYs these from the build context, so they are pure context bloat for every
+# image. They also carry huge vendored trees (client-rust/target alone is
+# ~1GB) whose sheer size + symlinks make Apple `container`'s context packer
+# truncate the stream partway through the walk and mark itself DONE — dropping
+# everything alphabetically after it (server/, max/, docker/) so their COPYs
+# fail with "not found". Excluding the dirs outright keeps the packer from ever
+# descending into them. Dev/test runs mount the repo as a volume, not via the
+# build context, so this does not affect `make shell`/`test`/`check-static`.
+client-python/
+client-rust/
+client-typescript/
+docs/
 # Build outputs and local state (rebuilt inside the image or irrelevant to it)
 **/target/
 **/node_modules/
 **/dist/
 **/.venv/
 **/__pycache__/
+# Test/tooling caches: rebuilt on every run, never wanted in the image, and —
+# because tools rewrite them in place — a live `pytest`/`npm` run can mutate
+# one mid-transfer and abort the context stream ("error from sender:
+# archive/tar: invalid tar header"). Exclude them so the build can't race it.
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
 *.db
 *.db-*
 .env
 .env.*
 data/
+# macOS metadata: Finder droppings and AppleDouble resource-fork files. They
+# carry extended-attribute data the Apple `container` context packer can encode
+# into malformed PAX tar headers ("error from sender: archive/tar: invalid tar
+# header"). Never wanted in a Linux image regardless.
+**/.DS_Store
+**/._*

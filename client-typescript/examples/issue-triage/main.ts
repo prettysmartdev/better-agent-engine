@@ -3,7 +3,9 @@
  *
  * This is the TypeScript port of the canonical Rust example. It keeps one
  * session open while it lists open issues and then triages each selected issue
- * with the configured GitHub MCP server, shell tool, and scoped file tools.
+ * with the configured GitHub MCP server, shell tool, and — in `none` mode only
+ * — scoped file tools (in a sandbox the clone is out of their host-scoped
+ * reach, so they are not attached).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -51,8 +53,10 @@ invent new labels or casing variants (no \`Bug\`, \`bugs\`, \`severity:high\`, e
 TOOLS — GitHub access is provided by an MCP server whose tools you can see via
 tool discovery (issue listing, fetching, label mutation, comment creation). A
 shell tool (\`run_shell_command\`) runs commands in the configured sandbox. File
-tools (\`read_file\`/\`explore_files\`) read files under the work directory. Use the
-tools that are actually available to you; do not assume specific tool names.
+tools (\`read_file\`/\`explore_files\`) are attached ONLY when the shell runs
+directly on the host (no sandbox); in a sandbox they are absent because they
+cannot reach files inside the container. Use the tools that are actually
+available to you; do not assume specific tool names.
 
 RATE LIMITS — if a GitHub tool call fails with a rate-limit error, do NOT retry
 in a loop. Stop, and report the rate-limit failure plainly in your reply for the
@@ -90,21 +94,30 @@ async function run(): Promise<void> {
   fs.mkdirSync(workRootPath, { recursive: true });
   const workRoot = fs.realpathSync(workRootPath);
 
-  const fileConfig: FileToolConfig = {
-    allowedDirs: [workRoot],
-    deniedExtensions: ["env"],
-  };
-
   const harness = new Harness(config);
-  harness.registerTool(readFileTool(fileConfig));
-  harness.registerTool(writeFileTool(fileConfig));
-  harness.registerTool(exploreFilesTool(fileConfig));
 
   const sandboxSession = harness.sandboxSession();
   const target = targetFor(settings);
   harness.registerSandboxTool(
     runShellCommand(sandboxSession, target, RemoteMode.auto()),
   );
+
+  // Builtin file tools — ONLY in `none` mode. They read/write under the host
+  // work_root, so they are useful only when the clone lands on the host
+  // (`none`). In a sandbox the cloned files live inside the container,
+  // unreachable by these host-scoped tools, so we do not attach them at all —
+  // the model uses the shell tool there. `.env` is denied unconditionally so a
+  // cloned repo's secrets file can never be read back even though no
+  // `allowedExtensions` allowlist is set.
+  if (settings.mode === "none") {
+    const fileConfig: FileToolConfig = {
+      allowedDirs: [workRoot],
+      deniedExtensions: ["env"],
+    };
+    harness.registerTool(readFileTool(fileConfig));
+    harness.registerTool(writeFileTool(fileConfig));
+    harness.registerTool(exploreFilesTool(fileConfig));
+  }
 
   let session: Session;
   try {
@@ -233,7 +246,7 @@ function perIssuePrompt(
 1. Fetch issue #${number}: its title, body, existing labels, and comments, using the GitHub tools.
 2. IDEMPOTENCY: if any existing comment already contains the marker string \`${TRIAGE_MARKER}\`, this issue was triaged by a previous run — do NOTHING else and reply exactly \`already triaged\`.
 3. Otherwise, shallow-clone the repository into \`${issueDir}\` using the shell tool: \`mkdir -p ${shellQuote(path.dirname(issueDir))} && git clone --depth 1 ${shellQuote(`https://github.com/${settings.repo}.git`)} ${shellQuote(issueDir)}\`. Git was already bootstrapped by the harness for container modes.
-4. Explore the cloned repository under \`${issueDir}\` to assess the issue's validity/feasibility — in \`none\` mode use the scoped file tools; in container modes use the shell tool because container files are not host-mounted.
+4. Explore the cloned repository under \`${issueDir}\` to assess the issue's validity/feasibility — in \`none\` mode use the scoped file tools (attached only in this mode); in container modes use the shell tool because container files are not host-mounted and the file tools are not attached.
 5. Apply EXACTLY ONE type label (bug | enhancement | question | invalid) and, for a \`bug\`, EXACTLY ONE severity label (sev-critical | sev-high | sev-medium | sev-low) via the GitHub label tool. First remove every existing label from these type/severity vocabularies that conflicts with the classification; then add only the selected type and (for bugs) severity. Remove all severity labels for non-bug types.
 6. Post EXACTLY ONE comment via the GitHub comment tool. It MUST begin with the marker \`${TRIAGE_MARKER}\` on its own line, followed by either an implementation plan (files to touch, approach, key risks) for a valid issue/feature request, or a clear explanation for an invalid/needs-info issue.
 Finally, reply with a one-line summary: the labels you applied and a short description of the comment you posted.`;

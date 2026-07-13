@@ -204,10 +204,13 @@ id, go to stderr.
 The example follows the normal harness ordering documented by the capability
 guides:
 
-1. It creates `./issue-triage-work/<owner>-<repo>/`, canonicalizes it, and
-   builds `FileToolConfig` with that directory as the only allowed directory
-   and `env` as a denied extension. The three file tools are registered before
-   `connect()`, as described in [File Tools](file-tools.md).
+1. It creates `./issue-triage-work/<owner>-<repo>/`, canonicalizes it, and — in
+   `none` mode only — builds `FileToolConfig` with that directory as the only
+   allowed directory and `env` as a denied extension, registering the three file
+   tools before `connect()`, as described in [File Tools](file-tools.md). In the
+   two sandbox modes the file tools are **not** attached at all: the clone lands
+   inside the container, out of these host-scoped tools' reach, so they would be
+   useless (the container shell does the exploration instead).
 2. It obtains the harness's sandbox session and registers one
    `run_shell_command` bound to the selected target with `RemoteMode::Auto`.
    `remote-sandbox` is started before the list turn; local and none dispatch

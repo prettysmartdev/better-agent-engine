@@ -12,7 +12,9 @@ It composes the three capability families the harness exposes onto **one
 session** kept open for the whole run:
 
 1. the builtin file tools (``read_file``/``write_file``/``explore_files``),
-   scoped to a fresh throwaway ``work_root`` directory;
+   scoped to a fresh throwaway ``work_root`` directory, attached **only in
+   ``none`` mode** — in a sandbox the clone lives inside the container, out of
+   these host-scoped tools' reach, so they are not attached there;
 2. one sandbox shell tool (``run_shell_command``), whose execution target is
    chosen by ``TRIAGE_EXEC_MODE`` (``none`` -> host, ``local-sandbox`` -> a
    local container, ``remote-sandbox`` -> the server's sandbox) — the same
@@ -127,8 +129,10 @@ invent new labels or casing variants (no `Bug`, `bugs`, `severity:high`, etc.).
 TOOLS — GitHub access is provided by an MCP server whose tools you can see via
 tool discovery (issue listing, fetching, label mutation, comment creation). A
 shell tool (`run_shell_command`) runs commands in the configured sandbox. File
-tools (`read_file`/`explore_files`) read files under the work directory. Use the
-tools that are actually available to you; do not assume specific tool names.
+tools (`read_file`/`explore_files`) are attached ONLY when the shell runs
+directly on the host (no sandbox); in a sandbox they are absent because they
+cannot reach files inside the container. Use the tools that are actually
+available to you; do not assume specific tool names.
 
 RATE LIMITS — if a GitHub tool call fails with a rate-limit error, do NOT retry
 in a loop. Stop, and report the rate-limit failure plainly in your reply for the
@@ -317,9 +321,10 @@ def per_issue_prompt(settings: Settings, work_root: str, number: int) -> str:
         f"{_shell_quote(issue_dir)}`. Git was already bootstrapped by the harness for "
         "container modes.\n"
         f"4. Explore the cloned repository under `{issue_dir}` to assess the "
-        "issue's validity/feasibility — in `none` mode use the scoped file tools; "
-        "in container modes use the shell tool because container files are not "
-        "host-mounted.\n"
+        "issue's validity/feasibility — in `none` mode use the scoped file tools "
+        "(attached only in this mode); in container modes use the shell tool "
+        "because container files are not host-mounted and the file tools are not "
+        "attached.\n"
         "5. Apply EXACTLY ONE type label (bug | enhancement | question | "
         "invalid) and, for a `bug`, EXACTLY ONE severity label (sev-critical | "
         "sev-high | sev-medium | sev-low) via the GitHub label tool. First remove "
@@ -492,29 +497,31 @@ async def run() -> None:
     work_root_path.mkdir(parents=True, exist_ok=True)
     work_root = str(work_root_path.resolve())
 
-    # --- 2b. Builtin file tools, scoped to work_root -------------------------
-    # `.env` is denied unconditionally so a cloned repo's secrets file can
-    # never be read back even though no allowed_extensions allowlist is set.
-    file_config = FileToolConfig(allowed_dirs=[work_root], denied_extensions=["env"])
-    read_file = read_file_tool(file_config)
-    write_file = write_file_tool(file_config)
-    explore_files = explore_files_tool(file_config)
-
     # --- 3. The one sandbox shell tool, target chosen by TRIAGE_EXEC_MODE ----
     # RemoteMode.auto(): for remote-sandbox this yields a server-dispatched
     # SandboxTool definition; for none/local-sandbox a client-dispatched tool.
-    # register_sandbox_tool routes either variant correctly, so the
-    # registration below is identical across all three modes.
+    # register_sandbox_tool routes either variant correctly, so this
+    # registration is identical across all three modes.
     harness = Harness(config)
     sandbox_session = harness.sandbox_session()
     target = _sandbox_target(settings)
     run_shell = run_shell_command(sandbox_session, target, RemoteMode.auto())
 
     # --- 4. Open one session for the whole run -------------------------------
-    harness.register_tool(read_file)
-    harness.register_tool(write_file)
-    harness.register_tool(explore_files)
     harness.register_sandbox_tool(run_shell)
+
+    # Builtin file tools — ONLY in `none` mode. They read/write under the host
+    # work_root, so they are useful only when the clone lands on the host
+    # (`none`). In a sandbox the cloned files live inside the container,
+    # unreachable by these host-scoped tools, so we do not attach them at all —
+    # the model uses the shell tool there. `.env` is denied unconditionally so a
+    # cloned repo's secrets file can never be read back even though no
+    # allowed_extensions allowlist is set.
+    if settings.mode is ExecMode.NONE:
+        file_config = FileToolConfig(allowed_dirs=[work_root], denied_extensions=["env"])
+        harness.register_tool(read_file_tool(file_config))
+        harness.register_tool(write_file_tool(file_config))
+        harness.register_tool(explore_files_tool(file_config))
 
     try:
         session = await harness.connect()
