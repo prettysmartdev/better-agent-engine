@@ -56,6 +56,9 @@ use baesrv::store::{generate_id, Store};
 ///   `tool_result`, then a final text turn. Drives the client-side tool loop.
 /// - `/mcp`  — a `tool_use` for an *undeclared* tool (`remote_search`) until a
 ///   `tool_result` appears, then text. Drives the server-side MCP stub loop.
+/// - `/mcp2` — two undeclared MCP tool uses, exercising the in-process loop.
+/// - `/mixed` — one undeclared MCP tool use and one client tool use.
+/// - `/mixed_sandbox` — one sandbox tool use and one client tool use.
 /// - `/fail` — always HTTP 500 (a broken provider, for the fallback walk).
 async fn mock_handler(req: Request) -> Response {
     let path = req.uri().path().to_string();
@@ -93,6 +96,33 @@ async fn mock_handler(req: Request) -> Response {
         } else {
             json!({ "role": "assistant", "stop_reason": "tool_use", "content": [
                 { "type": "tool_use", "id": "tu_1", "name": "get_current_time", "input": {} }] })
+        }
+    } else if path.starts_with("/mcp2") {
+        if has_tool_result {
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "after two mcp tools" }] })
+        } else {
+            json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_mcp_1", "name": "remote_search", "input": { "q": "one" } },
+                { "type": "tool_use", "id": "tu_mcp_2", "name": "remote_search", "input": { "q": "two" } }
+            ] })
+        }
+    } else if path.starts_with("/mixed_sandbox") {
+        if has_tool_result {
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "after mixed sandbox" }] })
+        } else {
+            json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_sbx_mix", "name": "run_shell_command", "input": { "command": "echo mixed" } },
+                { "type": "tool_use", "id": "tu_client_mix", "name": "get_current_time", "input": {} }
+            ] })
+        }
+    } else if path.starts_with("/mixed") {
+        if has_tool_result {
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "after mixed tools" }] })
+        } else {
+            json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_mcp_mix", "name": "remote_search", "input": { "q": "mixed" } },
+                { "type": "tool_use", "id": "tu_client_mix", "name": "get_current_time", "input": {} }
+            ] })
         }
     } else if path.starts_with("/mcp") {
         if has_tool_result {
@@ -385,6 +415,9 @@ fn default_provider_registry(
         entry("text", "text", "test-token"),
         entry("tool", "tool", "test-token"),
         entry("mcp", "mcp", "test-token"),
+        entry("mcp2", "mcp2", "test-token"),
+        entry("mixed", "mixed", "test-token"),
+        entry("mixed_sandbox", "mixed_sandbox", "test-token"),
         entry("sandbox", "sandbox", "test-token"),
         entry("triage", "triage", "test-token"),
         entry("fail", "fail", "test-token"),
@@ -429,6 +462,16 @@ async fn start_server_with_registry(
     let mock = start_mock().await;
     let providers = default_provider_registry(&mock);
     boot_server(registry, providers, None).await
+}
+
+/// The capture twin of [`start_server_with_registry`], used by tests that need
+/// to inspect the in-memory pending turn or call `stream_history` directly.
+async fn start_server_with_registry_capture(
+    registry: std::collections::HashMap<String, baesrv::config_file::McpServerConfig>,
+) -> (TestServer, AppState) {
+    let mock = start_mock().await;
+    let providers = default_provider_registry(&mock);
+    boot_server_capture(registry, providers, None, None).await
 }
 
 /// Boot the real routers with an explicit provider registry (whose entries the
@@ -1387,6 +1430,741 @@ async fn mcp_tool_dispatch_round_trip() {
         .find(|e| e["event_type"] == json!("tool.call"))
         .unwrap();
     assert_eq!(tool_call["payload"]["dispatch"], json!("mcp"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_mcp_client_turn_pauses_with_server_result_and_annotated_message() {
+    let (ts, state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("mixed", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let tools = json!([{
+        "name": "get_current_time",
+        "description": "Return the current time",
+        "input_schema": { "type": "object", "properties": {} },
+    }]);
+    let (sid, key, _) = ts.open_session(&client_key, tools).await;
+
+    let (status, first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "mixed please" }))
+        .await;
+    assert_eq!(status, 200, "mixed turn: {raw}");
+
+    let evs = first["events"].as_array().unwrap();
+    for expected in [
+        "mcp.request",
+        "mcp.response",
+        "tool.result",
+        "server.message.send",
+    ] {
+        assert!(
+            evs.iter().any(|e| e["event_type"] == json!(expected)),
+            "missing {expected}: {raw}"
+        );
+    }
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e["event_type"] == json!("client.message.send"))
+            .count(),
+        1,
+        "the only client message is the initial user turn"
+    );
+
+    let assistant = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("server.message.send"))
+        .expect("paused assistant message");
+    let blocks = assistant["payload"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0]["id"], json!("tu_mcp_mix"));
+    assert_eq!(blocks[0]["dispatch"], json!("mcp"));
+    assert_eq!(blocks[1]["id"], json!("tu_client_mix"));
+    assert_eq!(blocks[1]["dispatch"], json!("client"));
+
+    let tool_result = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.result"))
+        .unwrap();
+    assert_eq!(tool_result["payload"]["tool_use_id"], json!("tu_mcp_mix"));
+    assert_eq!(tool_result["payload"]["dispatch"], json!("mcp"));
+    assert_eq!(tool_result["payload"]["is_error"], json!(true));
+
+    // The server-side result is parked with the paused gate, rather than being
+    // sent as a client tool result or lost between HTTP requests.
+    {
+        let pending = state.pending_turns.lock().unwrap();
+        let pt = pending.get(&sid).expect("mixed turn is parked");
+        assert_eq!(pt.server_tool_results.len(), 1);
+        assert_eq!(
+            pt.server_tool_results[0]["tool_use_id"],
+            json!("tu_mcp_mix")
+        );
+        assert_eq!(pt.server_tool_results[0]["is_error"], json!(true));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_resume_merges_both_results_and_stream_history_alternates() {
+    let (ts, state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("mixed", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]);
+    let (sid, key, _) = ts.open_session(&client_key, tools).await;
+
+    let (status, _first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "mixed please" }))
+        .await;
+    assert_eq!(status, 200, "first mixed turn: {raw}");
+
+    let (status, second, raw) = ts
+        .send_message(
+            &sid,
+            &key,
+            json!({ "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tu_client_mix",
+                    "content": "12:00 UTC"
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tu_mcp_mix",
+                    "content": "forged client result"
+                }
+            ] }),
+        )
+        .await;
+    assert_eq!(status, 200, "mixed resume: {raw}");
+    assert_eq!(
+        second["message"]["content"][0]["text"],
+        json!("after mixed tools")
+    );
+
+    let client_send = second["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("client.message.send"))
+        .expect("merged client message event");
+    let result_blocks = client_send["payload"]["content"].as_array().unwrap();
+    assert_eq!(
+        result_blocks
+            .iter()
+            .map(|b| b["tool_use_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["tu_mcp_mix", "tu_client_mix"]
+    );
+    assert!(result_blocks
+        .iter()
+        .all(|b| b["type"] == json!("tool_result")));
+    assert_ne!(
+        result_blocks[0]["content"],
+        json!("forged client result"),
+        "the server-produced result wins an id collision"
+    );
+
+    let (_status, events, _raw) = ts
+        .client_get(&format!("/api/v1/sessions/{sid}/events"), Some(&key))
+        .await;
+    for id in ["tu_mcp_mix", "tu_client_mix"] {
+        assert_eq!(
+            events["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e["event_type"] == json!("tool.result")
+                        && e["payload"]["tool_use_id"] == json!(id)
+                })
+                .count(),
+            1,
+            "exactly one tool.result event for {id}"
+        );
+    }
+
+    let history = state
+        .store
+        .with_conn(|c| baesrv::store::sessions::stream_history(c, &sid))
+        .unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "user", "assistant"]
+    );
+    assert_eq!(
+        history[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["tool_use_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["tu_mcp_mix", "tu_client_mix"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_server_two_mcp_tools_loop_without_pause_or_client_message() {
+    let ts = start_server().await;
+    let profile_id = ts.create_profile("mcp2", json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts.open_session(&client_key, json!([])).await;
+
+    let (status, resp, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "two tools" }))
+        .await;
+    assert_eq!(status, 200, "all-server turn: {raw}");
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("after two mcp tools")
+    );
+    let evs = resp["events"].as_array().unwrap();
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e["event_type"] == json!("server.message.send"))
+            .count(),
+        1,
+        "only the terminal assistant message is persisted"
+    );
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e["event_type"] == json!("client.message.send"))
+            .count(),
+        1,
+        "all-server execution has no intermediate client message"
+    );
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e["event_type"] == json!("tool.result"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_client_turn_keeps_empty_server_pending_results_and_resumes_normally() {
+    let (ts, state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("tool", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts
+        .open_session(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+
+    let (status, first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "what time?" }))
+        .await;
+    assert_eq!(status, 200, "all-client pause: {raw}");
+    let block = first["message"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == json!("tool_use"))
+        .unwrap();
+    assert_eq!(block["dispatch"], json!("client"));
+    assert!(!first["events"].as_array().unwrap().iter().any(|e| {
+        e["event_type"] == json!("mcp.request") || e["event_type"] == json!("mcp.response")
+    }));
+    {
+        let pending = state.pending_turns.lock().unwrap();
+        assert!(pending.get(&sid).unwrap().server_tool_results.is_empty());
+    }
+
+    let (status, second, raw) = ts
+        .send_message(
+            &sid,
+            &key,
+            json!({ "content": [{
+                "type": "tool_result", "tool_use_id": block["id"], "content": "12:00 UTC"
+            }] }),
+        )
+        .await;
+    assert_eq!(status, 200, "all-client resume: {raw}");
+    assert_eq!(
+        second["message"]["content"][0]["text"],
+        json!("tool round-trip complete")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_client_malformed_continuations_are_rejected_and_make_session_terminal() {
+    let (base, requests) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let providers = HashMap::from([(
+        "record".to_string(),
+        baesrv::engine::provider::ProviderConfig {
+            provider: baesrv::engine::provider::ProviderKind::Anthropic,
+            base_url: Some(format!("{base}/tool")),
+            model: "recording-model".into(),
+            auth_token: "test-token".into(),
+            max_tokens: 128,
+        },
+    )]);
+    let ts = boot_server(HashMap::new(), providers, None).await;
+    let profile_id = ts
+        .create_profile("record", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let cases = [
+        ("missing", json!({ "content": [] })),
+        (
+            "duplicate",
+            json!({ "content": [
+                { "type": "tool_result", "tool_use_id": "tu_1", "content": "one" },
+                { "type": "tool_result", "tool_use_id": "tu_1", "content": "two" }
+            ] }),
+        ),
+        (
+            "unexpected",
+            json!({ "content": [
+                { "type": "tool_result", "tool_use_id": "not_this_turn", "content": "no" }
+            ] }),
+        ),
+        (
+            "non-user-role",
+            json!({ "role": "assistant", "content": [
+                { "type": "tool_result", "tool_use_id": "tu_1", "content": "no" }
+            ] }),
+        ),
+    ];
+
+    for (label, continuation) in cases {
+        let (sid, key, _) = ts
+            .open_session(
+                &client_key,
+                json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+            )
+            .await;
+        let (status, _first, raw) = ts
+            .send_message(&sid, &key, json!({ "content": format!("case {label}") }))
+            .await;
+        assert_eq!(status, 200, "initial {label} turn: {raw}");
+        let calls_before = requests.lock().unwrap().len();
+
+        let (status, terminal, raw) = ts.send_message(&sid, &key, continuation).await;
+        assert_eq!(status, 200, "malformed {label} response: {raw}");
+        assert_eq!(terminal["error"]["code"], json!(-32000), "{label}: {raw}");
+        assert_eq!(requests.lock().unwrap().len(), calls_before, "{label}");
+
+        let (_status, followup, raw) = ts
+            .send_message(&sid, &key, json!({ "content": "must not replay" }))
+            .await;
+        assert_eq!(followup["error"]["code"], json!(-32000), "{label}: {raw}");
+        assert!(raw.contains("not open"), "terminal {label} session: {raw}");
+        assert_eq!(requests.lock().unwrap().len(), calls_before, "{label}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_mcp_owner_plain_message_cancels_client_call_and_keeps_history_valid() {
+    let (ts, state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("mixed", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts
+        .open_session(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    ts.send_message(&sid, &key, json!({ "content": "mixed" }))
+        .await;
+
+    let (status, second, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "never mind" }))
+        .await;
+    assert_eq!(status, 200, "mixed abandonment: {raw}");
+    assert_eq!(
+        second["message"]["content"][0]["text"],
+        json!("after mixed tools")
+    );
+
+    let history = state
+        .store
+        .with_conn(|c| baesrv::store::sessions::stream_history(c, &sid))
+        .unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "user", "assistant"]
+    );
+    let results = history[2]["content"].as_array().unwrap();
+    assert_eq!(results[0]["tool_use_id"], json!("tu_mcp_mix"));
+    assert_eq!(results[1]["tool_use_id"], json!("tu_client_mix"));
+    assert_eq!(results[1]["is_error"], json!(true));
+    assert_eq!(results[2]["text"], json!("never mind"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_turn_timeout_merges_server_result_and_client_cancellation_before_next_driver() {
+    let (base, requests) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let providers = HashMap::from([(
+        "record".to_string(),
+        baesrv::engine::provider::ProviderConfig {
+            provider: baesrv::engine::provider::ProviderKind::Anthropic,
+            base_url: Some(format!("{base}/mixed")),
+            model: "recording-model".into(),
+            auth_token: "test-token".into(),
+            max_tokens: 128,
+        },
+    )]);
+    let (ts, state) = boot_server_capture(
+        HashMap::new(),
+        providers,
+        Some(Duration::from_millis(300)),
+        None,
+    )
+    .await;
+    let profile_id = ts
+        .create_profile("record", json!([]), json!(["get_current_time"]))
+        .await;
+    let key_a = ts.create_key(&profile_id).await;
+    let key_b = ts.create_key(&profile_id).await;
+    let (sid, session_key_a, _) = ts
+        .open_session(
+            &key_a,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    let session_key_b = ts.join_session(&sid, &key_b, json!([])).await;
+
+    let (status, _first, raw) = ts
+        .send_message(&sid, &session_key_a, json!({ "content": "mixed" }))
+        .await;
+    assert_eq!(status, 200, "mixed pause: {raw}");
+    assert_eq!(
+        state
+            .pending_turns
+            .lock()
+            .unwrap()
+            .get(&sid)
+            .unwrap()
+            .server_tool_results
+            .len(),
+        1
+    );
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let (status, second, raw) = ts
+        .send_message(
+            &sid,
+            &session_key_b,
+            json!({ "content": "new driver message" }),
+        )
+        .await;
+    assert_eq!(status, 200, "post-timeout driver turn: {raw}");
+    assert_eq!(
+        second["message"]["content"][0]["text"],
+        json!("after mixed tools")
+    );
+    assert!(!state.pending_turns.lock().unwrap().contains_key(&sid));
+
+    let calls = requests.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one initial and one cancellation provider call"
+    );
+    let messages = calls[1]["messages"].as_array().unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "user"]
+    );
+    let merged = messages.last().unwrap()["content"].as_array().unwrap();
+    assert_eq!(
+        merged
+            .iter()
+            .filter_map(|b| b["tool_use_id"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["tu_mcp_mix", "tu_client_mix"]
+    );
+    assert_eq!(merged[1]["is_error"], json!(true));
+    assert_eq!(merged[2]["text"], json!("new driver message"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_sandbox_owner_plain_message_cancels_client_call_and_keeps_history_valid() {
+    let driver = MockSandboxDriver::with_config(MockConfig::default());
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver)).await;
+    let profile_id = ts
+        .create_profile_with_sandboxes(
+            "mixed_sandbox",
+            json!(["python:3.12"]),
+            json!(["get_current_time"]),
+        )
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key) = ts
+        .open_session_with_sandbox_tools(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+            json!([{ "name": "run_shell_command", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    ts.rpc_terminal(
+        &sid,
+        &key,
+        "session.startRemoteSandbox",
+        json!({ "image": "python:3.12" }),
+    )
+    .await;
+    ts.send_message(&sid, &key, json!({ "content": "mixed sandbox" }))
+        .await;
+
+    let (status, _second, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "cancel it" }))
+        .await;
+    assert_eq!(status, 200, "mixed sandbox abandonment: {raw}");
+    let history = state
+        .store
+        .with_conn(|c| baesrv::store::sessions::stream_history(c, &sid))
+        .unwrap();
+    let results = history[2]["content"].as_array().unwrap();
+    assert_eq!(results[0]["tool_use_id"], json!("tu_sbx_mix"));
+    assert_eq!(results[1]["tool_use_id"], json!("tu_client_mix"));
+    assert_eq!(results[1]["is_error"], json!(true));
+    assert_eq!(results[2]["text"], json!("cancel it"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_client_sandbox_turn_routes_sandbox_server_side() {
+    let driver = MockSandboxDriver::with_config(MockConfig {
+        exec_stdout: "sandbox-mix-out".into(),
+        ..MockConfig::default()
+    });
+    let (ts, state) = start_server_with_sandbox(Arc::new(driver.clone())).await;
+    let profile_id = ts
+        .create_profile_with_sandboxes(
+            "mixed_sandbox",
+            json!(["python:3.12"]),
+            json!(["get_current_time"]),
+        )
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key) = ts
+        .open_session_with_sandbox_tools(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+            json!([{ "name": "run_shell_command", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    ts.rpc_terminal(
+        &sid,
+        &key,
+        "session.startRemoteSandbox",
+        json!({ "image": "python:3.12" }),
+    )
+    .await;
+
+    let (status, first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "mixed sandbox please" }))
+        .await;
+    assert_eq!(status, 200, "mixed sandbox turn: {raw}");
+    let blocks = first["message"]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["dispatch"], json!("sandbox"));
+    assert_eq!(blocks[1]["dispatch"], json!("client"));
+    let evs = first["events"].as_array().unwrap();
+    assert!(evs
+        .iter()
+        .any(|e| e["event_type"] == json!("sandbox.request")));
+    assert!(evs
+        .iter()
+        .any(|e| e["event_type"] == json!("sandbox.response")));
+    let tr = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.result"))
+        .unwrap();
+    assert_eq!(tr["payload"]["dispatch"], json!("sandbox"));
+    assert_eq!(tr["payload"]["tool_use_id"], json!("tu_sbx_mix"));
+    assert_eq!(driver.count("exec:"), 1);
+    {
+        let pending = state.pending_turns.lock().unwrap();
+        assert_eq!(pending.get(&sid).unwrap().server_tool_results.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_body_strips_dispatch_and_caller_from_replayed_tool_use() {
+    let (base, requests) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let providers = HashMap::from([(
+        "record".to_string(),
+        baesrv::engine::provider::ProviderConfig {
+            provider: baesrv::engine::provider::ProviderKind::Anthropic,
+            base_url: Some(format!("{base}/tool")),
+            model: "recording-model".into(),
+            auth_token: "test-token".into(),
+            max_tokens: 128,
+        },
+    )]);
+    let ts = boot_server(HashMap::new(), providers, None).await;
+    let profile_id = ts
+        .create_profile("record", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts
+        .open_session(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+
+    let (status, _first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "call it" }))
+        .await;
+    assert_eq!(status, 200, "provider-body first turn: {raw}");
+    let (status, _second, raw) = ts
+        .send_message(
+            &sid,
+            &key,
+            json!({ "content": [{
+                "type": "tool_result", "tool_use_id": "tu_1", "content": "12:00 UTC"
+            }] }),
+        )
+        .await;
+    assert_eq!(status, 200, "provider-body resume: {raw}");
+
+    let calls = requests.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "one provider call per server turn");
+    let replayed = calls[1]["messages"].as_array().unwrap();
+    let replayed_tool_use = replayed
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .find(|b| b["type"] == json!("tool_use"))
+        .expect("replayed assistant tool_use reached provider");
+    assert!(replayed_tool_use.get("dispatch").is_none());
+    assert!(replayed_tool_use.get("caller").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_resume_missing_or_duplicate_result_logs_error_without_provider_call() {
+    let (base, requests) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let providers = HashMap::from([(
+        "record".to_string(),
+        baesrv::engine::provider::ProviderConfig {
+            provider: baesrv::engine::provider::ProviderKind::Anthropic,
+            base_url: Some(format!("{base}/mixed")),
+            model: "recording-model".into(),
+            auth_token: "test-token".into(),
+            max_tokens: 128,
+        },
+    )]);
+    let ts = boot_server(HashMap::new(), providers, None).await;
+    let profile_id = ts
+        .create_profile("record", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+
+    // A missing expected id must be rejected before the second provider call.
+    let (sid, key, _) = ts
+        .open_session(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    let (status, _first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "missing result" }))
+        .await;
+    assert_eq!(status, 200, "initial missing-id turn: {raw}");
+    let calls_after_first = requests.lock().unwrap().len();
+    let (status, terminal, raw) = ts.send_message(&sid, &key, json!({ "content": [] })).await;
+    assert_eq!(status, 200, "missing-id response: {raw}");
+    assert_eq!(terminal["error"]["code"], json!(-32000), "raw={raw}");
+    assert!(
+        raw.contains("tool_result_merge_invalid")
+            || terminal["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("tool result merge invalid"),
+        "terminal={terminal} raw={raw}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), calls_after_first);
+
+    // A duplicate client id is also rejected before the provider sees a
+    // malformed user turn. Use a fresh session so this assertion is independent
+    // of the first invalid request's abandoned pending turn.
+    let (sid, key, _) = ts
+        .open_session(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    let (status, _first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "duplicate result" }))
+        .await;
+    assert_eq!(status, 200, "initial duplicate-id turn: {raw}");
+    let calls_after_first = requests.lock().unwrap().len();
+    let duplicate = json!({
+        "type": "tool_result", "tool_use_id": "tu_client_mix", "content": "ok"
+    });
+    let (status, terminal, raw) = ts
+        .send_message(
+            &sid,
+            &key,
+            json!({ "content": [duplicate.clone(), duplicate] }),
+        )
+        .await;
+    assert_eq!(status, 200, "duplicate-id response: {raw}");
+    assert_eq!(terminal["error"]["code"], json!(-32000));
+    assert!(
+        raw.contains("tool_result_merge_invalid")
+            || terminal["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("tool result merge invalid"),
+        "terminal={terminal} raw={raw}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), calls_after_first);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unroutable_mcp_in_mixed_turn_is_error_result_and_not_client_dispatch() {
+    let (ts, _state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("mixed", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (sid, key, _) = ts
+        .open_session(
+            &client_key,
+            json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]),
+        )
+        .await;
+    let (status, first, raw) = ts
+        .send_message(&sid, &key, json!({ "content": "unroutable" }))
+        .await;
+    assert_eq!(status, 200, "unroutable mixed turn: {raw}");
+    let evs = first["events"].as_array().unwrap();
+    let call = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.call"))
+        .unwrap();
+    assert_eq!(call["payload"]["name"], json!("remote_search"));
+    assert_eq!(call["payload"]["dispatch"], json!("mcp"));
+    assert_eq!(call["payload"]["server_name"], Value::Null);
+    let result = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.result"))
+        .unwrap();
+    assert_eq!(result["payload"]["dispatch"], json!("mcp"));
+    assert_eq!(result["payload"]["is_error"], json!(true));
+    let assistant = evs
+        .iter()
+        .find(|e| e["event_type"] == json!("server.message.send"))
+        .unwrap();
+    assert_eq!(assistant["payload"]["content"][0]["dispatch"], json!("mcp"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2536,7 +3314,8 @@ fn req_tool_names(body: &Value) -> Vec<String> {
 /// Behaviour is chosen by the leading path segment, like [`mock_handler`]:
 /// `/text` (always final text "Hello from anthropic mock"), `/tool` (a
 /// `get_current_time` tool_use until a `tool_result` arrives, then text),
-/// `/fail` (HTTP 500). Returns `(base_url, recorder)`.
+/// `/mixed` (one MCP and one client tool_use until results arrive), `/fail`
+/// (HTTP 500). Returns `(base_url, recorder)`.
 async fn start_anthropic_recording_mock(delay: Duration) -> (String, Recorder) {
     let requests: Recorder = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2570,7 +3349,16 @@ async fn anthropic_recording_handler(
         )
             .into_response();
     }
-    let out = if path.starts_with("/tool") {
+    let out = if path.starts_with("/mixed") {
+        if last_message_has_block(&body, "tool_result") {
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "after mixed tools" }] })
+        } else {
+            json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_mcp_mix", "name": "remote_search", "input": { "q": "mixed" } },
+                { "type": "tool_use", "id": "tu_client_mix", "name": "get_current_time", "input": {} }
+            ] })
+        }
+    } else if path.starts_with("/tool") {
         if last_message_has_block(&body, "tool_result") {
             json!({ "role": "assistant", "stop_reason": "end_turn",
                     "content": [{ "type": "text", "text": "tool round-trip complete" }] })
@@ -3339,7 +4127,7 @@ async fn cross_driver_send_blocks_until_owner_turn_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abandoned_turn_timeout_releases_gate_and_stays_open() {
-    let (mock, _rec) = start_anthropic_recording_mock(Duration::ZERO).await;
+    let (mock, rec) = start_anthropic_recording_mock(Duration::ZERO).await;
     let reg = provider_registry_from_toml(&provider_entry_toml(
         "tool",
         "anthropic",
@@ -3376,6 +4164,20 @@ async fn abandoned_turn_timeout_releases_gate_and_stays_open() {
         .await;
     assert_eq!(sb, 200, "B proceeds after the abandonment timeout: {raw}");
     assert_eq!(rb["message"]["role"], json!("assistant"));
+
+    let calls = rec.lock().unwrap().clone();
+    let resumed = calls.last().unwrap()["messages"].as_array().unwrap();
+    assert_eq!(
+        resumed
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "user"]
+    );
+    let cancellation = resumed.last().unwrap()["content"].as_array().unwrap();
+    assert_eq!(cancellation[0]["tool_use_id"], json!("tu_1"));
+    assert_eq!(cancellation[0]["is_error"], json!(true));
+    assert_eq!(cancellation[1]["text"], json!("my turn now"));
 
     // A session.error(driver_turn_abandoned) was logged, attributed to A, and
     // the session is still open.
@@ -3635,6 +4437,10 @@ async fn openai_kind_end_to_end_tool_round_trip() {
         reqs[0]
     );
     let last = reqs.last().unwrap();
+    assert!(
+        !last.to_string().contains("dispatch") && !last.to_string().contains("caller"),
+        "receive-only routing fields must not reach OpenAI: {last:?}"
+    );
     assert!(
         last["messages"]
             .as_array()

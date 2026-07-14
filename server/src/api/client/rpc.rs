@@ -36,7 +36,7 @@
 //! every JSON-RPC-level outcome — including `-32700`/`-32600`/`-32601`/`-32602`
 //! envelope errors — is delivered in the NDJSON stream.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 
 use axum::body::{Body, Bytes};
@@ -398,12 +398,18 @@ async fn drive_send_message(
     // (1) A paused turn owned by this caller is resumed by reclaiming its
     // parked guard — no queuing; ownership is checked by client key id, not by
     // the message's shape, so the owner may also abandon its pending tool call
-    // voluntarily by sending anything. (2) A paused turn whose owner stayed
-    // away past the deadline is abandoned: drop the parked guard (releasing
-    // the gate to the next FIFO waiter) and log the abandonment. (3) Otherwise
-    // queue on the gate; `tokio::sync::Mutex` grants `lock_owned()` in request
-    // order, which is the FIFO queue.
+    // voluntarily by sending a new message. (2) A paused turn whose owner
+    // stayed away past the deadline is abandoned: the next arrival reclaims
+    // the parked guard and completes the old exchange with cancellation
+    // results before serving its message. (3) Otherwise queue on the gate;
+    // `tokio::sync::Mutex` grants `lock_owned()` in request order.
     let mut abandoned_owner: Option<String> = None;
+    let mut resumed_paused_turn = false;
+    let mut timed_out_paused_turn = false;
+    // The server-side tool results parked on this caller's paused turn (a mixed
+    // turn); empty unless this request resumes such a turn. Merged with the
+    // client's own results below, before the turn is recorded.
+    let mut stashed_server_results: Vec<Value> = Vec::new();
     let reclaimed = {
         let mut pending = state
             .pending_turns
@@ -417,15 +423,26 @@ async fn drive_send_message(
             None => (false, false),
         };
         if caller_owns {
-            pending.remove(&session.id).map(|pt| pt.guard)
+            pending.remove(&session.id).map(|pt| {
+                resumed_paused_turn = true;
+                stashed_server_results = pt.server_tool_results;
+                pt.guard
+            })
         } else {
             if expired {
-                if let Some(pt) = pending.remove(&session.id) {
+                pending.remove(&session.id).map(|pt| {
                     abandoned_owner = Some(pt.owner_client_key_id);
-                    // Dropping pt (and its parked guard) releases the gate.
-                }
+                    resumed_paused_turn = true;
+                    timed_out_paused_turn = true;
+                    stashed_server_results = pt.server_tool_results;
+                    // Reclaim the parked guard for this request. This retires
+                    // the expired exchange before any queued message can
+                    // interleave with its synthetic cancellation results.
+                    pt.guard
+                })
+            } else {
+                None
             }
-            None
         }
     };
     if let Some(owner) = abandoned_owner {
@@ -495,8 +512,75 @@ async fn drive_send_message(
     // not necessarily the session's creator). These go through the publish
     // choke point and are broadcast to observers, but suppressed from the
     // sender's own stream via `self_event_ids`.
+    // Move the client's content out so it can be merged in place. `message.role`
+    // stays available (partial move).
+    let mut content = message.content;
+
+    // Resume of any paused turn: reassemble the single `user` turn the provider
+    // requires from the server-side results dispatched before the pause (empty
+    // for an all-client turn) and this client's own results — BEFORE recording
+    // it as `client.message.send`, so `stream_history` always replays a
+    // well-formed alternating transcript. The ids of the server-dispatched
+    // blocks; their `tool.result` events were already logged at dispatch time,
+    // so they are not re-logged below.
+    let server_ids: HashSet<String> = stashed_server_results
+        .iter()
+        .filter_map(|b| {
+            b.get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    if resumed_paused_turn {
+        let assistant_tool_uses = match state
+            .store
+            .with_conn(|c| sessions::last_assistant_tool_uses(c, &session.id))
+        {
+            Ok(v) => v,
+            Err(e) => return emit_internal(&tx, &resp_id, e).await,
+        };
+        let merged = if message.role != "user" {
+            Err(format!(
+                "paused tool continuation must have role \"user\", got {:?}",
+                message.role
+            ))
+        } else if timed_out_paused_turn || is_voluntary_abandonment(&content) {
+            cancel_abandoned_tool_uses(&assistant_tool_uses, &stashed_server_results, &content)
+        } else {
+            merge_tool_results(&assistant_tool_uses, &stashed_server_results, &content)
+        };
+        match merged {
+            Ok(merged) => content = merged,
+            Err(reason) => {
+                // Fail loudly: the merged turn would not answer exactly the
+                // paused assistant turn's tool_use ids (a missing, duplicate, or
+                // unexpected id). Log a `session.error` and abandon this turn
+                // rather than forward a malformed body upstream (Anthropic would
+                // 400). A rejected continuation makes the session terminal:
+                // its durable assistant tool_use message is intentionally not
+                // replayable without a valid immediately-following user result.
+                let _ = broadcast::insert_and_publish(
+                    &state.store,
+                    &state.broadcaster,
+                    &session.id,
+                    Some(&acting_client_key_id),
+                    EventType::SessionError,
+                    &json!({ "reason": "tool_result_merge_invalid", "detail": reason }),
+                );
+                let _ = state
+                    .store
+                    .with_conn(|c| sessions::close_session(c, &session.id, STATE_ERROR));
+                emit_terminal(&tx, &resp_id, |id| {
+                    error_obj(id, -32000, format!("tool result merge invalid: {reason}"))
+                })
+                .await;
+                return;
+            }
+        }
+    }
+
     let mut all_events = Vec::new();
-    let msg_payload = json!({ "role": message.role, "content": message.content });
+    let msg_payload = json!({ "role": message.role, "content": content });
     match broadcast::insert_and_publish(
         &state.store,
         &state.broadcaster,
@@ -508,7 +592,14 @@ async fn drive_send_message(
         Ok(ev) => all_events.push(ev),
         Err(e) => return emit_internal(&tx, &resp_id, e).await,
     }
-    for block in tool_result_blocks(&message.content) {
+    for block in tool_result_blocks(&content) {
+        // Skip the server-dispatched blocks merged into `content`; their
+        // `tool.result` events were already logged when they were dispatched.
+        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+            if server_ids.contains(id) {
+                continue;
+            }
+        }
         match broadcast::insert_and_publish(
             &state.store,
             &state.broadcaster,
@@ -633,6 +724,11 @@ async fn drive_send_message(
                                 owner_client_key_id: acting_client_key_id.clone(),
                                 guard,
                                 deadline: tokio::time::Instant::now() + state.turn_timeout,
+                                // The server-side results dispatched before this
+                                // pause, to merge with the client's results when
+                                // this owner resumes (empty on an all-client
+                                // pause). Freed with the PendingTurn if abandoned.
+                                server_tool_results: turn.pending_tool_results,
                             },
                         );
                 }
@@ -655,6 +751,181 @@ async fn drive_send_message(
         }
     }
     drop(gate_guard);
+}
+
+/// Reassemble the single `user`-turn content that answers a paused mixed
+/// assistant turn, from the server-side results dispatched before the pause and
+/// the client's own results.
+///
+/// - `assistant_tool_uses`: the paused assistant turn's `tool_use` blocks, in
+///   order (each with an `id`). Defines the exact id set the merged turn must
+///   answer and the output ordering.
+/// - `server_results`: server-dispatched `tool_result` blocks (sandbox/MCP).
+///   These **win**: a client-supplied result for the same id is dropped.
+/// - `client_content`: the incoming client message content — its own
+///   `tool_result` blocks plus any other blocks (e.g. text), which are
+///   preserved after the results.
+///
+/// Returns the ordered merged content array, or `Err(reason)` when the merged
+/// results would not answer exactly the assistant turn's `tool_use` ids: a
+/// missing id (would 400 upstream), an unexpected id (not in the turn), or a
+/// duplicate client id.
+fn merge_tool_results(
+    assistant_tool_uses: &[Value],
+    server_results: &[Value],
+    client_content: &Value,
+) -> Result<Value, String> {
+    // Ordered ids the merged turn must answer.
+    let expected: Vec<String> = assistant_tool_uses
+        .iter()
+        .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    if expected.is_empty() {
+        return Err("paused assistant turn has no tool_use ids".to_string());
+    }
+    let expected_set: HashSet<&str> = expected.iter().map(String::as_str).collect();
+    if expected_set.len() != expected.len() {
+        return Err("paused assistant turn contains duplicate tool_use ids".to_string());
+    }
+
+    // Server results by id (server wins on collision below).
+    let mut server_by_id: HashMap<String, Value> = HashMap::new();
+    for b in server_results {
+        let id = b
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "server tool_result is missing a string tool_use_id".to_string())?;
+        if server_by_id.insert(id.to_owned(), b.clone()).is_some() {
+            return Err(format!(
+                "server produced a duplicate tool_result for id {id:?}"
+            ));
+        }
+    }
+
+    // Client results by id, dropping any that collide with a server id; any
+    // non-`tool_result` blocks are preserved as trailing extras.
+    let mut client_by_id: HashMap<String, Value> = HashMap::new();
+    let mut extras: Vec<Value> = Vec::new();
+    for b in client_content.as_array().cloned().unwrap_or_default() {
+        if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+            let id = b
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if server_by_id.contains_key(&id) {
+                continue; // server result wins; drop the client's copy
+            }
+            if client_by_id.insert(id.clone(), b).is_some() {
+                return Err(format!(
+                    "client returned a duplicate tool_result for id {id:?}"
+                ));
+            }
+        } else {
+            extras.push(b);
+        }
+    }
+
+    // Reject any id (from either side) not present in the assistant turn.
+    for id in server_by_id.keys().chain(client_by_id.keys()) {
+        if !expected_set.contains(id.as_str()) {
+            return Err(format!(
+                "tool_result id {id:?} is not in the paused assistant turn"
+            ));
+        }
+    }
+
+    // One result per assistant tool_use, in the assistant turn's order; server
+    // wins, then any client result, else the id is unanswered.
+    let mut merged: Vec<Value> = Vec::with_capacity(expected.len() + extras.len());
+    for id in &expected {
+        if let Some(b) = server_by_id.remove(id) {
+            merged.push(b);
+        } else if let Some(b) = client_by_id.remove(id) {
+            merged.push(b);
+        } else {
+            return Err(format!("no tool_result for tool_use id {id:?}"));
+        }
+    }
+    merged.extend(extras);
+    Ok(Value::Array(merged))
+}
+
+/// A same-owner plain message, or the first new message after a pause timeout,
+/// abandons the outstanding client calls. Complete the paused provider
+/// exchange by synthesizing error results for every id the server did not
+/// already answer, then retain the new message as trailing user content. This
+/// keeps the session open without ever persisting an unanswered assistant
+/// `tool_use` turn.
+fn cancel_abandoned_tool_uses(
+    assistant_tool_uses: &[Value],
+    server_results: &[Value],
+    incoming_content: &Value,
+) -> Result<Value, String> {
+    let server_ids: HashSet<&str> = server_results
+        .iter()
+        .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+        .collect();
+    let mut client_content = Vec::new();
+    for tool_use in assistant_tool_uses {
+        let id = tool_use
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "paused tool_use is missing a string id".to_string())?;
+        if !server_ids.contains(id) {
+            client_content.push(json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "Client tool call was abandoned before returning a result.",
+                "is_error": true,
+            }));
+        }
+    }
+
+    match incoming_content {
+        Value::String(text) if !text.is_empty() => {
+            client_content.push(json!({ "type": "text", "text": text }));
+        }
+        Value::Array(blocks) => {
+            if blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                return Err(
+                    "timed-out replacement message must not contain tool_result blocks".to_string(),
+                );
+            }
+            client_content.extend(blocks.iter().cloned());
+        }
+        Value::String(_) => {}
+        _ => {
+            return Err(
+                "abandonment message content must be a string or content-block array".to_string(),
+            );
+        }
+    }
+
+    merge_tool_results(
+        assistant_tool_uses,
+        server_results,
+        &Value::Array(client_content),
+    )
+}
+
+/// A non-empty message without any tool results is a deliberate replacement
+/// for the paused tool continuation. Empty arrays remain malformed
+/// continuations and are rejected by the exact-id validator.
+fn is_voluntary_abandonment(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(blocks) => {
+            !blocks.is_empty()
+                && !blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,4 +1516,43 @@ fn ndjson_response(body: Body) -> Response {
         .header(CONTENT_TYPE, "application/x-ndjson")
         .body(body)
         .expect("static header is always valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_rejects_missing_server_result_id() {
+        let assistant = vec![
+            json!({ "type": "tool_use", "id": "server_1" }),
+            json!({ "type": "tool_use", "id": "client_1" }),
+        ];
+        let client = json!([{
+            "type": "tool_result",
+            "tool_use_id": "client_1",
+            "content": "ok"
+        }]);
+        let err = merge_tool_results(&assistant, &[], &client).unwrap_err();
+        assert!(
+            err.contains("server_1"),
+            "missing id should be named: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_duplicate_client_result_id() {
+        let assistant = vec![json!({ "type": "tool_use", "id": "client_1" })];
+        let result = json!({
+            "type": "tool_result",
+            "tool_use_id": "client_1",
+            "content": "ok"
+        });
+        let err =
+            merge_tool_results(&assistant, &[], &json!([result.clone(), result])).unwrap_err();
+        assert!(
+            err.contains("duplicate"),
+            "duplicate should be named: {err}"
+        );
+    }
 }

@@ -45,8 +45,9 @@ pub enum Error {
         events: Vec<EventView>,
     },
 
-    /// The model asked to call a tool the harness never registered. Indicates
-    /// the declared tool set and the profile allowlist are out of sync.
+    /// A client-owned tool call has no local handler. This can only occur for
+    /// `dispatch: "client"` (or an older untagged call selected by the local
+    /// registry); server-owned MCP/sandbox calls never raise this error.
     #[error("server requested unknown tool '{0}' not in the registry")]
     UnknownTool(String),
 

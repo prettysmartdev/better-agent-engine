@@ -27,6 +27,7 @@ from mock_transport import (
     MockTransport,
     assistant_text,
     assistant_tool_call,
+    assistant_tool_calls,
     connect_response,
     ok,
     rpc_error_frame,
@@ -230,15 +231,165 @@ async def test_hook_error_aborts_the_loop() -> None:
     assert len(transport.requests) == 1
 
 
-async def test_unknown_tool_raises() -> None:
+async def test_client_dispatch_without_handler_raises_unknown_tool() -> None:
     transport = MockTransport(
-        script=[connect_response(), assistant_tool_call("tu_1", "not_registered")]
+        script=[
+            connect_response(),
+            assistant_tool_call("tu_1", "not_registered", dispatch="client"),
+        ]
     )
     session = await Harness(_config(), transport=transport).connect()
 
     with pytest.raises(UnknownToolError) as exc:
         await session.send("go")
     assert exc.value.name == "not_registered"
+
+
+async def test_no_dispatch_falls_back_to_registered_tool_membership() -> None:
+    transport = MockTransport(
+        script=[
+            connect_response(),
+            assistant_tool_call("tu_1", "get_current_time"),
+            assistant_text("the time is noon"),
+        ]
+    )
+    session = await Harness(_config(), tools=[_time_tool()], transport=transport).connect()
+
+    reply = await session.send("what time is it")
+
+    assert reply.text() == "the time is noon"
+    followup = transport.requests[2].json["params"]["message"]
+    assert followup["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tu_1",
+            "content": "2026-07-06T00:00:00Z",
+        }
+    ]
+
+
+async def test_null_dispatch_falls_back_to_registered_tool_membership() -> None:
+    calls: list[dict] = []
+    transport = MockTransport(
+        script=[
+            connect_response(),
+            assistant_tool_calls(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu_null",
+                        "name": "get_current_time",
+                        "input": {},
+                        "dispatch": None,
+                    }
+                ]
+            ),
+            assistant_text("done"),
+        ]
+    )
+    session = await Harness(_config(), tools=[_time_tool(calls)], transport=transport).connect()
+
+    await session.send("go")
+
+    assert calls == [{}]
+    followup = transport.requests[2].json["params"]["message"]
+    assert followup["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tu_null",
+            "content": "2026-07-06T00:00:00Z",
+        }
+    ]
+
+
+async def test_dispatch_wins_over_registry_membership_for_same_name_collision() -> None:
+    calls: list[dict] = []
+    transport = MockTransport(
+        script=[
+            connect_response(),
+            assistant_tool_calls(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu_server",
+                        "name": "get_current_time",
+                        "input": {"owner": "server"},
+                        "dispatch": "mcp",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tu_client",
+                        "name": "get_current_time",
+                        "input": {"owner": "client"},
+                        "dispatch": "client",
+                    },
+                ]
+            ),
+            assistant_text("done"),
+        ]
+    )
+    session = await Harness(_config(), tools=[_time_tool(calls)], transport=transport).connect()
+
+    await session.send("go")
+
+    assert calls == [{"owner": "client"}]
+    followup = transport.requests[2].json["params"]["message"]
+    assert [block["tool_use_id"] for block in followup["content"]] == ["tu_client"]
+
+
+async def test_mixed_dispatch_executes_only_client_result_and_surfaces_server_tool() -> None:
+    # `issue_read` has no client handler. Its MCP tag must make it
+    # informational rather than an UnknownToolError.
+    transport = MockTransport(
+        script=[
+            connect_response(),
+            assistant_tool_calls(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu_mcp",
+                        "name": "issue_read",
+                        "input": {"id": 9},
+                        "dispatch": "mcp",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tu_client",
+                        "name": "get_current_time",
+                        "input": {},
+                        "dispatch": "client",
+                    },
+                ]
+            ),
+            assistant_text("done"),
+        ]
+    )
+    informational: list[ToolUseBlock] = []
+
+    def after_receive(message: Message) -> None:
+        informational.extend(tu for tu in message.tool_uses() if tu.dispatch in {"mcp", "sandbox"})
+
+    session = await Harness(
+        _config(),
+        tools=[_time_tool()],
+        hooks=Hooks(after_receive=after_receive),
+        transport=transport,
+    ).connect()
+
+    reply = await session.send("go")
+
+    assert reply.text() == "done"
+    followup = transport.requests[2].json["params"]["message"]
+    assert followup["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tu_client",
+            "content": "2026-07-06T00:00:00Z",
+        }
+    ]
+    assert [(tu.id, tu.name, tu.dispatch) for tu in informational] == [
+        ("tu_mcp", "issue_read", "mcp")
+    ]
 
 
 async def test_tool_handler_error_propagates_as_tool_error() -> None:

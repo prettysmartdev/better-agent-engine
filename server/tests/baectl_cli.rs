@@ -42,8 +42,32 @@ use serde_json::{json, Value};
 fn baectl_bin() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let manifest = workspace.join("baectl/Cargo.toml");
+        // Resolve the sibling `baectl` crate at RUN time. The compile-time
+        // `env!("CARGO_MANIFEST_DIR")` bakes in the directory where this test
+        // binary was *built*, which is wrong whenever the produced artifacts
+        // are executed under a different tree root than they were compiled in
+        // (e.g. built in a container at `/workspace`, then run from a host
+        // worktree). Cargo sets `CARGO_MANIFEST_DIR` in the test process's
+        // environment at run time, reflecting the tree the tests are actually
+        // running from; prefer it and fall back to the compile-time value when
+        // a raw binary is invoked outside cargo.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
+        // Walk from the server crate dir upward and take the first ancestor
+        // that actually holds a sibling `baectl/Cargo.toml`, so the lookup
+        // survives layout differences instead of assuming a fixed `..` hop.
+        let manifest_dir = Path::new(&manifest_dir);
+        let manifest = manifest_dir
+            .ancestors()
+            .map(|a| a.join("baectl/Cargo.toml"))
+            .find(|m| m.exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "could not locate a sibling baectl/Cargo.toml above {}",
+                    manifest_dir.display()
+                )
+            });
+        let baectl_dir = manifest.parent().unwrap();
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let status = Command::new(&cargo)
             .arg("build")
@@ -52,7 +76,7 @@ fn baectl_bin() -> PathBuf {
             .status()
             .expect("spawn cargo build for baectl");
         assert!(status.success(), "building baectl failed");
-        let bin = workspace.join("baectl/target/debug/baectl");
+        let bin = baectl_dir.join("target/debug/baectl");
         assert!(bin.exists(), "baectl binary missing at {}", bin.display());
         bin
     })

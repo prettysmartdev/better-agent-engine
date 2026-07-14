@@ -222,9 +222,10 @@ class Session:
         Each turn is a ``session.sendMessage`` JSON-RPC call over ``…/rpc``:
         live ``session.event`` notifications are handed to the ``on_event``
         hook, and the terminal ``{message, events}`` result drives the loop.
-        Dispatches any ``tool_use`` blocks the server returns to the registered
-        handlers, sends the ``tool_result`` blocks back, and repeats until an
-        assistant turn contains no tool calls — which is then returned.
+        Dispatches only client-owned ``tool_use`` blocks the server returns to
+        the registered handlers, sends those ``tool_result`` blocks back, and
+        repeats until an assistant turn contains no tool calls — which is then
+        returned. Server-owned blocks remain visible through ``after_receive``.
         """
         current = to_message(message)
         while True:
@@ -244,9 +245,27 @@ class Session:
 
             results: list[Any] = []
             for tu in tool_uses:
+                # A current server's dispatch tag is authoritative, including
+                # when a server-owned tool happens to share a local name. Older
+                # servers omit it, so retain registry-membership routing as the
+                # compatibility fallback.
+                owned_by_client = (
+                    tu.dispatch == "client"
+                    if tu.dispatch is not None
+                    else tu.name in self._registry
+                )
+                if not owned_by_client:
+                    # The complete assistant message was already exposed via
+                    # after_receive for informational/UI handling. Server-owned
+                    # calls must not run client hooks or receive a result.
+                    continue
+
                 await self._run_hook("before_tool_call", self._hooks.before_tool_call, tu)
                 tool = self._registry.get(tu.name)
                 if tool is None:
+                    # This is reachable only for a client-owned call: a
+                    # dispatch:"client" request can expose a stale declaration
+                    # or handler mismatch. Server-owned calls are skipped above.
                     raise UnknownToolError(tu.name)
                 try:
                     output = await _maybe_await(tool.handler(tu.input))

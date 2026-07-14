@@ -298,6 +298,14 @@ pub async fn call(
 ) -> Result<ProviderResponse, ProviderCallError> {
     let token = resolve_tokens(&cfg.auth_token).map_err(ProviderCallError::Config)?;
 
+    // Strip baesrv's non-standard per-block routing/attribution fields
+    // (`dispatch`, `caller`) from replayed `tool_use` blocks before the request
+    // is built. These are persisted on `server.message.send` blocks and thus
+    // replayed by `stream_history`, but the LLM must never see them — an
+    // unknown field can trip a provider's strict-schema validation.
+    let messages = strip_nonstandard_block_fields(messages);
+    let messages = &messages;
+
     let base = cfg.effective_base_url().trim_end_matches('/').to_owned();
     let (url, request_body) = match cfg.provider {
         ProviderKind::Anthropic => (
@@ -352,6 +360,49 @@ pub async fn call(
             body: text,
         })
     }
+}
+
+/// Remove baesrv's non-standard per-block fields (`dispatch`, `caller`) from
+/// every `tool_use` block in a canonical message list. Pure.
+///
+/// `run_turn` tags the `tool_use` blocks of a mixed/all-client
+/// `server.message.send` with `dispatch` so the client can route them; that tag
+/// (and any future `caller` attribution field) is replayed back into provider
+/// history by `stream_history`. This strips both so neither reaches the
+/// upstream LLM. Messages with no such fields pass through structurally
+/// unchanged (only the affected `tool_use` objects are rebuilt).
+fn strip_nonstandard_block_fields(messages: &Value) -> Value {
+    let Some(arr) = messages.as_array() else {
+        return messages.clone();
+    };
+    Value::Array(
+        arr.iter()
+            .map(|msg| {
+                let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+                    return msg.clone();
+                };
+                let cleaned: Vec<Value> = blocks
+                    .iter()
+                    .map(|b| {
+                        if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                            if let Some(obj) = b.as_object() {
+                                if obj.contains_key("dispatch") || obj.contains_key("caller") {
+                                    let mut o = obj.clone();
+                                    o.remove("dispatch");
+                                    o.remove("caller");
+                                    return Value::Object(o);
+                                }
+                            }
+                        }
+                        b.clone()
+                    })
+                    .collect();
+                let mut m = msg.clone();
+                m["content"] = Value::Array(cleaned);
+                m
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +825,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args, json!({ "tz": "UTC" }));
+    }
+
+    #[test]
+    fn replayed_tool_use_strips_dispatch_and_caller_fields() {
+        let messages = json!([{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "tu_1",
+                "name": "get_time",
+                "input": {},
+                "dispatch": "client",
+                "caller": "driver-a"
+            }]
+        }]);
+        assert_eq!(
+            strip_nonstandard_block_fields(&messages),
+            json!([{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tu_1",
+                    "name": "get_time",
+                    "input": {}
+                }]
+            }])
+        );
     }
 
     #[test]

@@ -18,6 +18,11 @@ export type ContentBlock =
       id: string;
       name: string;
       input: Record<string, unknown>;
+      /**
+       * Server-selected owner for this invocation. This receive-only routing
+       * tag is omitted by older servers; see {@link ToolUse.dispatch}.
+       */
+      dispatch?: string | null;
     }
   | { type: "tool_result"; tool_use_id: string; content: Content };
 
@@ -35,6 +40,17 @@ export interface ToolUse {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /**
+   * Server-selected owner for this invocation, when supplied. `"client"`
+   * means this harness must execute it; every other present value is
+   * server-owned and informational. When absent, the harness falls back to
+   * local registry membership for compatibility with older servers.
+   *
+   * The full assistant {@link Message} (including server-owned calls) is
+   * passed to `Hooks.after_receive`, allowing an application or UI to
+   * display informational calls without executing them.
+   */
+  dispatch?: string | null;
 }
 
 /**
@@ -50,6 +66,19 @@ export interface ToolResult {
 /** Normalize a `send()` argument into a `user` `Message`. */
 export function toMessage(input: string | Message): Message {
   return typeof input === "string" ? { role: "user", content: input } : input;
+}
+
+/** Clone a message for outbound transport, removing receive-only routing tags. */
+export function messageToWire(message: Message): Message {
+  if (typeof message.content === "string") return { ...message };
+  return {
+    ...message,
+    content: message.content.map((block) => {
+      if (block.type !== "tool_use") return block;
+      const { dispatch: _dispatch, ...wireBlock } = block;
+      return wireBlock;
+    }),
+  };
 }
 
 /** Concatenate all `text` blocks of a message (handy for printing a turn). */
@@ -71,7 +100,12 @@ export function toolUses(message: Message): ToolUse[] {
       (b): b is Extract<ContentBlock, { type: "tool_use" }> =>
         b.type === "tool_use",
     )
-    .map((b) => ({ id: b.id, name: b.name, input: b.input }));
+    .map((b) => ({
+      id: b.id,
+      name: b.name,
+      input: b.input,
+      dispatch: b.dispatch,
+    }));
 }
 
 // ---------------------------------------------------------------------------

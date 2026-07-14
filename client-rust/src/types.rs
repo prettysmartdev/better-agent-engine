@@ -49,10 +49,16 @@ impl Message {
             Content::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input } => Some(ToolUse {
+                    ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        dispatch,
+                    } => Some(ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
+                        dispatch: dispatch.clone(),
                     }),
                     _ => None,
                 })
@@ -141,6 +147,10 @@ pub enum ContentBlock {
         name: String,
         /// JSON arguments for the tool handler.
         input: Value,
+        /// Server-selected owner for this invocation. This receive-only routing
+        /// tag is omitted by older servers; see [`ToolUse::dispatch`].
+        #[serde(default, skip_serializing)]
+        dispatch: Option<String>,
     },
     /// The result of a tool invocation, sent back to the server.
     ToolResult {
@@ -161,6 +171,15 @@ pub struct ToolUse {
     pub name: String,
     /// JSON arguments.
     pub input: Value,
+    /// Server-selected owner for this invocation, when supplied. `"client"`
+    /// means this harness must execute it; every other present value is
+    /// server-owned and informational. When absent, the harness falls back to
+    /// local registry membership for compatibility with older servers.
+    ///
+    /// The full assistant [`Message`] (including server-owned calls) is passed
+    /// to [`Hooks::after_receive`](crate::Hooks::after_receive), allowing an
+    /// application or UI to display informational calls without executing them.
+    pub dispatch: Option<String>,
 }
 
 /// The outcome of a tool invocation, before it is sent back to the server.

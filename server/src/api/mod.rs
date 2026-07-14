@@ -84,7 +84,8 @@ type SandboxStatusMap = Arc<Mutex<HashMap<String, HashMap<String, SandboxImageSt
 /// in-flight tool round trip. If the owner stays away past `deadline`
 /// (`BAE_TURN_TIMEOUT`), the next `session.sendMessage` arrival treats the
 /// turn as abandoned: it drops the parked guard (releasing the gate to the
-/// next FIFO waiter) and logs a `session.error` with reason
+/// next message, which completes the abandoned exchange with synthetic error
+/// results before continuing) and logs a `session.error` with reason
 /// `driver_turn_abandoned`.
 pub struct PendingTurn {
     /// The client key that owns the paused turn — only it may resume without
@@ -94,6 +95,14 @@ pub struct PendingTurn {
     pub guard: tokio::sync::OwnedMutexGuard<()>,
     /// When the paused turn becomes abandonable.
     pub deadline: tokio::time::Instant,
+    /// Server-dispatched `tool_result` blocks executed before the pause
+    /// (sandbox/MCP tools in a mixed turn). Empty for an all-client pause. On
+    /// resume these are merged with the owner's client results into the single
+    /// `user` turn the provider requires. On voluntary abandonment or timeout,
+    /// they are merged with synthetic error results for unanswered client ids,
+    /// preserving a replayable provider transcript. See
+    /// `crate::engine::session::Turn::pending_tool_results`.
+    pub server_tool_results: Vec<serde_json::Value>,
 }
 
 /// Shared state handed to both routers. Cloneable and cheap (the [`Store`] is an

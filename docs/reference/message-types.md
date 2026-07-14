@@ -64,6 +64,32 @@ The server's final assistant turn for this iteration of the loop.
 `tool_use` block to the client, this event is still emitted with that
 `tool_use` content so the full round-trip is visible in the event log.
 
+**Mixed and all-client turns:** when the turn contains at least one
+`dispatch:"client"` tool, every `tool_use` block in this event's `content` —
+client-, sandbox-, and MCP-dispatched alike — carries a `dispatch` field, the
+same value as that block's [`tool.call`](#toolcall) event below:
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {"type": "tool_use", "id": "tu_abc123", "name": "get_current_time", "input": {}, "dispatch": "client"},
+    {"type": "tool_use", "id": "tu_xyz789", "name": "list_directory", "input": {"path": "/data"}, "dispatch": "mcp"}
+  ]
+}
+```
+
+The `sandbox`/`mcp` blocks above have already been dispatched and answered by
+the server by the time this event is emitted; only the `client` block is left
+for the harness to execute. See [Client API — tool call
+response](client-api.md#sessionsendmessage) for the full client contract.
+`dispatch` (and any future `caller` field) is a baesrv-internal routing tag —
+`engine::provider::call` strips it from `tool_use` blocks before replaying
+history to the LLM, so it never reaches the provider (see
+[`provider.request`](#providerrequest) below) — a well-behaved client does not
+echo it back either. An all-server turn (no client tool involved) never
+pauses, so its `server.message.send` content has no `dispatch` field.
+
 ---
 
 ### `provider.request`
@@ -580,6 +606,7 @@ non-fatal audit/visibility signal.
 | `"profile_unavailable"` | The profile was deleted mid-session. | yes |
 | `"primary_provider_unavailable"` | `POST /api/v1/sessions` or `POST /api/v1/sessions/{id}/join` rejected the request because the profile's `primary_provider` name isn't in the `[providers]` registry. Payload: `{"profile_id": "pro_…", "primary_provider": "name"}`. Logged on this **separate audit session row** (`state='error'`) — the real session, if any, is untouched. See [Profiles](../profiles.md#fatal-primary--non-fatal-fallback). | n/a — no real session was created |
 | `"driver_turn_abandoned"` | A paused turn's owning driver didn't return with its continuation before `BAE_TURN_TIMEOUT` elapsed; the FIFO gate was released to the next queued driver. Payload: `{"owner_client_key_id": "key_…"}` (also the event's `client_key_id` column). | **no** — the session stays `open`; other drivers are unaffected |
+| `"tool_result_merge_invalid"` | A paused-turn continuation had a non-user role or did not answer exactly the assistant turn's tool-use ids (missing, duplicate, or unexpected result). Payload includes a human-readable `detail`. | yes — prevents incomplete durable tool history from being replayed upstream |
 
 Note: `"provider_call_failed"` is recorded once when the primary fails but
 a fallback attempt follows. If a fallback succeeds, the session continues
@@ -639,6 +666,40 @@ provider.request
 provider.response      (ok: true)
 server.message.send    (final text)
 ```
+
+**Mixed client + MCP tool call (two `session.sendMessage` calls — the server
+dispatches its own block before pausing, then merges both result sets on
+resume):**
+
+Call 1:
+```
+client.message.send
+provider.request
+provider.response      (ok: true)
+tool.call              (dispatch: mcp, server_name: "filesystem")
+mcp.request            (method: tools/call)
+mcp.response           (ok: true)
+tool.result            (dispatch: mcp, is_error: false)
+tool.call              (dispatch: client)
+server.message.send    (content has both tool_use blocks, each tagged
+                         `dispatch` — loop paused; the mcp block's
+                         tool.result is already logged above)
+```
+
+Call 2:
+```
+client.message.send    (content has a tool_result for the client id only —
+                         the server merges in its own stashed mcp result to
+                         answer both ids before this is recorded)
+provider.request
+provider.response      (ok: true)
+server.message.send    (final text)
+```
+
+Note there is no second `tool.result` event for the `mcp` id on resume — it
+was already logged in call 1, and the merge does not re-log it. See [Client
+API — tool call response](client-api.md#sessionsendmessage) for the full
+client contract on a mixed turn.
 
 **MCP tool call (single `session.sendMessage` call, server-side):**
 

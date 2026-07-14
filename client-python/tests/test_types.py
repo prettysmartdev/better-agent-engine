@@ -19,12 +19,19 @@ from bae_py.types import parse_block, parse_content
 def test_parse_and_roundtrip_content_blocks() -> None:
     raw = [
         {"type": "text", "text": "hi"},
-        {"type": "tool_use", "id": "tu_1", "name": "t", "input": {"a": 1}},
+        {
+            "type": "tool_use",
+            "id": "tu_1",
+            "name": "t",
+            "input": {"a": 1},
+            "dispatch": "mcp",
+        },
         {"type": "tool_result", "tool_use_id": "tu_1", "content": "done"},
     ]
     blocks = parse_content(raw)
     assert isinstance(blocks[0], TextBlock)
     assert isinstance(blocks[1], ToolUseBlock)
+    assert blocks[1].dispatch == "mcp"
     assert isinstance(blocks[2], ToolResultBlock)
     # to_wire is faithful.
     assert blocks[1].to_wire() == {

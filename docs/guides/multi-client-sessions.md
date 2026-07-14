@@ -241,7 +241,9 @@ result) and A never sends the `tool_result` continuation, the turn stays
 parked under A's ownership until `BAE_TURN_TIMEOUT` (default 120s) elapses.
 At that point the next arrival — B's queued message, or a retry from A —
 triggers abandonment: a `session.error` (`reason: "driver_turn_abandoned"`)
-is logged, the gate releases, and the session stays `open`. See
+is logged, the server merges parked server results with synthetic error
+results for unanswered client calls, and the session stays `open` with a valid
+provider transcript. See
 [Wire Protocol — "Remaining connected"](../reference/wire-protocol.md#remaining-connected-is-a-return-before-timeout-guarantee-not-a-held-socket).
 
 ---

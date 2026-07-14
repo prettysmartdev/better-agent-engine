@@ -321,6 +321,43 @@ pub fn stream_history(conn: &Connection, session_id: &str) -> rusqlite::Result<V
     Ok(history)
 }
 
+/// The `tool_use` blocks of the session's most recent `server.message.send`
+/// (the paused assistant turn), in their original order, each retaining its
+/// `id`/`name`/`dispatch` fields. Empty when there is no such event or it
+/// carried no `tool_use` blocks.
+///
+/// Used at mixed-turn resume to know exactly which `tool_use` ids the merged
+/// `user` turn must answer, and in what order, without loading full history.
+pub fn last_assistant_tool_uses(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<Value>> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM session_events \
+             WHERE session_id = ?1 AND event_type = 'server.message.send' \
+             ORDER BY rowid DESC LIMIT 1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(Vec::new());
+    };
+    let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    let blocks = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(blocks)
+}
+
 /// Resolve an event id to its rowid within a session, for `since_event_id`
 /// replay. Returns `None` if no event with that id exists in the session (a
 /// stale or foreign id), letting the caller fall back to replaying from the

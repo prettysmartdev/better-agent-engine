@@ -18,20 +18,29 @@
 //!    OpenAI-kind attempt that is the untranslated Chat Completions response;
 //!    the loop itself only ever consumes the canonical translation
 //!    [`provider::call`] hands back, so this module stays wire-format-agnostic.
-//! 5. If the response contains tool calls, insert a `tool.call` per call.
-//!    Client-side tools (declared by the client at session open) are returned to
-//!    the client for execution and the turn pauses. MCP tools are dispatched to
-//!    the session's live MCP connections (`mcp.request` / `mcp.response` with the
-//!    real `tools/call` exchange, then `tool.result`) and the loop continues with
-//!    the real result appended. A tool the session has no MCP server for, or a
-//!    server that fails mid-turn, yields an error-shaped `tool.result` so the
-//!    model can adjust — the turn is never aborted for a tool failure.
+//! 5. If the response contains tool calls, insert a `tool.call` per call, each
+//!    tagged with its `dispatch` (`client` / `sandbox` / `mcp`), then
+//!    **partition** the calls on that tag. The server-dispatched tools
+//!    (`sandbox` + `mcp`) are **always** dispatched first, server-side: sandbox
+//!    tools against the session's remote sandbox and MCP tools against the
+//!    session's live MCP connections (`mcp.request` / `mcp.response` with the
+//!    real `tools/call` exchange, then `tool.result`). A tool the session has
+//!    no MCP server for, or a server that fails mid-turn, yields an
+//!    error-shaped `tool.result` so the model can adjust — the turn is never
+//!    aborted for a tool failure. Then, on the `client` bucket:
+//!    - empty (all-server turn): append the collected results to history and
+//!      loop — the common MCP path, no pause, no persistence;
+//!    - non-empty (mixed or all-client turn): persist the whole assistant
+//!      message (every `tool_use` block, each carrying its `dispatch` tag) as
+//!      `server.message.send`, return [`Outcome::Paused`], and carry the
+//!      already-dispatched server results out via [`Turn::pending_tool_results`]
+//!      so the caller can merge them with the client's results on resume.
 //! 6. On a plain (no-tool) response, insert `server.message.send` and finish.
 //!
 //! The auth token is resolved inside [`super::provider::call`] and never reaches
 //! this module, an event payload, or a log line.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -68,6 +77,12 @@ pub struct Turn {
     pub message: Value,
     pub events: Vec<EventRecord>,
     pub outcome: Outcome,
+    /// Server-dispatched `tool_result` blocks that were executed before the
+    /// turn paused, to be merged with the client's own results on resume.
+    /// Non-empty **only** on a mixed-turn [`Outcome::Paused`] (a turn that
+    /// contains at least one client tool alongside sandbox/MCP tools); empty on
+    /// every other outcome, including an all-client `Paused`.
+    pub pending_tool_results: Vec<Value>,
 }
 
 /// A turn failed at the persistence layer (distinct from a provider failure,
@@ -108,6 +123,17 @@ fn log_event(
 /// Run one client turn. The caller has already inserted the incoming
 /// `client.message.send` (and any `tool.result` events for returned tool
 /// output) before calling this.
+///
+/// **Partitioned dispatch.** When an assistant turn contains tool calls, they
+/// are split on their `dispatch` tag: `sandbox`/`mcp` calls are always
+/// dispatched server-side first (collecting their `tool_result` blocks), and
+/// only then does the `client` bucket decide the outcome. An empty client
+/// bucket (all-server turn) loops in-process with the results appended to
+/// history; a non-empty client bucket (mixed or all-client turn) persists the
+/// full assistant message and returns [`Outcome::Paused`] with the collected
+/// server results carried out in [`Turn::pending_tool_results`], so the caller
+/// can reassemble both result sets into the single following `user` turn on
+/// resume.
 ///
 /// `acting_client_key_id` is the client key driving this turn (the same id the
 /// FIFO turn lock records as the turn's owner). It scopes the turn in two
@@ -324,29 +350,48 @@ pub async fn run_turn(
                 message,
                 events,
                 outcome: Outcome::Completed,
+                pending_tool_results: Vec::new(),
             });
         }
 
-        // Record every tool call, tagged with how it will be dispatched:
-        // "client" (the acting client's own tools), "sandbox" (Auto-mode
-        // sandbox tools, server-dispatched), or "mcp" (everything else). MCP
+        // Classify each tool call by how it will be dispatched: "client" (the
+        // acting client's own tools), "sandbox" (Auto-mode sandbox tools,
+        // server-dispatched), or "mcp" (everything else). This dispatch tag is
+        // the partition key below; it is echoed onto every `tool.call` event
+        // and — for a mixed/all-client turn — onto the persisted assistant
+        // `tool_use` blocks so the client can tell its own blocks apart.
+        let dispatches: Vec<&'static str> = tool_uses
+            .iter()
+            .map(|tu| {
+                let name = tu.name.as_str();
+                if client_tool_names.contains(name) {
+                    "client"
+                } else if sandbox_tool_names.contains(name) {
+                    "sandbox"
+                } else {
+                    "mcp"
+                }
+            })
+            .collect();
+        // Dispatch tag by `tool_use` id, for annotating the persisted assistant
+        // message on a mixed/all-client pause.
+        let dispatch_by_id: HashMap<String, &'static str> = tool_uses
+            .iter()
+            .zip(&dispatches)
+            .filter_map(|(tu, d)| tu.id.as_str().map(|id| (id.to_owned(), *d)))
+            .collect();
+
+        // Record every tool call, tagged with how it will be dispatched. MCP
         // calls also carry the resolved `server_name` (null if unroutable).
-        for tu in &tool_uses {
+        for (tu, dispatch) in tool_uses.iter().zip(&dispatches) {
             let name = tu.name.as_str();
-            let dispatch = if client_tool_names.contains(name) {
-                "client"
-            } else if sandbox_tool_names.contains(name) {
-                "sandbox"
-            } else {
-                "mcp"
-            };
             let mut payload = json!({
                 "id": tu.id,
                 "name": name,
                 "input": tu.input,
                 "dispatch": dispatch,
             });
-            if dispatch == "mcp" {
+            if *dispatch == "mcp" {
                 payload["server_name"] = json!(mcp_routes.get(name));
             }
             events.push(log_event(
@@ -359,37 +404,19 @@ pub async fn run_turn(
             )?);
         }
 
-        let has_client_tool = tool_uses
-            .iter()
-            .any(|tu| client_tool_names.contains(tu.name.as_str()));
+        let has_client = dispatches.contains(&"client");
 
-        if has_client_tool {
-            // Hand the assistant turn (with its tool_use blocks) to the client
-            // for execution; persist it as the message we sent back and pause.
-            let message = json!({ "role": "assistant", "content": content });
-            events.push(log_event(
-                store,
-                broadcaster,
-                sid,
-                cid,
-                EventType::ServerMessageSend,
-                message.clone(),
-            )?);
-            return Ok(Turn {
-                message,
-                events,
-                outcome: Outcome::Paused,
-            });
-        }
-
-        // All tool calls are server-dispatched (sandbox or MCP): dispatch each
-        // and continue the loop with the real results appended. This assistant
-        // turn is internal (not sent to the client) so it is not persisted as
-        // server.message.send; it is kept in the in-memory history for the
-        // next provider call.
-        history.push(json!({ "role": "assistant", "content": content }));
-        let mut result_blocks: Vec<Value> = Vec::new();
-        for tu in &tool_uses {
+        // Always dispatch the server-side tools (sandbox + MCP) first, in
+        // tool_use order, collecting each one's `tool_result` block. This runs
+        // for every turn shape — all-server, mixed, and all-client (a no-op
+        // then) — so observers see server-side work live even when the turn
+        // later pauses for the client. Client-dispatched blocks are skipped
+        // here; the client executes them.
+        let mut server_tool_results: Vec<Value> = Vec::new();
+        for (tu, dispatch) in tool_uses.iter().zip(&dispatches) {
+            if *dispatch == "client" {
+                continue;
+            }
             let name = tu.name.as_str();
 
             // Auto-mode sandbox tools: dispatched server-side against the
@@ -398,7 +425,7 @@ pub async fn run_turn(
             // the result becomes an ordinary tool.result. A call with no
             // started sandbox is handled exactly like a tool with no MCP
             // server: an error-shaped tool.result, and the turn continues.
-            if sandbox_tool_names.contains(name) {
+            if *dispatch == "sandbox" {
                 let command = tu
                     .input
                     .get("command")
@@ -510,7 +537,7 @@ pub async fn run_turn(
                         "content": result_content,
                     }),
                 )?);
-                result_blocks.push(json!({
+                server_tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
                     "content": result_content,
@@ -597,14 +624,49 @@ pub async fn run_turn(
                     "content": result_content,
                 }),
             )?);
-            result_blocks.push(json!({
+            server_tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
                 "content": result_content,
                 "is_error": is_error,
             }));
         }
-        history.push(json!({ "role": "user", "content": Value::Array(result_blocks) }));
+
+        if has_client {
+            // Mixed or all-client turn: hand the assistant turn to the client.
+            // Persist it with a `dispatch` tag on every `tool_use` block so the
+            // client executes only its own ("client") blocks and treats the
+            // server-dispatched ones as informational. The persisted message
+            // keeps ALL tool_use blocks because the following `user` turn must
+            // answer every `tool_use` id. Carry the already-dispatched server
+            // results out so the caller can merge them with the client's
+            // results on resume (see rpc::drive_send_message).
+            let content = annotate_dispatch(&content, &dispatch_by_id);
+            let message = json!({ "role": "assistant", "content": content });
+            events.push(log_event(
+                store,
+                broadcaster,
+                sid,
+                cid,
+                EventType::ServerMessageSend,
+                message.clone(),
+            )?);
+            return Ok(Turn {
+                message,
+                events,
+                outcome: Outcome::Paused,
+                pending_tool_results: server_tool_results,
+            });
+        }
+
+        // All-server turn: append the assistant message and the merged tool
+        // results to the in-memory history and continue the provider loop. This
+        // assistant turn is internal (not sent to the client), so it is not
+        // persisted as server.message.send; it is kept in the in-memory history
+        // for the next provider call. This is the hot MCP path — no pause, no
+        // persistence, no client.message.send.
+        history.push(json!({ "role": "assistant", "content": content }));
+        history.push(json!({ "role": "user", "content": Value::Array(server_tool_results) }));
         // ...and loop for the next provider call.
     }
 
@@ -637,7 +699,39 @@ fn finish_failed(
         }),
         events,
         outcome: Outcome::ProvidersFailed,
+        pending_tool_results: Vec::new(),
     })
+}
+
+/// Return `content` with a `dispatch` field added to every `tool_use` block,
+/// looked up by the block's `id`. Blocks without a known id (or non-array
+/// content) pass through unchanged. Applied only to the mixed/all-client
+/// assistant message persisted as `server.message.send`, so the client can
+/// route each block to the right executor. The tag is a non-standard field and
+/// is stripped before the message is ever replayed to a provider (see
+/// [`super::provider::call`]).
+fn annotate_dispatch(content: &Value, dispatch_by_id: &HashMap<String, &'static str>) -> Value {
+    let Some(arr) = content.as_array() else {
+        return content.clone();
+    };
+    Value::Array(
+        arr.iter()
+            .map(|b| {
+                if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let (Some(id), Some(obj)) =
+                        (b.get("id").and_then(Value::as_str), b.as_object())
+                    {
+                        if let Some(d) = dispatch_by_id.get(id) {
+                            let mut o = obj.clone();
+                            o.insert("dispatch".to_string(), json!(d));
+                            return Value::Object(o);
+                        }
+                    }
+                }
+                b.clone()
+            })
+            .collect(),
+    )
 }
 
 /// Build the error-shaped `tool_result` content for a failed MCP dispatch, so

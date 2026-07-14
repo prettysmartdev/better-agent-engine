@@ -33,6 +33,9 @@ class ToolUseBlock:
     id: str
     name: str
     input: dict[str, Any] = field(default_factory=dict)
+    # Server-selected owner for this invocation. This receive-only routing tag
+    # is omitted by older servers and must not be echoed in a tool_result turn.
+    dispatch: str | None = None
     type: str = "tool_use"
 
     def to_wire(self) -> dict[str, Any]:
@@ -66,7 +69,12 @@ def parse_block(raw: dict[str, Any]) -> ContentBlock:
         case "text":
             return TextBlock(text=raw.get("text", ""))
         case "tool_use":
-            return ToolUseBlock(id=raw["id"], name=raw["name"], input=raw.get("input") or {})
+            return ToolUseBlock(
+                id=raw["id"],
+                name=raw["name"],
+                input=raw.get("input") or {},
+                dispatch=raw.get("dispatch"),
+            )
         case "tool_result":
             return ToolResultBlock(
                 tool_use_id=raw["tool_use_id"], content=parse_content(raw.get("content", []))

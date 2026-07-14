@@ -69,7 +69,12 @@ export class RpcError extends BaeError {
   }
 }
 
-/** The server returned a `tool_use` for a tool that was not registered. */
+/**
+ * A client-owned tool call has no local handler. This can only occur for a
+ * `dispatch: "client"` block (or an older untagged block selected by the
+ * local registry) — server-owned `sandbox`/`mcp` blocks never raise this
+ * error.
+ */
 export class UnknownToolError extends BaeError {
   constructor(readonly toolName: string) {
     super(`no handler registered for tool "${toolName}"`);

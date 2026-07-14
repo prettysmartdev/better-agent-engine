@@ -496,9 +496,45 @@ followed by a terminal result.
 
 **Tool call response (loop paused):**
 
-When the assistant response contains `tool_use` blocks, the terminal result
-`message` carries them and the harness dispatches client-side tools, then
-sends another `session.sendMessage` with `tool_result` blocks:
+The loop pauses (`Outcome::Paused`) whenever the assistant response contains
+at least one `dispatch:"client"` tool_use block. The terminal result
+`message.content` carries **every** `tool_use` block from that turn — client,
+`sandbox`, and `mcp` alike — each tagged with its `dispatch` (see [Content
+blocks](#content-blocks) below):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "message": {
+      "role": "assistant",
+      "content": [
+        {"type": "tool_use", "id": "tu_abc123", "name": "get_current_time", "input": {}, "dispatch": "client"},
+        {"type": "tool_use", "id": "tu_xyz789", "name": "list_directory", "input": {"path": "/data"}, "dispatch": "mcp"}
+      ]
+    },
+    "events": [ … ]
+  }
+}
+```
+
+The `mcp` block above was already dispatched and answered by the server
+*before* the turn paused — its `mcp.request`/`mcp.response`/`tool.result`
+events are already present in `result.events`. The client's job:
+
+- **Execute only `dispatch:"client"` blocks.** For each one, call the
+  registered handler by `name` with `input` and build a `tool_result` block
+  echoing `tool_use_id`.
+- **Treat every other block as informational.** A `sandbox`/`mcp` block (or,
+  against an older server that omits `dispatch`, any block whose `name` is
+  not in the client's own registered-tool set) is display-only — surface it
+  to application code/UI if useful (e.g. "server is running `list_directory`"),
+  but do not execute it and do not synthesize a `tool_result` for it. The
+  server already owns that result.
+- **Return only the client's own results.** Send back a `user` message whose
+  `content` is exactly the `tool_result` blocks for the blocks the client
+  executed — nothing for the server-dispatched ones:
 
 ```json
 {
@@ -519,6 +555,30 @@ sends another `session.sendMessage` with `tool_result` blocks:
   }
 }
 ```
+
+**Absent-dispatch fallback.** A server that predates this contract never sets
+`dispatch` and never sends server-dispatched blocks to the client at all — its
+`server.message.send`/terminal `message.content` only ever contains blocks the
+harness itself declared. A harness talking to such a server falls back to its
+old behavior: treat a `tool_use` block as its own iff `name` is in its own
+registered-tool set.
+
+**Server-side merge.** The server dispatched and answered the `sandbox`/`mcp`
+blocks itself before pausing, and stashes those results across the pause.
+When the client resumes with its own `tool_result`s, the server merges both
+result sets into the single following `user` turn recorded in history — one
+`tool_result` per `tool_use` id in the paused assistant turn, server results
+first-class. If the client mistakenly returns a `tool_result` for a
+server-dispatched id, the client's copy is dropped in favor of the server's.
+A resume that doesn't answer exactly the paused turn's id set (missing,
+duplicate, or unexpected id) is rejected with a `session.error`
+(`reason: "tool_result_merge_invalid"`) and a `-32000` JSON-RPC error — the
+session moves to `error`, so its incomplete durable tool exchange can never be
+replayed upstream. A plain user message is instead an explicit abandonment:
+the server synthesizes error results for unanswered client ids, preserves the
+plain content, and keeps the session open. See [Wire Protocol — FIFO
+turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+for how the pause/resume gate itself works.
 
 **Provider failure:**
 
@@ -792,13 +852,21 @@ blocks:
 
 ```json
 {"type": "text",        "text": "…"}
-{"type": "tool_use",    "id": "tu_…", "name": "…", "input": {…}}
+{"type": "tool_use",    "id": "tu_…", "name": "…", "input": {…}, "dispatch": "client"}
 {"type": "tool_result", "tool_use_id": "tu_…", "content": <string|block[]>}
 ```
 
-The server passes these through to/from the provider verbatim. SDKs inspect
-`tool_use` blocks to dispatch to registered handlers, then send `tool_result`
-blocks back.
+The server passes these through to/from the provider verbatim, except that
+`dispatch` (and the reserved `caller` field) are stripped from `tool_use`
+blocks before the provider ever sees them — see [Message Types —
+`server.message.send`](message-types.md#servermessagesend).
+
+A `tool_use` block in a `server.message.send` event carries `dispatch`, one of
+`"client"`, `"sandbox"`, or `"mcp"`, whenever the turn paused for at least one
+client-dispatched tool (see [Tool call response](#sessionsendmessage) above).
+Older servers that predate this field omit it; a harness talking to such a
+server falls back to treating a block as its own iff the block's `name` is in
+its own registered-tool set.
 
 ---
 
@@ -808,19 +876,27 @@ SDK harnesses implement this loop inside `session.send(message)`:
 
 1. POST `session.sendMessage` to `/rpc` with `{message:{role:"user", content}}`.
 2. Read NDJSON: fire `on_event` for each notification; await terminal result.
-3. If `result.message.content` contains **no** `tool_use` block → return the
-   final assistant turn to the caller. **Loop ends.**
-4. If there are `tool_use` blocks → for each block, call the registered handler
-   by `name` with `input`. Build `tool_result` blocks echoing `tool_use_id`.
+3. If `result.message.content` contains **no** block that is "ours" (see
+   below) → return the final assistant turn to the caller. **Loop ends.**
+4. For each `tool_use` block that is ours, call the registered handler by
+   `name` with `input`. Build a `tool_result` block echoing `tool_use_id`.
+   Every other `tool_use` block is informational only — skip it, do not
+   synthesize a `tool_result` for it.
 5. POST `session.sendMessage` with
-   `{message:{role:"user", content:[…tool_result blocks]}}`.
+   `{message:{role:"user", content:[…tool_result blocks for "ours" only]}}`.
 6. Go to step 2.
 
+**Deciding "ours":** a block is ours iff `dispatch == "client"`, or, against a
+server that predates the `dispatch` field, `name` is in the harness's own
+registered-tool set. Tools the client did not declare are dispatched
+server-side (through configured MCP servers, or the session's Auto-mode
+sandbox) — against a current server they still surface as `tool_use` blocks
+(tagged `dispatch:"sandbox"`/`"mcp"`) so the full turn is visible, but the
+harness must not execute or answer them; against an older server they never
+surface at all. See [`session.sendMessage` — tool call
+response](#sessionsendmessage) for the full contract.
+
 Notes:
-- The harness only dispatches `tool_use` blocks for tools **it declared** at
-  session open. Tools the client did not declare are dispatched server-side
-  through configured MCP servers and never surface as `tool_use` blocks to the
-  client.
 - `tool_use.id` must be echoed verbatim as `tool_result.tool_use_id`.
 - Hooks (`before_send`, `after_receive`, `before_tool_call`, `after_tool_call`,
   `on_event`) fire at their respective points; an error from any hook aborts

@@ -199,20 +199,25 @@ polling, no retry — the connection simply waits.
 
 **A turn is a logical unit, not a single HTTP request.** When a turn pauses
 for a client-side tool call (`Outcome::Paused` — the assistant response
-contains `tool_use` blocks the harness must dispatch), the FIFO gate is not
-released. It stays held by that turn's owner — the client key that sent the
-original message — until:
+contains at least one `dispatch:"client"` `tool_use` block the harness must
+dispatch), the FIFO gate is not released. A paused turn may also carry
+`sandbox`/`mcp` `tool_use` blocks the server already dispatched and answered
+itself — see [Client API — tool call response](client-api.md#sessionsendmessage)
+for the client contract and how the server merges both result sets back
+together on resume. The gate stays held by that turn's owner — the client key
+that sent the original message — until:
 
-- The **same** client key sends the `tool_result` continuation (any further
-  `session.sendMessage`, not necessarily one shaped like a tool result — see
-  below), reusing the held gate with no queuing, or
+- The **same** client key sends the `tool_result` continuation, or deliberately
+  replaces it with a fresh plain message, reusing the held gate with no
+  queuing, or
 - `BAE_TURN_TIMEOUT` (default 120s, see [Configuration](configuration.md))
   elapses without that continuation arriving, at which point the turn is
-  **abandoned**: the gate is released to the next FIFO waiter, and a
+  **abandoned**: the next arrival reclaims the gate, and a
   broadcast `session.error` event (`reason: "driver_turn_abandoned"`,
-  `{"owner_client_key_id": "key_…"}`) is logged. The session itself stays
-  `open` — unlike a provider failure, an abandoned turn does not move the
-  session to `error`, since other drivers are unaffected.
+  `{"owner_client_key_id": "key_…"}`) is logged. Before that new message is
+  sent upstream, the server completes every unanswered client tool call with
+  a synthetic error result and merges any parked MCP/sandbox results. The
+  session itself stays `open` with valid replay history.
 
 Only the owning client key may submit that turn's continuation; a *different*
 driver's `session.sendMessage` call during someone else's paused turn simply
@@ -220,7 +225,9 @@ queues (blocks) like any other contender for the gate — it is never rejected
 with an error, it waits its turn. Ownership is tracked by `client_key_id`,
 not by the shape of the message: the owner may abandon its own pending tool
 call voluntarily by sending a fresh message instead of a `tool_result`
-continuation, and the turn proceeds with that as the next input.
+continuation. The server puts synthetic error results for unanswered client
+ids and that fresh content in the single following `user` turn, so role
+alternation and exact tool-result coverage remain valid.
 
 ### "Remaining connected" is a return-before-timeout guarantee, not a held socket
 

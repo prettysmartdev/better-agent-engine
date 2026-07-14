@@ -25,7 +25,7 @@ import type {
   SessionEvent,
   SessionJoinPayload,
 } from "./types.js";
-import { messageText } from "./types.js";
+import { messageText, toolUses } from "./types.js";
 
 /**
  * A scripted, request-recording transport so the whole loop runs offline. REST
@@ -271,10 +271,23 @@ describe("hooks", () => {
 });
 
 describe("send — error propagation", () => {
-  it("throws UnknownToolError for an unregistered tool", async () => {
+  it("throws UnknownToolError for a client-owned tool with no handler", async () => {
+    // dispatch:"client" makes the block ours to execute, so an unregistered
+    // name is a genuine declared-tool/handler mismatch (see the "dispatch
+    // routing" suite below for the untagged-and-unregistered fallback case,
+    // which is informational rather than an error).
     const transport = new MockTransport(
       () => openOk,
-      () => toolTurn,
+      () =>
+        assistantFrames([
+          {
+            type: "tool_use",
+            id: "tu_1",
+            name: "get_time",
+            input: { tz: "utc" },
+            dispatch: "client",
+          },
+        ]),
     );
     const session = await new Harness(config(), { transport }).connect();
     await expect(session.send("hi")).rejects.toMatchObject({
@@ -351,6 +364,250 @@ describe("send — error propagation", () => {
     await expect(session.send("hi")).rejects.toMatchObject({
       constructor: RpcError,
       code: -32000,
+    });
+  });
+});
+
+// ===========================================================================
+// Dispatch-split scenarios (WI 0009)
+//
+// These mirror the Rust harness tests one-for-one (see
+// client-rust/src/harness.rs):
+//   - no_dispatch_falls_back_to_registered_tool_membership
+//   - client_dispatch_without_handler_raises_unknown_tool
+//   - mixed_dispatch_executes_only_client_result_and_surfaces_server_tool
+// ===========================================================================
+
+describe("dispatch routing", () => {
+  it("falls back to registered-tool membership when dispatch is absent (older-server compatibility)", async () => {
+    const handler = vi.fn(() => "12:00");
+    const transport = new MockTransport(
+      () => openOk,
+      (_req, call) => (call === 1 ? toolTurn : textTurn),
+    );
+    const harness = new Harness(config(), { transport }).registerTool({
+      name: "get_time",
+      description: "the time",
+      input_schema: {},
+      handler,
+    });
+
+    const session = await harness.connect();
+    const reply = await session.send("what time?");
+
+    expect(messageText(reply)).toBe("hello");
+    expect(handler).toHaveBeenCalledWith({ tz: "utc" });
+    // Second /rpc call carries a session.sendMessage with the tool_result.
+    const second = transport.requests[2]!;
+    const envelope = second.body as JsonRpcRequest<SendMessageParams>;
+    expect(envelope.method).toBe("session.sendMessage");
+    expect(envelope.params.message.content).toEqual([
+      { type: "tool_result", tool_use_id: "tu_1", content: "12:00" },
+    ]);
+  });
+
+  it("throws UnknownToolError for a dispatch:client call with no handler", async () => {
+    const transport = new MockTransport(
+      () => openOk,
+      () =>
+        assistantFrames([
+          {
+            type: "tool_use",
+            id: "tu_1",
+            name: "mystery",
+            input: {},
+            dispatch: "client",
+          },
+        ]),
+    );
+    // "mystery" is deliberately not registered; unrelated "get_time" is.
+    const session = await new Harness(config(), { transport })
+      .registerTool({
+        name: "get_time",
+        description: "the time",
+        input_schema: {},
+        handler: () => "noop",
+      })
+      .connect();
+
+    await expect(session.send("go")).rejects.toMatchObject({
+      constructor: UnknownToolError,
+      toolName: "mystery",
+    });
+  });
+
+  it("treats dispatch:null as absent and falls back to registry membership", async () => {
+    const handler = vi.fn(() => "12:00");
+    const transport = new MockTransport(
+      () => openOk,
+      (_req, call) =>
+        call === 1
+          ? assistantFrames([
+              {
+                type: "tool_use",
+                id: "tu_null",
+                name: "get_time",
+                input: {},
+                dispatch: null,
+              },
+            ])
+          : textTurn,
+    );
+    const session = await new Harness(config(), { transport })
+      .registerTool({
+        name: "get_time",
+        description: "the time",
+        input_schema: {},
+        handler,
+      })
+      .connect();
+
+    await session.send("go");
+
+    expect(handler).toHaveBeenCalledOnce();
+    const envelope = transport.requests[2]!
+      .body as JsonRpcRequest<SendMessageParams>;
+    expect(envelope.params.message.content).toEqual([
+      { type: "tool_result", tool_use_id: "tu_null", content: "12:00" },
+    ]);
+  });
+
+  it("uses dispatch over registry membership for same-name collisions", async () => {
+    const handler = vi.fn(() => "local");
+    const transport = new MockTransport(
+      () => openOk,
+      (_req, call) =>
+        call === 1
+          ? assistantFrames([
+              {
+                type: "tool_use",
+                id: "tu_server",
+                name: "get_time",
+                input: { owner: "server" },
+                dispatch: "mcp",
+              },
+              {
+                type: "tool_use",
+                id: "tu_client",
+                name: "get_time",
+                input: { owner: "client" },
+                dispatch: "client",
+              },
+            ])
+          : textTurn,
+    );
+    const session = await new Harness(config(), { transport })
+      .registerTool({
+        name: "get_time",
+        description: "the time",
+        input_schema: {},
+        handler,
+      })
+      .connect();
+
+    await session.send("go");
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith({ owner: "client" });
+    const envelope = transport.requests[2]!
+      .body as JsonRpcRequest<SendMessageParams>;
+    expect(envelope.params.message.content).toEqual([
+      { type: "tool_result", tool_use_id: "tu_client", content: "local" },
+    ]);
+  });
+
+  it("strips receive-only dispatch tags from outbound tool_use blocks", async () => {
+    const transport = new MockTransport(
+      () => openOk,
+      () => textTurn,
+    );
+    const session = await new Harness(config(), { transport }).connect();
+
+    await session.send({
+      role: "user",
+      content: [
+        {
+          type: "tool_use",
+          id: "tu_echo",
+          name: "get_time",
+          input: {},
+          dispatch: "client",
+        },
+      ],
+    });
+
+    const envelope = transport.requests[1]!
+      .body as JsonRpcRequest<SendMessageParams>;
+    expect(envelope.params.message.content).toEqual([
+      { type: "tool_use", id: "tu_echo", name: "get_time", input: {} },
+    ]);
+  });
+
+  it("executes only the client-dispatched call and surfaces the server-dispatched one via after_receive, without error", async () => {
+    // "issue_read" has no client handler. Its mcp tag must make it
+    // informational rather than an UnknownToolError.
+    const handler = vi.fn(() => "12:00");
+    const transport = new MockTransport(
+      () => openOk,
+      (_req, call) =>
+        call === 1
+          ? assistantFrames([
+              {
+                type: "tool_use",
+                id: "tu_mcp",
+                name: "issue_read",
+                input: { id: 9 },
+                dispatch: "mcp",
+              },
+              {
+                type: "tool_use",
+                id: "tu_client",
+                name: "get_time",
+                input: {},
+                dispatch: "client",
+              },
+            ])
+          : assistantFrames([{ type: "text", text: "done" }]),
+    );
+
+    // after_receive is the informational surface: it sees the full assistant
+    // turn, including the server-owned block that will not run.
+    const informational: ReturnType<typeof toolUses> = [];
+    const harness = new Harness(config(), { transport })
+      .registerTool({
+        name: "get_time",
+        description: "the time",
+        input_schema: {},
+        handler,
+      })
+      .setHooks({
+        after_receive: (message) => {
+          informational.push(
+            ...toolUses(message).filter(
+              (u) => u.dispatch === "mcp" || u.dispatch === "sandbox",
+            ),
+          );
+        },
+      });
+
+    const session = await harness.connect();
+    const reply = await session.send("go");
+
+    expect(messageText(reply)).toBe("done");
+    expect(handler).toHaveBeenCalledWith({});
+
+    // Only the client-owned call produced a tool_result.
+    const second = transport.requests[2]!;
+    const envelope = second.body as JsonRpcRequest<SendMessageParams>;
+    expect(envelope.params.message.content).toEqual([
+      { type: "tool_result", tool_use_id: "tu_client", content: "12:00" },
+    ]);
+
+    expect(informational).toHaveLength(1);
+    expect(informational[0]).toMatchObject({
+      id: "tu_mcp",
+      name: "issue_read",
+      dispatch: "mcp",
     });
   });
 });

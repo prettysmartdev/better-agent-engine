@@ -143,22 +143,31 @@ def assistant_text(text: str, events: list[Any] | None = None) -> list[dict[str,
 
 
 def assistant_tool_call(
-    tool_use_id: str, name: str, tool_input: dict[str, Any] | None = None
+    tool_use_id: str,
+    name: str,
+    tool_input: dict[str, Any] | None = None,
+    dispatch: str | None = None,
 ) -> list[dict[str, Any]]:
     """A one-frame `/rpc` reply: a terminal turn requesting a tool call."""
+    tool_use: dict[str, Any] = {
+        "type": "tool_use",
+        "id": tool_use_id,
+        "name": name,
+        "input": tool_input or {},
+    }
+    if dispatch is not None:
+        tool_use["dispatch"] = dispatch
+    return assistant_tool_calls([tool_use])
+
+
+def assistant_tool_calls(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A one-frame `/rpc` reply containing an assistant tool-use turn."""
     return [
         rpc_terminal(
             {
                 "message": {
                     "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": tool_use_id,
-                            "name": name,
-                            "input": tool_input or {},
-                        }
-                    ],
+                    "content": tool_uses,
                 },
                 "events": [],
             }

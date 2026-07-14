@@ -492,32 +492,71 @@ async fn enforcement_rejects_missing_garbage_and_client_keys_on_every_route() {
 
 /// Stage a private copy of the `baesrv` binary under `dir` and return its path.
 ///
-/// `CARGO_BIN_EXE_baesrv` points at Cargo's shared "uplift" path
-/// (`target/debug/baesrv`), which Cargo refreshes with a remove-then-write
-/// whenever an invocation's build configuration differs from the last one
-/// (e.g. `make build`/`make lint` running concurrently with `make test`, or a
-/// differing `CARGO_INCREMENTAL`) — and the build lock is not held while tests
-/// run. While an overlapping build re-links that path the source is missing
-/// (ENOENT) or briefly busy (ETXTBSY) for the *entire* duration of the link,
-/// which for a `--all-targets` clippy/build is tens of seconds, not the few
-/// milliseconds of a lone uplift. Copying the binary into the test's own temp
-/// dir — retrying on any transient error across a deadline that comfortably
-/// outlasts such a build — makes the spawns hermetic without changing anything
-/// the test asserts.
+/// Two independent hazards make the shared "uplift" binary
+/// (`target/debug/baesrv`) unreliable to read directly:
+///
+/// 1. **Wrong path.** `env!("CARGO_BIN_EXE_baesrv")` bakes the binary's
+///    *compile-time* absolute path into the test. When the compiled test
+///    executable is reused across a different mount than it was built under
+///    (e.g. built inside the dev container at `/workspace/...`, then run on the
+///    host at `/Users/…/worktrees/…`, with Cargo's fingerprint not
+///    invalidating on the env change), that baked path names a location that
+///    does not exist here — a *permanent* ENOENT, not a transient one. We
+///    therefore prefer the path derived from the running test executable
+///    (`current_exe()` → `…/target/debug/deps/<test>` → `../baesrv`), which is
+///    always correct for the environment we are actually running in, and fall
+///    back to the baked path only if that sibling is absent.
+/// 2. **Transient relink.** Cargo refreshes the uplift path with a
+///    remove-then-write whenever an invocation's build configuration differs
+///    (e.g. `make build`/`make lint` running concurrently with `make test`) and
+///    holds no build lock while tests run. During that window the source is
+///    missing (ENOENT) or briefly busy (ETXTBSY) for the *entire* duration of
+///    the link. We retry the copy across a deadline that comfortably outlasts
+///    such a build.
+///
+/// Copying the binary into the test's own temp dir makes the spawns hermetic
+/// without changing anything the test asserts.
 fn stage_baesrv_copy(dir: &std::path::Path) -> PathBuf {
-    let src = std::path::Path::new(env!("CARGO_BIN_EXE_baesrv"));
+    // Candidate sources, most-reliable first: the sibling of the running test
+    // executable (correct for *this* environment), then Cargo's baked path.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        // exe = …/target/debug/deps/<test-hash>; the uplifted bin is two levels up.
+        if let Some(bin) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|d| d.join("baesrv"))
+        {
+            candidates.push(bin);
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_BIN_EXE_baesrv")));
+
     let dst = dir.join("baesrv");
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut last_err = None;
     loop {
-        match std::fs::copy(src, &dst) {
-            Ok(_) => return dst,
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
+        // A candidate that never exists (hazard 1) is a permanent miss; skip
+        // straight to the next candidate rather than burning the deadline on it.
+        for src in &candidates {
+            match std::fs::copy(src, &dst) {
+                Ok(_) => return dst,
+                Err(e) => last_err = Some((src.clone(), e)),
             }
-            Err(e) => panic!(
-                "baesrv never became copyable at {} within 90s: {e}",
+        }
+        if std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        } else {
+            let (src, e) = last_err.expect("at least one copy attempt");
+            panic!(
+                "baesrv never became copyable (tried {}); last source {} within 90s: {e}",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 src.display()
-            ),
+            );
         }
     }
 }

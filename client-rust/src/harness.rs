@@ -7,8 +7,10 @@
 //!
 //! 1. Send the user turn via the `session.sendMessage` JSON-RPC method.
 //! 2. If the assistant response has no `tool_use` block, it is final — return it.
-//! 3. Otherwise dispatch each `tool_use` to its registered handler, collect the
-//!    `tool_result` blocks, send them back, and go to step 2.
+//! 3. Otherwise use the server's `dispatch` tag to execute only client-owned
+//!    `tool_use` blocks, collect only those `tool_result` blocks, send them
+//!    back, and go to step 2. Server-owned blocks remain visible through
+//!    [`Hooks::after_receive`], but are informational and never executed.
 //!
 //! Session open, events replay, and close stay plain REST (`POST`/`GET`/`DELETE`
 //! against `/api/v1/sessions…`); only the message loop is JSON-RPC. A
@@ -121,10 +123,31 @@ pub(crate) async fn run_loop<T: Transport>(
 
         let mut result_blocks = Vec::with_capacity(tool_uses.len());
         for mut call in tool_uses {
+            // `dispatch` is authoritative whenever a current server supplies
+            // it: a client/MCP name collision must still go to the side the
+            // server selected. Older servers omit it, so retain the original
+            // registry-membership routing as the compatibility fallback.
+            let owned_by_client = match call.dispatch.as_deref() {
+                Some("client") => true,
+                Some(_) => false,
+                None => tools.contains_key(&call.name),
+            };
+            if !owned_by_client {
+                // The complete assistant message, including this call, was
+                // already exposed via `after_receive` for UI/observability.
+                // Server-owned calls must not run client hooks or handlers and
+                // must not receive a synthetic tool_result.
+                continue;
+            }
+
             hooks.run_before_tool_call(&mut call).map_err(Error::Hook)?;
 
             let tool = tools
                 .get(&call.name)
+                // This path is deliberately reachable only for client-owned
+                // calls: a dispatch:"client" request can reveal a stale local
+                // declaration/handler mismatch, while a server-owned request
+                // never becomes an UnknownTool error.
                 .ok_or_else(|| Error::UnknownTool(call.name.clone()))?;
             let output = tool
                 .call(call.input.clone())
@@ -915,7 +938,7 @@ impl std::fmt::Debug for Session {
 mod tests {
     use super::*;
     use crate::tool::Tool;
-    use crate::types::ApiError;
+    use crate::types::{ApiError, ToolUse};
     use serde_json::json;
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
@@ -990,13 +1013,27 @@ mod tests {
     }
 
     fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> SendOutcome {
+        assistant_tool_uses(vec![tool_use(id, name, input, None)])
+    }
+
+    fn tool_use(
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        dispatch: Option<&str>,
+    ) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+            dispatch: dispatch.map(str::to_string),
+        }
+    }
+
+    fn assistant_tool_uses(tool_uses: Vec<ContentBlock>) -> SendOutcome {
         SendOutcome {
             result: SendMessageResult {
-                message: Message::assistant(vec![ContentBlock::ToolUse {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    input,
-                }]),
+                message: Message::assistant(tool_uses),
                 events: vec![],
             },
             notifications: vec![],
@@ -1032,7 +1069,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatches_tool_call_and_sends_result_back() {
+    async fn no_dispatch_falls_back_to_registered_tool_membership() {
         // Turn 1: model asks for the tool. Turn 2: model replies with text.
         let transport = MockTransport::new(vec![
             Ok(assistant_tool_use("tu_1", "get_current_time", json!({}))),
@@ -1167,9 +1204,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_is_an_error() {
-        let transport =
-            MockTransport::new(vec![Ok(assistant_tool_use("tu_1", "mystery", json!({})))]);
+    async fn client_dispatch_without_handler_raises_unknown_tool() {
+        let transport = MockTransport::new(vec![Ok(assistant_tool_uses(vec![tool_use(
+            "tu_1",
+            "mystery",
+            json!({}),
+            Some("client"),
+        )]))]);
         let tools = registry(vec![time_tool()]); // "mystery" not registered
         let mut hooks = Hooks::default();
 
@@ -1181,6 +1222,139 @@ mod tests {
             Error::UnknownTool(name) => assert_eq!(name, "mystery"),
             other => panic!("expected UnknownTool, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn null_dispatch_falls_back_to_registered_tool_membership() {
+        let assistant: Message = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "tu_null",
+                "name": "get_current_time",
+                "input": {},
+                "dispatch": null
+            }]
+        }))
+        .unwrap();
+        let transport = MockTransport::new(vec![
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: assistant,
+                    events: vec![],
+                },
+                notifications: vec![],
+            }),
+            Ok(assistant_text("done")),
+        ]);
+        let tools = registry(vec![time_tool()]);
+        let mut hooks = Hooks::default();
+
+        run_loop(&transport, &tools, &mut hooks, Message::user("go"))
+            .await
+            .unwrap();
+
+        let sent = transport.sent.borrow();
+        let Content::Blocks(blocks) = &sent[1].message.content else {
+            panic!("expected tool_result blocks");
+        };
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu_null"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_wins_over_registry_membership_for_same_name_collision() {
+        let transport = MockTransport::new(vec![
+            Ok(assistant_tool_uses(vec![
+                tool_use(
+                    "tu_server",
+                    "get_current_time",
+                    json!({ "owner": "server" }),
+                    Some("mcp"),
+                ),
+                tool_use(
+                    "tu_client",
+                    "get_current_time",
+                    json!({ "owner": "client" }),
+                    Some("client"),
+                ),
+            ])),
+            Ok(assistant_text("done")),
+        ]);
+        let tools = registry(vec![time_tool()]);
+        let mut hooks = Hooks::default();
+
+        run_loop(&transport, &tools, &mut hooks, Message::user("go"))
+            .await
+            .unwrap();
+
+        let sent = transport.sent.borrow();
+        let Content::Blocks(blocks) = &sent[1].message.content else {
+            panic!("expected tool_result blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tu_client"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mixed_dispatch_executes_only_client_result_and_surfaces_server_tool() {
+        // `issue_read` has no client handler. Its MCP tag must make it
+        // informational rather than an UnknownTool error.
+        let transport = MockTransport::new(vec![
+            Ok(assistant_tool_uses(vec![
+                tool_use("tu_mcp", "issue_read", json!({ "id": 9 }), Some("mcp")),
+                tool_use("tu_client", "get_current_time", json!({}), Some("client")),
+            ])),
+            Ok(assistant_text("done")),
+        ]);
+        let tools = registry(vec![time_tool()]);
+
+        // `after_receive` is the informational surface: it sees the full
+        // assistant turn, including server-owned blocks that will not run.
+        let informational = Arc::new(Mutex::new(Vec::<ToolUse>::new()));
+        let sink = informational.clone();
+        let mut hooks = Hooks::default().after_receive(move |message| {
+            sink.lock().unwrap().extend(
+                message.tool_uses().into_iter().filter(|call| {
+                    matches!(call.dispatch.as_deref(), Some("mcp") | Some("sandbox"))
+                }),
+            );
+            Ok(())
+        });
+
+        let out = run_loop(&transport, &tools, &mut hooks, Message::user("go"))
+            .await
+            .unwrap();
+        assert_eq!(out.text(), "done");
+
+        let sent = transport.sent.borrow();
+        assert_eq!(sent.len(), 2, "initial turn plus client-only tool result");
+        let Content::Blocks(blocks) = &sent[1].message.content else {
+            panic!("expected tool_result blocks");
+        };
+        assert_eq!(blocks.len(), 1, "server-owned calls have no client result");
+        match &blocks[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "tu_client");
+                assert_eq!(content, &json!("2026-07-06T00:00:00Z"));
+            }
+            other => panic!("expected tool_result block, got {other:?}"),
+        }
+        drop(sent);
+
+        let observed = informational.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].id, "tu_mcp");
+        assert_eq!(observed[0].name, "issue_read");
+        assert_eq!(observed[0].dispatch.as_deref(), Some("mcp"));
     }
 
     #[tokio::test]
@@ -1683,6 +1857,7 @@ mod tests {
                     id: "tu_manual".into(),
                     name: "run_shell_command".into(),
                     input: json!({ "command": "ls -la" }),
+                    dispatch: None,
                 }]),
                 events: vec![],
             },

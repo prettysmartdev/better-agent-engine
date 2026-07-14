@@ -26,6 +26,7 @@ import {
   type Transport,
 } from "./transport.js";
 import {
+  messageToWire,
   toMessage,
   toolUses,
   type ContentBlock,
@@ -337,7 +338,13 @@ export class Session implements SandboxRpc {
    *
    * Each turn is a `session.sendMessage` JSON-RPC call over `…/rpc`: live
    * `session.event` notifications are handed to the `on_event` hook, and the
-   * terminal `{message, events}` result drives the loop.
+   * terminal `{message, events}` result drives the loop. When a `tool_use`
+   * block's `dispatch` is `"client"` (or, for an older server that omits
+   * `dispatch`, when its name is in this harness's registered-tool set), the
+   * harness executes it and returns its `tool_result`. Every other block is
+   * server-owned: it is never executed and never receives a synthesized
+   * result, but the full assistant message — including server-owned blocks —
+   * is still passed to `after_receive` so applications can surface it.
    */
   async send(input: string | Message): Promise<Message> {
     let message = toMessage(input);
@@ -439,7 +446,9 @@ export class Session implements SandboxRpc {
       method: "POST",
       path: `/api/v1/sessions/${this.id}/rpc`,
       token: this.sessionKey,
-      body: this.rpcRequest("session.sendMessage", { message }),
+      body: this.rpcRequest("session.sendMessage", {
+        message: messageToWire(message),
+      }),
     });
 
     const notifications: SessionEvent[] = [];
@@ -467,14 +476,41 @@ export class Session implements SandboxRpc {
     return { jsonrpc: "2.0", id: this.nextRpcId++, method, params };
   }
 
-  /** Dispatch each `tool_use` to its handler, producing `tool_result` blocks. */
+  /**
+   * Dispatch each client-owned `tool_use` to its handler, producing
+   * `tool_result` blocks only for those. A block is client-owned when its
+   * `dispatch` is `"client"`, or — for an older server that omits `dispatch`
+   * — when its name is in the registered-tool set. Every other block
+   * (`dispatch` `"sandbox"`/`"mcp"`/anything else) is server-owned: the
+   * server already dispatched and answered it, so it is skipped here without
+   * running any hook or producing a result.
+   */
   private async dispatchTools(uses: ToolUse[]): Promise<ContentBlock[]> {
     const blocks: ContentBlock[] = [];
     for (const use of uses) {
+      // `dispatch` is authoritative whenever a current server supplies it: a
+      // client/MCP name collision must still go to the side the server
+      // selected. Older servers omit it, so retain registry-membership
+      // routing as the compatibility fallback.
+      const ownedByClient =
+        use.dispatch == null
+          ? this.tools.has(use.name)
+          : use.dispatch === "client";
+      if (!ownedByClient) {
+        // The complete assistant message, including this call, was already
+        // exposed via after_receive for UI/observability. Server-owned calls
+        // must not run client hooks or handlers and must not receive a
+        // synthesized tool_result.
+        continue;
+      }
+
       await this.runHook("before_tool_call", (h) => h(use));
 
       const tool = this.tools.get(use.name);
       if (tool === undefined) {
+        // Reachable only for client-owned calls: a dispatch:"client" request
+        // can reveal a stale local declaration/handler mismatch, while a
+        // server-owned request never reaches here.
         throw new UnknownToolError(use.name);
       }
 
