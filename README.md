@@ -17,7 +17,9 @@
 
 ---
 
-`better-agent-engine` (a.k.a. BAE) is a "hybrid agent system" which allows combining remote and local execution to develop powerful AI agents. BAE client harness libraries (TypeScript, Python, and Rust) are ultra-customizable with both custom and builtin tools such as files, sandboxes, subagents, and more. `baesrv` is a tiny rust-based server which adds server-side sandboxes, MCP servers, durable sessions, and full RBAC, permissions, and LLM provider handling. BAE is natively multi-client which allows multiple clients or users to connect simultaneously to work together when driving an agent session. This combination of hybrid architecture and multiplayer capabilities allows for any task from simple to highly complex to be solved by your agents.
+`better-agent-engine` (a.k.a. BAE) is a "hybrid agent system" which allows combining remote and local execution to develop powerful AI agents. BAE client harness libraries (TypeScript, Python, and Rust) are ultra-customizable with both custom and builtin tools such as files, sandboxes, subagents, and more. BAE is natively multi-client which allows multiple clients or users to connect simultaneously to work together when driving an agent session. 
+
+# Combine the powers of Local and Cloud to build multiplayer agents that solve real problems for you and your team.
 
 ## What you get
 
