@@ -3,23 +3,19 @@
 </p>
 
 <p align="center">
-  <strong>Build multiplayer AI agents that run tools wherever they belong —<br>
-  on your machine, in the cloud, or both at once — with durable, replayable sessions.</strong>
+  <strong>Build multiplayer AI agents that combine the powers of Local and Cloud.<br>
+  Ultra customizable harnesses, parallel clients, durable sessions, and builtin tools.</strong>
 </p>
 
 <p align="center">
   <img src="https://github.com/prettysmartdev/better-agent-engine/actions/workflows/test.yml/badge.svg">
 </p>
 
-<p align="center">
-  <em>Status: alpha. The codebase, tooling, and project specification are in place; APIs and SDKs will likely change.</em>
-</p>
-
 ---
 
-`better-agent-engine` (a.k.a. BAE) is a "hybrid agent system" which allows combining remote and local execution to develop powerful AI agents. BAE client harness libraries (TypeScript, Python, and Rust) are ultra-customizable with both custom and builtin tools such as files, sandboxes, subagents, and more. BAE is natively multi-client which allows multiple clients or users to connect simultaneously to work together when driving an agent session. 
+`better-agent-engine` (a.k.a. BAE) is a "hybrid agent system" which allows combining remote and local execution to develop powerful AI agents. BAE client harness libraries (TypeScript, Python, and Rust) are ultra-customizable with both custom and builtin tools such as files, sandboxes, subagents, and more. BAE is natively multi-client which allows many users to connect simultaneously to work together when driving an agent session.
 
-# Combine the powers of Local and Cloud to build multiplayer agents that solve real problems for you and your team.
+## Combine the powers of Local and Cloud to build multiplayer agents that solve real problems for you and your team.
 
 ## What you get
 
@@ -39,7 +35,6 @@
 - **Batteries included.** Built-in sandboxes, file tools, and server-managed MCP
   servers mean you're wiring together capabilities, not reimplementing them for every agent.
 
----
 
 ## The hybrid cloud/local model
 
@@ -82,7 +77,6 @@ graph LR
     H --- LT
 ```
 
----
 
 ## The sandbox model: real execution on your terms
 
@@ -110,7 +104,6 @@ boundary something *you* declare, not something you hope the model respects.
 the trust boundary (which images, which commands, local vs. remote, which
 directories) entirely in your control.
 
----
 
 ## Multiplayer: many drivers, many observers, one session
 
@@ -137,7 +130,6 @@ Because the server owns all state and streams every event, joining a session
 means catching the full history *and* the live tail with no gaps, no double-delivery,
 and resumable after a disconnect.
 
----
 
 ## MAX: a web dashboard for your BAE instance
 
@@ -161,7 +153,6 @@ do from any browser (desktop, tablet, or phone).
 
 Because MAX is a pure API client, everything it does is also possible via the `baesrv` admin API.
 
----
 
 ## Quickstart
 
@@ -176,6 +167,10 @@ message. Full walkthrough: [`docs/guides/quickstart.md`](docs/guides/quickstart.
 Want the dashboard? Run the `bae-max` variant instead —
 `ghcr.io/prettysmartdev/better-agent-engine:max` — and open MAX in your browser.
 See the [MAX Webapp guide](docs/guides/max-webapp.md).
+
+## Project status
+
+Early Beta. The project architecture is in place but libraries, APIs, and wire protocols will likely evolve.
 
 ## Learn more
 
