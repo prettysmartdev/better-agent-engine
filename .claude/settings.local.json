@@ -8,7 +8,14 @@
       "Bash(cargo fmt *)",
       "Bash(echo \"server exit: $?\")",
       "Bash(echo \"baectl exit: $?\")",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(git -C /workspace log --oneline -5)",
+      "Bash(git -C /workspace log --oneline -1 -- aspec/work-items/0009-mixed-turn-tool-dispatch.md)",
+      "Bash(npx --no-install playwright --version)",
+      "Bash(node /tmp/claude-1000/-workspace/b2c63440-78dc-40f9-93b9-10cca5e5194c/scratchpad/repro.mjs)",
+      "Bash(node -e \"console.log\\(require.resolve\\('playwright-core'\\)\\)\")",
+      "Bash(node -e \"console.log\\(require.resolve\\('@playwright/test'\\)\\)\")",
+      "Bash(git check-ignore *)"
     ]
   }
 }
