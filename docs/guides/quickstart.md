@@ -4,7 +4,8 @@ Get a BAE server running and send your first message in five steps.
 
 ## Prerequisites
 
-- Docker (for the production image), or a Rust toolchain to build from source.
+- Docker (to pull the published production image), or a Rust toolchain to build
+  from source (see [DEVELOPING.md](../../DEVELOPING.md)).
 - `curl` for the examples below.
 - A provider API key — e.g. `ANTHROPIC_API_KEY` — for any profile that calls a
   real LLM.
@@ -21,7 +22,7 @@ docker run -d \
   -p 8080:8080 \
   -v bae-data:/var/lib/bae \
   -e ANTHROPIC_API_KEY="sk-ant-…" \
-  better-agent-engine
+  ghcr.io/prettysmartdev/better-agent-engine:latest
 ```
 
 The container exposes port **8080** (client API). The admin port (8081) binds

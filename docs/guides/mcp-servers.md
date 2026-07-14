@@ -51,7 +51,7 @@ docker run -d \
   -v $(pwd)/examples/bae-config:/cfg:ro \
   -e BAE_CONFIG=/cfg/filesystem.toml \
   -e ANTHROPIC_API_KEY="sk-ant-…" \
-  better-agent-engine
+  ghcr.io/prettysmartdev/better-agent-engine:latest
 ```
 
 > **The `args` path `/data` is the directory the filesystem server can access.**

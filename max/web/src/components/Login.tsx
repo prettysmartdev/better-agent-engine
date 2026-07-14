@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { ApiError, login } from "../api/client";
+import { Wordmark } from "./ui";
 
 /** The login shell: posts the MAX password once to obtain a session cookie. */
 export default function Login({ onSuccess }: { onSuccess: () => void }) {
@@ -28,7 +29,7 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
   return (
     <div className="login-screen">
       <form className="login-card" onSubmit={submit}>
-        <span className="wordmark login-wordmark">max</span>
+        <Wordmark className="login-wordmark" />
         <p className="login-sub">Sign in to administer this BAE instance.</p>
         <label className="field">
           <span className="field-label">MAX password</span>

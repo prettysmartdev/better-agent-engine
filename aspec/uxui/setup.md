@@ -4,7 +4,7 @@
 
 Download:
 - Operators: pull the published Docker image (`docker pull ghcr.io/prettysmartdev/better-agent-engine`) or build it from source with `make image`.
-- Operators who also want the MAX web dashboard: pull the `-max`-suffixed tag from the same repository instead (`docker pull ghcr.io/prettysmartdev/better-agent-engine:latest-max`) or build it from source with `make image-max`. See [docs/guides/max-webapp.md](../../docs/guides/max-webapp.md).
+- Operators who also want the MAX web dashboard: pull the `-max`-suffixed tag from the same repository instead (`docker pull ghcr.io/prettysmartdev/better-agent-engine:max`) or build it from source with `make image-max`. See [docs/guides/max-webapp.md](../../docs/guides/max-webapp.md).
 - Agent developers: install a client library from its registry — `cargo add bae-rs`, `npm install @prettysmartdev/bae-ts`, or `uv add bae-py` — and point it at a running server.
 
 Initial configuration:

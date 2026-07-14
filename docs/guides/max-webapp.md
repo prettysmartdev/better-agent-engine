@@ -33,7 +33,7 @@ Pull the `-max`-suffixed tag from the same image repository as the default
 image — it is not a separate repository:
 
 ```sh
-docker pull ghcr.io/prettysmartdev/better-agent-engine:latest-max
+docker pull ghcr.io/prettysmartdev/better-agent-engine:max
 # or pin a version:
 docker pull ghcr.io/prettysmartdev/better-agent-engine:0.3.0-max
 ```
@@ -51,7 +51,7 @@ also publish MAX's web port (`3000` by default) alongside the client port:
 docker run \
   -p 8080:8080 -p 3000:3000 \
   -v bae-data:/var/lib/bae \
-  ghcr.io/prettysmartdev/better-agent-engine:latest-max
+  ghcr.io/prettysmartdev/better-agent-engine:max
 ```
 
 Do **not** publish the admin port (`8081`) — `bae-max` does not expose it,

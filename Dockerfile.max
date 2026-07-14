@@ -8,8 +8,8 @@
 # components, no lockstep"), the small duplication is preferred over coupling
 # the two image builds together.
 #
-#   docker build -f Dockerfile.max -t better-agent-engine-max .
-#   docker run -p 8080:8080 -p 3000:3000 -v bae-data:/var/lib/bae better-agent-engine-max
+#   docker build -f Dockerfile.max -t better-agent-engine:max .
+#   docker run -p 8080:8080 -p 3000:3000 -v bae-data:/var/lib/bae better-agent-engine:max
 
 FROM rust:1-bookworm AS rust-build
 WORKDIR /build

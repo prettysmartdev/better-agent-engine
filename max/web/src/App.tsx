@@ -11,7 +11,7 @@ type AuthStatus = "loading" | "authed" | "anon";
 
 export default function App() {
   const [auth, setAuth] = useState<AuthStatus>("loading");
-  const [tab, setTab] = useState<TabId>("keys");
+  const [tab, setTab] = useState<TabId>("sessions");
 
   // Any 401 from anywhere in the app forces the login view.
   useEffect(() => {

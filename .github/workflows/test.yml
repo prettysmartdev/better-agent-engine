@@ -1,0 +1,51 @@
+# Build, lint, and test every component on every push and pull request.
+#
+# CI uses the exact same entrypoints as local dev (aspec/devops/cicd.md): build the
+# dev toolchain image, then `make build` / `make lint` / `make test`. The dev image is
+# built with buildx + GitHub Actions layer caching and tagged with the name the
+# Makefile expects (DEV_IMAGE), so `ensure-dev-image` finds it and never rebuilds.
+name: test
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"] # tag pushes are handled by release.yml, not here
+  pull_request:
+  workflow_call: # let release.yml reuse this job as a gate
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-lint:
+    name: build · lint · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the dev image once, cached across runs, tagged as the Makefile's
+      # DEV_IMAGE default (awman-better-agent-engine:latest). `--load` puts it in the
+      # local engine so the subsequent `make` targets reuse it instead of rebuilding.
+      - name: Build dev toolchain image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          tags: awman-better-agent-engine:latest
+          load: true
+          cache-from: type=gha,scope=dev-image
+          cache-to: type=gha,scope=dev-image,mode=max
+
+      - name: Build all components
+        run: make build
+
+      - name: Lint all components
+        run: make lint
+
+      - name: Test all components
+        run: make test

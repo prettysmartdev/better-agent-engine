@@ -9,6 +9,10 @@ vi.mock("./api/client", async (importOriginal) => {
     logout: vi.fn().mockResolvedValue(undefined),
     listKeys: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
     listProfiles: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+    listSessions: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+    listSessionEvents: vi
+      .fn()
+      .mockResolvedValue({ items: [], next_cursor: null }),
   };
 });
 

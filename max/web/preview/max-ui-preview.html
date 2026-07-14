@@ -1,0 +1,199 @@
+<title>MAX webapp — UI changes preview</title>
+<style>
+/*__APPCSS__*/
+
+/* Viewer theme-toggle support (the compiled app CSS only keys off the OS
+   preference; these let the artifact's light/dark toggle drive the tokens). */
+:root[data-theme="light"]{--text:#4b4754;--text-h:#08060d;--muted:#6b6375;--bg:#fff;--bg-2:#f6f6f8;--panel:#fff;--border:#e5e4e7;--border-strong:#cbc9d0;--accent:#2563eb;--accent-contrast:#fff;--danger:#b91c1c;--ok:#15803d;--warn-bg:#fdf6e3;--warn-border:#e6d9a8;--warn-text:#7a5b00;}
+:root[data-theme="dark"]{--text:#c8ccd4;--text-h:#f3f4f6;--muted:#9aa0ac;--bg:#121317;--bg-2:#191b21;--panel:#1b1d24;--border:#2e303a;--border-strong:#3c3f4b;--accent:#4f8cff;--accent-contrast:#06122b;--danger:#f87171;--ok:#4ade80;--warn-bg:#2a2412;--warn-border:#4d431f;--warn-text:#e8cf88;}
+
+/* Preview harness chrome (namespaced .pv-*, never touches app classes). */
+.pv-root{background:var(--bg-2);min-height:100vh;}
+.pv-page{max-width:1200px;margin:0 auto;padding:44px 24px 96px;}
+.pv-kicker{font-family:var(--mono);font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#00d4ff;margin:0 0 8px;}
+.pv-lead{font-size:26px;line-height:1.15;color:var(--text-h);margin:0 0 8px;font-weight:700;letter-spacing:-0.01em;text-wrap:balance;}
+.pv-note{color:var(--muted);margin:0 0 8px;max-width:64ch;}
+.pv-note code{font-family:var(--mono);font-size:.9em;color:var(--text-h);}
+.pv-sections{display:flex;flex-direction:column;gap:48px;margin-top:44px;}
+.pv-eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:12px;margin:0 0 14px;}
+.pv-eyebrow::before{content:"";width:22px;height:2px;background:#00d4ff;flex:none;}
+.pv-eyebrow b{color:var(--text-h);font-weight:600;letter-spacing:.02em;}
+.pv-frame{border:1px solid var(--border);border-radius:14px;background:var(--bg);overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+.pv-pad{padding:24px;}
+.pv-caption{color:var(--muted);font-size:13.5px;margin:12px 2px 0;line-height:1.5;}
+</style>
+
+<div class="pv-root">
+  <div class="pv-page">
+    <p class="pv-kicker">BAE · MAX dashboard</p>
+    <h1 class="pv-lead">Webapp UI changes — rendered from the app's own stylesheet</h1>
+    <p class="pv-note">Each frame below is real component markup styled by the <em>compiled</em> <code>index.css</code> that ships with the build — a faithful preview of the five requested changes. Use the viewer's light/dark toggle; both themes are wired.</p>
+
+    <div class="pv-sections">
+
+      <!-- 5) Logo + 4) tab order -->
+      <section>
+        <p class="pv-eyebrow"><b>Navbar</b> — stacked BAE/MAX logo &amp; reordered tabs</p>
+        <div class="pv-frame">
+          <header class="topbar">
+            <span class="wordmark" role="img" aria-label="BAE MAX"><span class="wordmark-bae" aria-hidden="true">BAE</span><span class="wordmark-max" aria-hidden="true">MAX</span></span>
+            <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+              <button class="tab tab-active" role="tab" aria-selected="true">Sessions</button>
+              <button class="tab" role="tab">Profiles</button>
+              <button class="tab" role="tab">Keys</button>
+            </nav>
+            <button class="btn btn-ghost logout">Log out</button>
+          </header>
+        </div>
+        <p class="pv-caption">Monospace <b>BAE</b> (neon-blue, from the readme logo palette) over <b>MAX</b> (white) on a navy chip — the six letters line up as a 3×2 grid. Tabs now read Sessions · Profiles · Keys.</p>
+      </section>
+
+      <!-- 1) Empty state -->
+      <section>
+        <p class="pv-eyebrow"><b>Empty state</b> — centered, contained</p>
+        <div class="pv-frame pv-pad">
+          <div class="empty-state">
+            <h2>No open sessions</h2>
+            <p>A session is an agent run against a profile. Open a session with a client key to see it here; its events stream live into the graph view.</p>
+            <button class="btn btn-ghost">Include closed &amp; error sessions</button>
+          </div>
+        </div>
+        <p class="pv-caption">Flex-centered vertically and horizontally with <code>overflow-wrap: anywhere</code> — title, copy, and action stay centered and never spill the dashed box (this pattern backs every empty state: Sessions, Profiles, Keys).</p>
+      </section>
+
+      <!-- 3) Sessions list -->
+      <section>
+        <p class="pv-eyebrow"><b>Sessions list</b> — roomier rows with live metrics</p>
+        <div class="pv-frame pv-pad">
+          <ul class="session-list">
+            <li class="session-card" role="button" tabindex="0">
+              <div class="session-card-main">
+                <div class="session-card-headline">
+                  <code class="session-card-id">ses_8f3a91c2</code>
+                  <span class="badge state-open">open</span>
+                </div>
+                <div class="session-card-sub muted">pro_agent_prod · client bae-cli/1.4.0</div>
+              </div>
+              <div class="session-stats">
+                <div class="stat"><span class="stat-value">128</span><span class="stat-label">Events</span></div>
+                <div class="stat"><span class="stat-value">3</span><span class="stat-label">Clients</span></div>
+                <div class="stat"><span class="stat-value">12s ago</span><span class="stat-label">Last activity</span></div>
+                <div class="stat"><span class="stat-value">Jul 14, 01:22</span><span class="stat-label">Created</span></div>
+              </div>
+              <div class="session-card-action"><button class="btn btn-ghost btn-sm">Open →</button></div>
+            </li>
+            <li class="session-card" role="button" tabindex="0">
+              <div class="session-card-main">
+                <div class="session-card-headline">
+                  <code class="session-card-id">ses_41d0ba7e</code>
+                  <span class="badge state-open">open</span>
+                </div>
+                <div class="session-card-sub muted">pro_research · client python-sdk/0.9.2</div>
+              </div>
+              <div class="session-stats">
+                <div class="stat"><span class="stat-value">500+</span><span class="stat-label">Events</span></div>
+                <div class="stat"><span class="stat-value">1</span><span class="stat-label">Clients</span></div>
+                <div class="stat"><span class="stat-value">4m ago</span><span class="stat-label">Last activity</span></div>
+                <div class="stat"><span class="stat-value">Jul 14, 00:47</span><span class="stat-label">Created</span></div>
+              </div>
+              <div class="session-card-action"><button class="btn btn-ghost btn-sm">Open →</button></div>
+            </li>
+            <li class="session-card" role="button" tabindex="0">
+              <div class="session-card-main">
+                <div class="session-card-headline">
+                  <code class="session-card-id">ses_0c9927fa</code>
+                  <span class="badge state-error">error</span>
+                </div>
+                <div class="session-card-sub muted">pro_agent_prod · client bae-cli/1.3.8</div>
+              </div>
+              <div class="session-stats">
+                <div class="stat"><span class="stat-value">37</span><span class="stat-label">Events</span></div>
+                <div class="stat"><span class="stat-value">0</span><span class="stat-label">Clients</span></div>
+                <div class="stat"><span class="stat-value">2h ago</span><span class="stat-label">Last activity</span></div>
+                <div class="stat"><span class="stat-value">Jul 13, 23:10</span><span class="stat-label">Created</span></div>
+              </div>
+              <div class="session-card-action"><button class="btn btn-ghost btn-sm">Open →</button></div>
+            </li>
+          </ul>
+        </div>
+        <p class="pv-caption">Dense table → luxurious cards. Each surfaces the event count at load (<code>500+</code> when paged), connected-client count, and time since last activity, alongside profile, client, state and created time.</p>
+      </section>
+
+      <!-- 2) Session graph layout -->
+      <section>
+        <p class="pv-eyebrow"><b>Session graph</b> — ¼ event list, ¾ details</p>
+        <div class="pv-frame pv-pad">
+          <div class="session-detail">
+            <div class="tab-head detail-toolbar">
+              <button class="btn btn-ghost">← Sessions</button>
+              <div class="detail-heading">
+                <code class="session-id">ses_8f3a91c2</code>
+                <span class="status-badge status-live"><span class="live-dot" aria-hidden="true"></span> live</span>
+              </div>
+            </div>
+            <div class="graph-legend" aria-label="Event categories">
+              <span class="legend-item"><span class="shape shape-pill" style="--marker-color:#2563eb"></span>Client turn</span>
+              <span class="legend-item"><span class="shape shape-circle" style="--marker-color:#0d9488"></span>Provider</span>
+              <span class="legend-item"><span class="shape shape-square" style="--marker-color:#d97706"></span>Tool call</span>
+              <span class="legend-item"><span class="shape shape-hexagon" style="--marker-color:#7c3aed"></span>MCP exchange</span>
+              <span class="legend-item"><span class="shape shape-diamond" style="--marker-color:#dc2626"></span>Session lifecycle</span>
+              <span class="legend-item"><span class="shape shape-triangle" style="--marker-color:#6b7280"></span>Join / driver</span>
+            </div>
+            <div class="graph-layout">
+              <div class="graph-main">
+                <div class="graph-scroll" style="height:380px;position:relative">
+                  <div class="graph-canvas" style="height:384px">
+                    <div class="graph-node-row" style="top:0px;height:64px">
+                      <div class="graph-node" role="button"><span class="shape shape-diamond" style="--marker-color:#dc2626"></span><span class="node-body"><span class="node-type">session.open</span><span class="node-meta">#1 · key_prod · 01:22:03Z</span></span></div>
+                    </div>
+                    <div class="graph-node-row" style="top:64px;height:64px">
+                      <div class="graph-node" role="button"><span class="shape shape-pill" style="--marker-color:#2563eb"></span><span class="node-body"><span class="node-type">client.message.send</span><span class="node-meta">#12 · key_prod · 01:23:40Z</span></span></div>
+                    </div>
+                    <div class="graph-node-row" style="top:128px;height:64px">
+                      <div class="graph-node" role="button"><span class="shape shape-circle" style="--marker-color:#0d9488"></span><span class="node-body"><span class="node-type">provider.request</span><span class="node-meta">#28 · key_prod · 01:24:12Z</span></span></div>
+                    </div>
+                    <div class="graph-node-row" style="top:192px;height:64px">
+                      <div class="graph-node graph-node-selected" role="button" aria-pressed="true"><span class="shape shape-square" style="--marker-color:#d97706"></span><span class="node-body"><span class="node-type">tool.call</span><span class="node-meta">#42 · key_prod · 01:24:51Z</span></span></div>
+                    </div>
+                    <div class="graph-node-row" style="top:256px;height:64px">
+                      <div class="graph-node" role="button"><span class="shape shape-hexagon" style="--marker-color:#7c3aed"></span><span class="node-body"><span class="node-type">mcp.request</span><span class="node-meta">#55 · key_prod · 01:25:07Z</span></span></div>
+                    </div>
+                    <div class="graph-node-row" style="top:320px;height:64px">
+                      <div class="graph-node" role="button"><span class="shape shape-square" style="--marker-color:#d97706"></span><span class="node-body"><span class="node-type">tool.result</span><span class="node-meta">#61 · key_prod · 01:25:19Z</span></span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="panel-slot">
+                <aside class="detail-panel" aria-label="Event 42 detail">
+                  <div class="detail-head">
+                    <h2 class="detail-title"><span class="shape shape-square" style="--marker-color:#d97706"></span><code>tool.call</code></h2>
+                    <button class="btn btn-ghost btn-sm" aria-label="Close detail panel">✕</button>
+                  </div>
+                  <dl class="detail-meta">
+                    <dt>Event id</dt><dd>42</dd>
+                    <dt>Category</dt><dd>Tool call</dd>
+                    <dt>Client key</dt><dd>key_prod_7f21</dd>
+                    <dt>Created</dt><dd>2026-07-14T01:24:51Z</dd>
+                  </dl>
+                  <h3 class="detail-subtitle">Payload</h3>
+                  <pre class="payload">{
+  "tool": "search_files",
+  "arguments": {
+    "query": "connection pool",
+    "path": "server/src",
+    "max_results": 20
+  },
+  "call_id": "call_a91f7"
+}</pre>
+                </aside>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="pv-caption">The screen breaks out to a much wider canvas (<code>max-width: 1600px</code>). The event list is pinned to ~¼ width; the details pane takes the remainder. With nothing selected, that pane shows a “Select an event…” placeholder instead.</p>
+      </section>
+
+    </div>
+  </div>
+</div>

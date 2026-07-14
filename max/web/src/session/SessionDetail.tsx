@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { SessionEvent, SessionListItem } from "../api/types";
+import type { SessionListItem } from "../api/types";
 import { EVENT_CATEGORIES } from "../api/eventTypes";
 import { useSessionStream, type ConnectFn } from "./useSessionStream";
 import EventGraph from "./EventGraph";
@@ -74,24 +74,21 @@ export default function SessionDetail({
             />
           )}
         </div>
-        {selected && (
-          <SelectedPanel event={selected} onClose={() => setSelectedId(null)} />
-        )}
+        <div className={`panel-slot ${selected ? "" : "panel-slot-empty"}`}>
+          {selected ? (
+            <EventDetailPanel
+              event={selected}
+              onClose={() => setSelectedId(null)}
+            />
+          ) : (
+            <div className="detail-panel detail-panel-placeholder">
+              <p>
+                Select an event on the left to inspect its payload and metadata.
+              </p>
+            </div>
+          )}
+        </div>
       </div>
-    </div>
-  );
-}
-
-function SelectedPanel({
-  event,
-  onClose,
-}: {
-  event: SessionEvent;
-  onClose: () => void;
-}) {
-  return (
-    <div className="panel-slot">
-      <EventDetailPanel event={event} onClose={onClose} />
     </div>
   );
 }

@@ -18,6 +18,7 @@
 PROJECT    := better-agent-engine
 DEV_IMAGE  ?= awman-$(PROJECT):latest
 IMAGE      ?= $(PROJECT):latest
+MAX_IMAGE  ?= $(PROJECT):max
 COMPONENTS := server baectl client-rust client-typescript client-python max
 PORT       ?= 8080
 
@@ -74,10 +75,10 @@ endif
 # intentionally NOT declared .PHONY — make ignores pattern rules for .PHONY
 # targets.
 .PHONY: help engine dev-image ensure-engine ensure-dev-image shell image image-max run \
-	build test lint fmt clean check-static image-smoke
+	run/baesrv run/baemax build test lint fmt clean check-static image-smoke release
 
 help: ## Show available targets
-	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_/-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo
 	@echo "  <verb>-<component>  Run one verb for one component, e.g. test-server,"
 	@echo "                      lint-client-python. Components: $(COMPONENTS)"
@@ -115,7 +116,7 @@ image: ensure-engine ## Build the production server image (Dockerfile)
 	$(ENGINE) build --file Dockerfile --tag $(IMAGE) .
 
 image-max: ensure-engine ## Build the bae-max image variant (Dockerfile.max)
-	$(ENGINE) build --file Dockerfile.max --tag $(IMAGE)-max .
+	$(ENGINE) build --file Dockerfile.max --tag $(MAX_IMAGE) .
 
 # Static-binary regression guard for baectl. Runs inside the dev image, which
 # carries the host-arch <arch>-unknown-linux-musl target + musl-tools, and asserts the
@@ -129,6 +130,18 @@ check-static: ensure-dev-image ## Verify baectl builds as a static musl binary
 # the shipped binary is genuinely self-contained/static.
 image-smoke: image ## Build the image and run `baectl --help` in it
 	$(ENGINE) run --rm $(IMAGE) baectl --help
+
+# One-command release: validate locally, publish all three client SDKs to their
+# registries with your LOCAL credentials, and push the vX.Y.Z tag (which triggers
+# the GHCR image build in .github/workflows/release.yml). Idempotent and re-runnable;
+# each step offers to skip on failure. See scripts/release.sh for the full flow.
+#   make release VERSION=v0.1.0
+release: ## Cut a release: publish SDKs + push tag (VERSION=vX.Y.Z)
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make release VERSION=vX.Y.Z   (e.g. make release VERSION=v0.1.0)" >&2; \
+		exit 1; \
+	fi
+	@bash scripts/release.sh "$(VERSION)"
 
 # Named so the loopback-only admin API is reachable via exec, e.g.:
 #   docker exec better-agent-engine-dev curl -s http://127.0.0.1:8081/admin/v1/keys …
@@ -145,6 +158,46 @@ run: ensure-dev-image ## Run the server in the dev container (port $(PORT))
 		--publish $(PORT):$(PORT) \
 		--env ANTHROPIC_API_KEY="$$ANTHROPIC_API_KEY" \
 		$(DEV_IMAGE) make -C server run
+
+# Build and run the *production* container images locally with the detected
+# engine. Unlike `run` (baesrv inside the dev image), these launch the actual
+# shipped images detached, each first tearing down any prior container of the
+# same name so a re-run never fails on a name clash. Both mount bae-max-demo/'s
+# config (the [providers] registry + GitHub MCP server) at /etc/bae and forward
+# ANTHROPIC_API_KEY / GITHUB_TOKEN from the environment (resolved server-side at
+# call time, never persisted). `--user 0:0` sidesteps named-volume ownership
+# friction on a freshly created data volume. The named volumes are created
+# explicitly because Apple `container` — unlike docker — does not auto-create
+# them on `run`.
+run/baesrv: image ## Build and run the production baesrv image (port 8080)
+	-$(ENGINE) stop bae >/dev/null 2>&1
+	-$(ENGINE) rm bae >/dev/null 2>&1
+	-$(ENGINE) volume create bae-data >/dev/null 2>&1
+	$(ENGINE) run -d --name bae \
+		--user 0:0 \
+		--publish 8080:8080 \
+		--volume bae-data:/var/lib/bae \
+		--volume "$(CURDIR)/bae-max-demo:/etc/bae:ro" \
+		--env ANTHROPIC_API_KEY="$$ANTHROPIC_API_KEY" \
+		--env GITHUB_TOKEN="$$GITHUB_TOKEN" \
+		--env BAE_CONFIG=/etc/bae/config.toml \
+		$(IMAGE)
+	@echo "baesrv → container 'bae' on http://localhost:8080  (logs: $(ENGINE) logs -f bae)"
+
+run/baemax: image-max ## Build and run the bae-max image (ports 8080 + 3000)
+	-$(ENGINE) stop bae-max >/dev/null 2>&1
+	-$(ENGINE) rm bae-max >/dev/null 2>&1
+	-$(ENGINE) volume create bae-max-data >/dev/null 2>&1
+	$(ENGINE) run -d --name bae-max \
+		--user 0:0 \
+		--publish 8080:8080 --publish 3000:3000 \
+		--volume bae-max-data:/var/lib/bae \
+		--volume "$(CURDIR)/bae-max-demo:/etc/bae:ro" \
+		--env ANTHROPIC_API_KEY="$$ANTHROPIC_API_KEY" \
+		--env GITHUB_TOKEN="$$GITHUB_TOKEN" \
+		--env BAE_CONFIG=/etc/bae/config.toml \
+		$(MAX_IMAGE)
+	@echo "bae-max → container 'bae-max': MAX on http://localhost:3000, baesrv on http://localhost:8080  (logs: $(ENGINE) logs -f bae-max)"
 
 build: ## Build every component
 test: ## Test every component

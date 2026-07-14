@@ -19,9 +19,9 @@ Reasoning:
 
 ### Principle 3: Independent components, identical verbs
 Description:
-- server/, client-rust/, client-typescript/, and client-python/ are each independently buildable, testable, versioned, and publishable, and every component Makefile exposes the same verbs (build, test, lint, fmt, clean).
+- server/, client-rust/, client-typescript/, and client-python/ are each independently buildable and testable, and every component Makefile exposes the same verbs (build, test, lint, fmt, clean). They publish together at a single shared version — one `vX.Y.Z` release stamps all three SDKs and both images (see devops/cicd.md) — each SDK going to its own registry.
 Reasoning:
-- Independent release cadence avoids lockstep versioning pain across three registries and a Docker image; uniform verbs keep local dev and CI one simple loop over components.
+- Uniform per-component build/test verbs keep local dev and CI one simple loop over components; a single shared release version gives users one number to reason about across the client libraries and the server image, and keeps `/api/v1` the one compatibility contract to track.
 
 ## High-level Architecture:
 ```mermaid

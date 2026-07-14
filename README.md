@@ -164,15 +164,16 @@ Because MAX is a pure API client, everything it does is also possible via the `b
 ## Quickstart
 
 ```sh
-docker run -p 8080:8080 -v bae-data:/var/lib/bae better-agent-engine
+docker run -p 8080:8080 -v bae-data:/var/lib/bae ghcr.io/prettysmartdev/better-agent-engine:latest
 curl http://localhost:8080/healthz
 ```
 
 Then create a profile and client key, exchange the key for a session, and send a
 message. Full walkthrough: [`docs/guides/quickstart.md`](docs/guides/quickstart.md).
 
-Want the dashboard? Run the `bae-max` image variant instead and open MAX in your
-browser — see the [MAX Webapp guide](docs/guides/max-webapp.md).
+Want the dashboard? Run the `bae-max` variant instead —
+`ghcr.io/prettysmartdev/better-agent-engine:max` — and open MAX in your browser.
+See the [MAX Webapp guide](docs/guides/max-webapp.md).
 
 ## Learn more
 
@@ -189,7 +190,8 @@ browser — see the [MAX Webapp guide](docs/guides/max-webapp.md).
 ## Contributing & development
 
 Building from source, running the tests, and the project specification live in
-**[DEVELOPING.md](DEVELOPING.md)**.
+**[DEVELOPING.md](DEVELOPING.md)**. Cutting a release is documented in
+**[RELEASING.md](RELEASING.md)**.
 
 ## License
 

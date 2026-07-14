@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
+import { Wordmark } from "./ui";
 
 export type TabId = "keys" | "profiles" | "sessions";
 
 const TABS: { id: TabId; label: string }[] = [
-  { id: "keys", label: "Keys" },
-  { id: "profiles", label: "Profiles" },
   { id: "sessions", label: "Sessions" },
+  { id: "profiles", label: "Profiles" },
+  { id: "keys", label: "Keys" },
 ];
 
 /**
@@ -26,7 +27,7 @@ export default function Layout({
   return (
     <div className="app">
       <header className="topbar">
-        <span className="wordmark">max</span>
+        <Wordmark />
         <nav className="tabs" role="tablist" aria-label="Dashboard sections">
           {TABS.map((t) => (
             <button

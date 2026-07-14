@@ -71,7 +71,7 @@ for the full precedence.
 Rotate the admin key with `--rotate-admin-key` on the next `serve` startup:
 
 ```sh
-docker run ... better-agent-engine baesrv --rotate-admin-key
+docker run ... ghcr.io/prettysmartdev/better-agent-engine:latest baesrv --rotate-admin-key
 # or, restarting an existing container's process with an extra flag,
 # however your deployment passes CLI args through.
 ```
