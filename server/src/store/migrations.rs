@@ -66,10 +66,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "profiles_sandboxes",
         sql: include_str!("migrations/0007_profiles_sandboxes.sql"),
     },
+    Migration {
+        version: 8,
+        name: "sessions_subagent_tools",
+        sql: include_str!("migrations/0008_sessions_subagent_tools.sql"),
+    },
 ];
 
 /// The highest migration version this binary knows how to apply.
-pub const LATEST_VERSION: i64 = 7;
+pub const LATEST_VERSION: i64 = 8;
 
 /// A migration-runner failure.
 #[derive(Debug)]

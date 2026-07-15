@@ -33,6 +33,10 @@ pub const DEFAULT_SHUTDOWN_SECS: u64 = 30;
 /// may stay away before the next `session.sendMessage` arrival treats the turn
 /// as abandoned and releases the session's FIFO gate.
 pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 120;
+/// Default remote-subagent timeout, in seconds.
+pub const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
+/// Default count of concurrently running remote subagents per session.
+pub const DEFAULT_MAX_SUBAGENTS_PER_SESSION: usize = 8;
 
 /// Which container engine backs sandbox execution (`BAE_SANDBOX_DRIVER`).
 ///
@@ -73,6 +77,10 @@ pub struct Config {
     /// How long a paused turn may await its owner's continuation before being
     /// treated as abandoned (`BAE_TURN_TIMEOUT`).
     pub turn_timeout: Duration,
+    /// Default timeout for one remote subagent (`BAE_SUBAGENT_TIMEOUT`).
+    pub subagent_timeout: Duration,
+    /// Concurrent remote-subagent cap (`BAE_MAX_SUBAGENTS_PER_SESSION`).
+    pub max_subagents_per_session: usize,
     /// Which container engine backs sandbox execution (`BAE_SANDBOX_DRIVER`,
     /// `docker` by default or `apple-container`).
     pub sandbox_driver: SandboxDriverKind,
@@ -165,6 +173,16 @@ impl Config {
             "BAE_TURN_TIMEOUT",
             DEFAULT_TURN_TIMEOUT_SECS,
         )?);
+        let subagent_timeout = Duration::from_secs(parse_secs(
+            get,
+            "BAE_SUBAGENT_TIMEOUT",
+            DEFAULT_SUBAGENT_TIMEOUT_SECS,
+        )?);
+        let max_subagents_per_session = parse_secs(
+            get,
+            "BAE_MAX_SUBAGENTS_PER_SESSION",
+            DEFAULT_MAX_SUBAGENTS_PER_SESSION as u64,
+        )? as usize;
         let sandbox_driver = parse_sandbox_driver(get)?;
 
         Ok(Config {
@@ -174,6 +192,8 @@ impl Config {
             log,
             shutdown_timeout,
             turn_timeout,
+            subagent_timeout,
+            max_subagents_per_session,
             sandbox_driver,
         })
     }

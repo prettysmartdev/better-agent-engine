@@ -16,6 +16,8 @@ use crate::events::EventType;
 pub const SESSION_ID_PREFIX: &str = "ses_";
 /// Prefix on every event id.
 pub const EVENT_ID_PREFIX: &str = "evt_";
+/// Prefix on every remotely tracked subagent id.
+pub const SUBAGENT_ID_PREFIX: &str = "sba_";
 
 /// Lifecycle state of a session (mirrors the `sessions.state` CHECK constraint).
 pub const STATE_OPEN: &str = "open";
@@ -44,6 +46,9 @@ pub struct SessionRecord {
     /// dispatched **server-side** against the session's remote sandbox by
     /// `run_turn`, never returned to the client.
     pub sandbox_tools: Value,
+    /// Per-client remote-subagent declarations. Unlike `client_tools`, these
+    /// are executed by the server in the session's existing remote sandbox.
+    pub subagent_tools: Value,
     pub created_at: String,
     pub closed_at: Option<String>,
 }
@@ -60,7 +65,7 @@ pub struct EventRecord {
 }
 
 const SESSION_COLS: &str = "id, client_key_id, profile_id, state, client_version, client_tools, \
-     sandbox_tools, created_at, closed_at";
+     sandbox_tools, subagent_tools, created_at, closed_at";
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
@@ -76,6 +81,11 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
             .unwrap_or(Value::Null),
         sandbox_tools: row
             .get::<_, String>("sandbox_tools")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null),
+        subagent_tools: row
+            .get::<_, String>("subagent_tools")
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Value::Null),
@@ -99,15 +109,17 @@ pub fn create_session(
     client_version: Option<&str>,
     client_tools: &Value,
     sandbox_tools: &Value,
+    subagent_tools: &Value,
 ) -> rusqlite::Result<SessionRecord> {
     let id = generate_id(SESSION_ID_PREFIX);
     let tools_by_client = serde_json::json!({ client_key_id: client_tools });
     let sandbox_by_client = serde_json::json!({ client_key_id: sandbox_tools });
+    let subagent_by_client = serde_json::json!({ client_key_id: subagent_tools });
     let sql = format!(
         "INSERT INTO sessions \
            (id, client_key_id, profile_id, state, client_version, client_tools, \
-            sandbox_tools, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW_SQL}) \
+            sandbox_tools, subagent_tools, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW_SQL}) \
          RETURNING {SESSION_COLS}"
     );
     conn.query_row(
@@ -120,6 +132,7 @@ pub fn create_session(
             client_version,
             tools_by_client.to_string(),
             sandbox_by_client.to_string(),
+            subagent_by_client.to_string(),
         ],
         row_to_session,
     )
@@ -151,6 +164,17 @@ pub fn set_client_sandbox_tools(
     tools: &Value,
 ) -> rusqlite::Result<()> {
     set_per_client_column(conn, session_id, "sandbox_tools", client_key_id, tools)
+}
+
+/// The `subagent_tools` twin: upsert one client's remote-subagent
+/// declarations without affecting any other driver's entry.
+pub fn set_client_subagent_tools(
+    conn: &Connection,
+    session_id: &str,
+    client_key_id: &str,
+    tools: &Value,
+) -> rusqlite::Result<()> {
+    set_per_client_column(conn, session_id, "subagent_tools", client_key_id, tools)
 }
 
 /// Shared upsert behind [`set_client_tools`] / [`set_client_sandbox_tools`].
@@ -447,6 +471,7 @@ mod tests {
                 Some("1.0.0"),
                 &json!([{ "name": "only_a" }]),
                 &json!([]),
+                &json!([]),
             )
             .unwrap();
 
@@ -492,6 +517,7 @@ mod tests {
                 Some("1.0.0"),
                 &json!([]),
                 &json!([]),
+                &json!([]),
             )
             .unwrap();
             let s_closed = create_session(
@@ -502,6 +528,7 @@ mod tests {
                 None,
                 &json!([]),
                 &json!([]),
+                &json!([]),
             )
             .unwrap();
             let s_error = create_session(
@@ -510,6 +537,7 @@ mod tests {
                 "pro_1",
                 STATE_ERROR,
                 None,
+                &json!([]),
                 &json!([]),
                 &json!([]),
             )

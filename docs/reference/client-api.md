@@ -134,6 +134,18 @@ Auth: **client key**.
       "description": "Run an arbitrary shell command inside the configured sandbox.",
       "input_schema": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] }
     }
+  ],
+  "subagent_tools": [
+    {
+      "name": "launch_subagent",
+      "description": "Launch a CLI subagent (claude, codex) to work on a task in the background.",
+      "input_schema": { "type": "object", "properties": { "harness": { "type": "string" }, "model": { "type": "string" }, "prompt": { "type": "string" } }, "required": ["harness", "model", "prompt"] },
+      "image": "bae-subagents:latest",
+      "subagents": [
+        { "harness": "claude", "command_template": "claude --model {model} --print", "prompt_via": "stdin", "timeout_secs": 600 },
+        { "harness": "codex", "command_template": "codex exec --model {model}", "prompt_via": "stdin", "timeout_secs": 600 }
+      ]
+    }
   ]
 }
 ```
@@ -156,6 +168,13 @@ Auth: **client key**.
   execs `input.command`). Omit the key entirely when no Auto-mode tool is
   registered — this keeps a pre-work-item-0006 session-open body
   byte-identical.
+- `subagent_tools` — optional, default `[]`. Remote-launch declarations for
+  `launch_subagent`; each includes an image and one or more configured
+  `{harness, command_template, prompt_via, timeout_secs}` entries. These are
+  stored per client and are not checked against `allowed_tools`; the image is
+  checked against `available_sandboxes` when the remote launch is dispatched.
+  The provider receives only the tool name, description, and input schema.
+  Invalid declarations are rejected with `422 invalid_subagent_tools`.
 
 At session creation, BAE also connects to any MCP servers named in the
 profile's `mcp_servers` list, runs the MCP `initialize` handshake, and merges
@@ -210,7 +229,8 @@ the session — that's the point of this endpoint.
   "client_version": "1.0.0",
   "tools": [
     { "name": "get_current_time", "description": "…", "input_schema": {} }
-  ]
+  ],
+  "subagent_tools": []
 }
 ```
 
@@ -383,12 +403,14 @@ Content-Type: application/x-ndjson
 {"jsonrpc":"2.0","id":1,"result":{…}}\n
 ```
 
-The eight supported `method` values are `session.registerDriver`,
+The eleven supported `method` values are `session.registerDriver`,
 `session.sendMessage`, `session.subscribe`, `session.unsubscribe`,
 `session.startRemoteSandbox`, `session.stopRemoteSandbox`,
 `session.execRemoteSandbox`, `session.reportLocalSandbox` (the last four are
 documented in [Sandboxes](#sandboxes) below; see the
-[Sandboxes guide](../guides/sandboxes.md) for a walkthrough).
+[Sandboxes guide](../guides/sandboxes.md) for a walkthrough),
+`session.reportLocalSubagent`, `session.cancelSubagent`, and
+`session.updateClientTools` (see [Subagents](#subagents)).
 
 ---
 
@@ -519,14 +541,14 @@ blocks](#content-blocks) below):
 }
 ```
 
-The `mcp` block above was already dispatched and answered by the server
+The `mcp`/remote-subagent block above was already dispatched and answered by the server
 *before* the turn paused — its `mcp.request`/`mcp.response`/`tool.result`
 events are already present in `result.events`. The client's job:
 
 - **Execute only `dispatch:"client"` blocks.** For each one, call the
   registered handler by `name` with `input` and build a `tool_result` block
   echoing `tool_use_id`.
-- **Treat every other block as informational.** A `sandbox`/`mcp` block (or,
+- **Treat every other block as informational.** A `sandbox`/`mcp`/remote-subagent block (or,
   against an older server that omits `dispatch`, any block whose `name` is
   not in the client's own registered-tool set) is display-only — surface it
   to application code/UI if useful (e.g. "server is running `list_directory`"),
@@ -563,7 +585,7 @@ harness itself declared. A harness talking to such a server falls back to its
 old behavior: treat a `tool_use` block as its own iff `name` is in its own
 registered-tool set.
 
-**Server-side merge.** The server dispatched and answered the `sandbox`/`mcp`
+**Server-side merge.** The server dispatched and answered the `sandbox`/`mcp`/remote-subagent
 blocks itself before pausing, and stashes those results across the pause.
 When the client resumes with its own `tool_result`s, the server merges both
 result sets into the single following `user` turn recorded in history — one
@@ -845,6 +867,158 @@ to the caller's `client_key_id`.
 
 ---
 
+## Subagents
+
+These methods support the native CLI-subagent tools described in the
+[Subagents guide](../guides/subagents.md). They use the same JSON-RPC/NDJSON
+transport and driver-registration gate as the sandbox methods above. A
+subagent launch is asynchronous: the launch tool returns a `started`
+acknowledgment, while a status tool returns the eventual output.
+
+Remote subagent declarations are sent as `subagent_tools` alongside `tools`
+and `sandbox_tools` when opening or joining a session. The declaration carries
+the pinned `launch_subagent` schema plus the configured CLI command templates;
+only its name, description, and input schema are exposed to the provider.
+Local launches are ordinary client tools, and their automatically managed
+`local_subagent_status` declaration is synchronized with
+`session.updateClientTools`. SDKs serialize the tracked-task transition with
+this full replacement, so concurrent launches cannot exceed the local cap and
+an older removal cannot overwrite a newer addition.
+
+All three methods require prior driver registration. Any registered driver may
+call them; turn ownership is not required.
+
+### `session.reportLocalSubagent`
+
+Report a lifecycle transition for a **local** subagent, one whose subprocess is
+owned by the client harness. SDK local-subagent tools call this automatically.
+The server records the report as visibility telemetry and does not verify that
+the claimed process exists or has reached the claimed state.
+
+**Params:**
+
+```json
+{
+  "state": "start",
+  "subagent_id": "sba_…",
+  "harness": "claude",
+  "model": "claude-sonnet-5",
+  "detail": null,
+  "reason": null,
+  "exit_code": null
+}
+```
+
+- `state` — required; one of `start`, `running`, `completed`, `failed`, or
+  `cancelled`.
+- `subagent_id`, `harness`, `model` — required non-empty strings.
+- `detail`, `reason`, and `exit_code` — optional. `reason` is normally
+  `nonzero_exit`, `spawn_failed`, or `timeout` for `failed`, and `explicit` or
+  `session_close` for `cancelled`; the server echoes it without validating the
+  enum.
+
+**Terminal result:**
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": { "reported": true } }
+```
+
+**Events:** `state` maps to the corresponding
+`session.subagent.start`/`running`/`completed`/`failed`/`cancelled` event.
+Every payload contains `dispatch: "local"`, `subagent_id`, `harness`,
+`model`, and `detail`; terminal events add the applicable `reason` and
+`exit_code` fields. A local timeout is reported as `failed` with
+`reason: "timeout"`.
+
+**JSON-RPC errors:** `-32001` (unregistered driver), `-32602` (invalid or
+missing fields), and `-32603` (internal error).
+
+> **Telemetry limitation:** local reports are not authoritative. If the
+> harness crashes or disconnects before reporting a terminal state, the server
+> has no process handle and cannot reconcile the missing event.
+
+### `session.cancelSubagent`
+
+Cancel one **remote**, server-tracked subagent. A local subagent is cancelled
+in the SDK (`Session::cancel_subagent`); the server does not track its id.
+
+**Params:**
+
+```json
+{ "subagent_id": "sba_…" }
+```
+
+**Terminal result:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "result": { "cancelled": true, "subagent_id": "sba_…", "was_running": true }
+}
+```
+
+**Events:** For a running task, the server kills the subprocess, retains the terminal
+entry for the status tool, and emits `session.subagent.cancelled` with
+`dispatch: "remote"` and `reason: "explicit"`. Cancelling an already
+terminal task is an idempotent success with `was_running: false` and no new
+event. An unknown, local, or already-evicted id returns `-32014
+subagent_not_found`.
+
+**JSON-RPC errors:** `-32001` (unregistered driver), `-32602` (invalid
+`subagent_id`), `-32014` (not tracked), and `-32603` (internal error).
+
+### `session.updateClientTools`
+
+> **General-purpose wire-protocol surface:** this method is not specific to
+> subagents. It replaces the calling client's complete `client_tools` entry
+> and is reusable for any future feature that needs a dynamic client tool
+> list. Subagents use it to add or remove `local_subagent_status`.
+
+Update the calling client's tool declarations for the next provider call.
+The array is a **full replacement**, not a merge or a diff; other clients'
+tools and the session's `sandbox_tools`/`subagent_tools` are untouched.
+
+**Params:**
+
+```json
+{
+  "tools": [
+    {
+      "name": "get_current_time",
+      "description": "Return the current UTC time as a string",
+      "input_schema": { "type": "object", "properties": {} }
+    }
+  ]
+}
+```
+
+`tools` is required and may be empty. Each tool requires a non-empty `name`;
+`description` and `input_schema` are optional, using the same `ClientToolDef`
+shape as session open/join. Every name is checked against the profile's
+`allowed_tools`; `remote_subagent_status` is reserved and rejected. In
+particular, a profile used for local subagents must allowlist both
+`launch_subagent` and `local_subagent_status`.
+
+**Terminal result:**
+
+```json
+{ "jsonrpc": "2.0", "id": 9, "result": { "updated": true } }
+```
+
+The update applies to the **next** provider call. A call racing an in-flight
+turn does not rewrite the tool list already sent to that provider.
+SDK-managed subagent updates are ordered with their local task-set mutations;
+the server therefore receives full replacements in current-state order even
+when a status eviction and a new launch happen concurrently.
+
+**Events:** No subagent lifecycle event is emitted. This method updates the
+calling client's persisted tool list for subsequent provider calls.
+
+**JSON-RPC errors:** `-32001` (unregistered driver), `-32000` (session is not
+open), `-32602` (invalid params), `-32015 tool_not_allowed` (profile
+allowlist or reserved name), and `-32603` (internal error).
+
 ## Content blocks
 
 `content` on a message can be either a plain string or an array of typed
@@ -862,7 +1036,7 @@ blocks before the provider ever sees them — see [Message Types —
 `server.message.send`](message-types.md#servermessagesend).
 
 A `tool_use` block in a `server.message.send` event carries `dispatch`, one of
-`"client"`, `"sandbox"`, or `"mcp"`, whenever the turn paused for at least one
+`"client"`, `"sandbox"`, `"mcp"`, or `"subagent"`, whenever the turn paused for at least one
 client-dispatched tool (see [Tool call response](#sessionsendmessage) above).
 Older servers that predate this field omit it; a harness talking to such a
 server falls back to treating a block as its own iff the block's `name` is in
@@ -889,9 +1063,9 @@ SDK harnesses implement this loop inside `session.send(message)`:
 **Deciding "ours":** a block is ours iff `dispatch == "client"`, or, against a
 server that predates the `dispatch` field, `name` is in the harness's own
 registered-tool set. Tools the client did not declare are dispatched
-server-side (through configured MCP servers, or the session's Auto-mode
-sandbox) — against a current server they still surface as `tool_use` blocks
-(tagged `dispatch:"sandbox"`/`"mcp"`) so the full turn is visible, but the
+server-side (through configured MCP servers, the session's Auto-mode sandbox,
+or a remote subagent) — against a current server they still surface as
+`tool_use` blocks (tagged `dispatch:"sandbox"`/`"mcp"`/`"subagent"`) so the full turn is visible, but the
 harness must not execute or answer them; against an older server they never
 surface at all. See [`session.sendMessage` — tool call
 response](#sessionsendmessage) for the full contract.

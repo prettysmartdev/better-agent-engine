@@ -52,6 +52,7 @@ pub mod files;
 mod harness;
 mod hooks;
 pub mod sandbox;
+pub mod subagent;
 mod tool;
 mod types;
 
@@ -64,6 +65,12 @@ pub use sandbox::{
     run_shell_command, run_shell_named, AppleContainerDriver, DockerDriver, ExecResult, RemoteMode,
     RemoteSandboxStarted, RemoteSandboxStopped, SandboxDriver, SandboxError, SandboxHandle,
     SandboxSession, SandboxTarget, SandboxTool, SandboxToolDef,
+};
+pub use subagent::{
+    launch_subagent, LocalSubagentReport, ProcessRunner, PromptDelivery, RunnerOutput, SubagentDef,
+    SubagentFuture, SubagentLaunch, SubagentRpc, SubagentRunner, SubagentSession, SubagentStatus,
+    SubagentTool, SubagentToolDef, DEFAULT_SUBAGENT_TIMEOUT_SECS, LAUNCH_SUBAGENT_TOOL,
+    LOCAL_SUBAGENT_STATUS_TOOL, MAX_SUBAGENTS_PER_SESSION, SUBAGENT_OUTPUT_CAP_BYTES,
 };
 pub use tool::{BoxError, Tool, ToolFuture, ToolHandler};
 pub use types::{

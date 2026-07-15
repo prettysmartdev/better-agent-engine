@@ -28,7 +28,9 @@ use crate::config_file::McpServerConfig;
 use crate::engine::broadcast::EventBroadcaster;
 use crate::engine::mcp::McpSession;
 use crate::engine::provider::ProviderConfig;
+use crate::engine::sandbox::{CommandRunner, TokioCommandRunner};
 use crate::engine::sandbox::{DockerDriver, SandboxDriver, SandboxHandle, SandboxImageStatus};
+use crate::engine::subagent::SubagentTask;
 use crate::store::Store;
 
 /// Request-logging middleware shared by both routers: one line per request with
@@ -74,6 +76,9 @@ type Sandboxes = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<SandboxHandle>
 /// is the trust boundary (see `session.sandbox.available` and
 /// `session.startRemoteSandbox`).
 type SandboxStatusMap = Arc<Mutex<HashMap<String, HashMap<String, SandboxImageStatus>>>>;
+
+/// Remote subagent tasks, scoped first by session and then by subagent id.
+type Subagents = Arc<Mutex<HashMap<String, HashMap<String, SubagentTask>>>>;
 
 /// A paused turn whose FIFO-gate guard is parked between HTTP requests.
 ///
@@ -159,6 +164,14 @@ pub struct AppState {
     pub sandboxes: Sandboxes,
     /// Sandbox image provisioning status per profile. See [`SandboxStatusMap`].
     pub sandbox_status: SandboxStatusMap,
+    /// Tracked remote subagents, keyed session id then subagent id.
+    pub subagents: Subagents,
+    /// Shared injectable subprocess seam for remote `exec -i` subagents.
+    pub command_runner: Arc<dyn CommandRunner>,
+    /// Default remote subagent timeout.
+    pub subagent_timeout: Duration,
+    /// Maximum concurrently Running remote subagents per session.
+    pub max_subagents_per_session: usize,
 }
 
 impl AppState {
@@ -195,6 +208,10 @@ impl AppState {
             sandbox_driver: Arc::new(DockerDriver::new()),
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             sandbox_status: Arc::new(Mutex::new(HashMap::new())),
+            subagents: Arc::new(Mutex::new(HashMap::new())),
+            command_runner: Arc::new(TokioCommandRunner),
+            subagent_timeout: Duration::from_secs(crate::config::DEFAULT_SUBAGENT_TIMEOUT_SECS),
+            max_subagents_per_session: crate::config::DEFAULT_MAX_SUBAGENTS_PER_SESSION,
         }
     }
 

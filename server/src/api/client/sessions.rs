@@ -20,6 +20,7 @@ use crate::api::AppState;
 use crate::config_file::McpServerConfig;
 use crate::engine::broadcast;
 use crate::engine::mcp::McpSession;
+use crate::engine::subagent::{SubagentToolDef, REMOTE_STATUS_TOOL_NAME};
 use crate::events::EventType;
 use crate::store::keys::{self, KeyRecord};
 use crate::store::profiles::{self, ProfileRecord};
@@ -120,6 +121,10 @@ pub struct CreateSession {
     /// `input.command` in the sandbox.
     #[serde(default)]
     pub sandbox_tools: Vec<ClientToolDef>,
+    /// Remote-only, server-dispatched CLI-subagent declarations. Configuration
+    /// fields are persisted but never advertised to the provider.
+    #[serde(default)]
+    pub subagent_tools: Vec<SubagentToolDef>,
 }
 
 /// Client-safe projection of a profile (no `auth_token`, no env var names).
@@ -145,7 +150,7 @@ fn public_profile(state: &AppState, p: &ProfileRecord) -> Value {
 /// Enforce a profile's tool allowlist against a client's declared tools. An
 /// empty allowlist permits no tools. Shared by `create` and `join` — each
 /// client's declaration is validated independently against the same profile.
-fn enforce_tool_allowlist(
+pub(crate) fn enforce_tool_allowlist(
     profile: &ProfileRecord,
     tools: &[ClientToolDef],
 ) -> Result<(), ApiError> {
@@ -165,6 +170,103 @@ fn enforce_tool_allowlist(
     Ok(())
 }
 
+/// Validate remote subagent declarations at open/join. They intentionally do
+/// not use `allowed_tools`: the operator-created command template and the
+/// remote-sandbox image allowlist are the trust boundaries.
+fn validate_subagent_tools(tools: &[SubagentToolDef]) -> Result<(), ApiError> {
+    for tool in tools {
+        if tool.name.trim().is_empty() {
+            return Err(invalid_subagent_tools(
+                "tool name must be a non-empty string",
+            ));
+        }
+        if tool.name == REMOTE_STATUS_TOOL_NAME {
+            return Err(ApiError::unprocessable(
+                "reserved_tool_name",
+                "remote_subagent_status is reserved",
+            ));
+        }
+        if tool.image.trim().is_empty() || tool.subagents.is_empty() {
+            return Err(invalid_subagent_tools(
+                "image and non-empty subagents are required",
+            ));
+        }
+        let mut harnesses = HashSet::new();
+        for def in &tool.subagents {
+            if def.harness.trim().is_empty() || !harnesses.insert(def.harness.as_str()) {
+                return Err(invalid_subagent_tools(
+                    "harness must be non-empty and unique",
+                ));
+            }
+            if def.command_template.trim().is_empty()
+                || !valid_template(&def.command_template, &def.prompt_via)
+            {
+                return Err(invalid_subagent_tools(
+                    "invalid command_template placeholders",
+                ));
+            }
+            if def.prompt_via != "stdin" && def.prompt_via != "arg" {
+                return Err(invalid_subagent_tools(
+                    "prompt_via must be \"stdin\" or \"arg\"",
+                ));
+            }
+            if matches!(def.timeout_secs, Some(0)) {
+                return Err(invalid_subagent_tools(
+                    "timeout_secs must be a positive integer",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_subagent_tools(detail: &str) -> ApiError {
+    ApiError::unprocessable("invalid_subagent_tools", detail)
+}
+
+fn reject_reserved_tool_name(
+    client: &[ClientToolDef],
+    sandbox: &[ClientToolDef],
+) -> Result<(), ApiError> {
+    if client
+        .iter()
+        .chain(sandbox)
+        .any(|tool| tool.name == REMOTE_STATUS_TOOL_NAME)
+    {
+        Err(ApiError::unprocessable(
+            "reserved_tool_name",
+            "remote_subagent_status is reserved",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn valid_template(template: &str, prompt_via: &str) -> bool {
+    let mut rest = template;
+    let mut prompt_count = 0;
+    while let Some(start) = rest.find('{') {
+        let before = &rest[..start];
+        let Some(end) = rest[start + 1..].find('}') else {
+            return false;
+        };
+        let name = &rest[start + 1..start + 1 + end];
+        if before.contains('}') || !matches!(name, "model" | "prompt") {
+            return false;
+        }
+        if name == "prompt" {
+            prompt_count += 1;
+        }
+        rest = &rest[start + 2 + end..];
+    }
+    !rest.contains('}')
+        && match prompt_via {
+            "arg" => prompt_count == 1,
+            "stdin" => prompt_count == 0,
+            _ => false,
+        }
+}
+
 /// The declared tools as the JSON array the engine advertises to the LLM.
 fn declared_tools_json(tools: &[ClientToolDef]) -> Value {
     json!(tools
@@ -173,6 +275,17 @@ fn declared_tools_json(tools: &[ClientToolDef]) -> Value {
             "name": t.name,
             "description": t.description,
             "input_schema": t.input_schema.clone().unwrap_or_else(|| json!({})),
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn declared_subagent_tools_json(tools: &[SubagentToolDef]) -> Value {
+    json!(tools
+        .iter()
+        .map(|t| json!({
+            "name": t.name, "description": t.description,
+            "input_schema": t.input_schema.clone().unwrap_or_else(|| json!({})),
+            "image": t.image, "subagents": t.subagents,
         }))
         .collect::<Vec<_>>())
 }
@@ -214,7 +327,9 @@ pub async fn create(
     }
 
     // Enforce the tool allowlist. An empty allowlist permits no tools.
+    reject_reserved_tool_name(&body.tools, &body.sandbox_tools)?;
     enforce_tool_allowlist(&profile, &body.tools)?;
+    validate_subagent_tools(&body.subagent_tools)?;
 
     // Persist the declared tools as-is for the engine to advertise to the LLM
     // (stored under this client's own key in the per-client tools object).
@@ -224,11 +339,17 @@ pub async fn create(
     // when a sandbox is started.
     let client_tools = declared_tools_json(&body.tools);
     let sandbox_tools = declared_tools_json(&body.sandbox_tools);
+    let subagent_tools = declared_subagent_tools_json(&body.subagent_tools);
 
     let session_key = keys::generate_session_key();
     let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
     let sandbox_tool_names: Vec<&str> =
         body.sandbox_tools.iter().map(|t| t.name.as_str()).collect();
+    let subagent_tool_names: Vec<&str> = body
+        .subagent_tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
 
     // Create the session row, its session key, and the session.open event under
     // one lock. The session.open event is inserted inside this transaction (it is
@@ -244,6 +365,7 @@ pub async fn create(
             body.client_version.as_deref(),
             &client_tools,
             &sandbox_tools,
+            &subagent_tools,
         )
         .map_err(ApiError::from_db)?;
         keys::insert_session_key(c, &session.id, &client_key.id, &profile_id, &session_key)
@@ -263,6 +385,7 @@ pub async fn create(
                 "client_version": body.client_version,
                 "tools": tool_names,
                 "sandbox_tools": sandbox_tool_names,
+                "subagent_tools": subagent_tool_names,
             }),
         )
         .map_err(ApiError::from_db)?;
@@ -361,12 +484,20 @@ pub async fn join(
 
     // The joiner's own tool declaration, against the same profile's allowlist.
     // Sandbox tools bypass that allowlist by design (see `create`).
+    reject_reserved_tool_name(&body.tools, &body.sandbox_tools)?;
     enforce_tool_allowlist(&profile, &body.tools)?;
+    validate_subagent_tools(&body.subagent_tools)?;
     let client_tools = declared_tools_json(&body.tools);
     let sandbox_tools = declared_tools_json(&body.sandbox_tools);
+    let subagent_tools = declared_subagent_tools_json(&body.subagent_tools);
     let tool_names: Vec<&str> = body.tools.iter().map(|t| t.name.as_str()).collect();
     let sandbox_tool_names: Vec<&str> =
         body.sandbox_tools.iter().map(|t| t.name.as_str()).collect();
+    let subagent_tool_names: Vec<&str> = body
+        .subagent_tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
 
     // Upsert this client's tools entry, mint its session key, and log the join
     // under one lock; publish the join event to live watchers afterwards.
@@ -375,6 +506,8 @@ pub async fn join(
         sessions::set_client_tools(c, &session.id, &client_key.id, &client_tools)
             .map_err(ApiError::from_db)?;
         sessions::set_client_sandbox_tools(c, &session.id, &client_key.id, &sandbox_tools)
+            .map_err(ApiError::from_db)?;
+        sessions::set_client_subagent_tools(c, &session.id, &client_key.id, &subagent_tools)
             .map_err(ApiError::from_db)?;
         keys::insert_session_key(
             c,
@@ -399,6 +532,7 @@ pub async fn join(
                 "client_version": body.client_version,
                 "tools": tool_names,
                 "sandbox_tools": sandbox_tool_names,
+                "subagent_tools": subagent_tool_names,
             }),
         )
         .map_err(ApiError::from_db)
@@ -538,6 +672,7 @@ fn profile_unavailable_at_open(
             body.client_version.as_deref(),
             &client_tools,
             &json!([]),
+            &json!([]),
         )?;
         sessions::insert_event(
             c,
@@ -587,6 +722,7 @@ fn primary_provider_unavailable_at_open(
             STATE_ERROR,
             body.client_version.as_deref(),
             &client_tools,
+            &json!([]),
             &json!([]),
         )?;
         sessions::insert_event(
@@ -820,6 +956,39 @@ pub async fn close(
     // with no started sandbox is a no-op here, same as MCP teardown below on a
     // session with no connected servers; a driver stop failure is logged (as
     // session.sandbox.error) but never blocks close.
+    // Remote subagents share the same lifecycle boundary. Abort every running
+    // task before dropping the map so the production runner's kill_on_drop
+    // reaps its `exec -i` process; terminal tasks are simply forgotten on
+    // close because no later status acknowledgement is possible.
+    let cancelled = {
+        let mut all = state.subagents.lock().expect("subagents mutex poisoned");
+        let tasks = all.remove(&session.id).unwrap_or_default();
+        tasks
+            .into_iter()
+            .filter_map(|(subagent_id, mut task)| {
+                if task.status == crate::engine::subagent::SubagentStatus::Running {
+                    if let Some(join) = task.task.take() {
+                        join.abort();
+                    }
+                    Some((subagent_id, task.harness, task.model))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    for (subagent_id, harness, model) in cancelled {
+        if let Err(e) = broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            &session.id,
+            Some(&session.client_key_id),
+            EventType::SubagentCancelled,
+            &json!({ "dispatch": "remote", "subagent_id": subagent_id, "harness": harness, "model": model, "detail": Value::Null, "reason": "session_close" }),
+        ) {
+            tracing::error!("failed to log session-close subagent cancellation: {e}");
+        }
+    }
     stop_remote_sandbox(&state, &session.id, &session.client_key_id, "session_close").await;
 
     // Drop the broadcast channel (dropping the sender ends every live watcher's

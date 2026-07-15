@@ -97,11 +97,21 @@ pub enum EventType {
     /// The result of an Auto-mode sandbox dispatch (mirrors `mcp.response`).
     #[serde(rename = "sandbox.response")]
     SandboxResponse,
+    #[serde(rename = "session.subagent.start")]
+    SubagentStart,
+    #[serde(rename = "session.subagent.running")]
+    SubagentRunning,
+    #[serde(rename = "session.subagent.completed")]
+    SubagentCompleted,
+    #[serde(rename = "session.subagent.failed")]
+    SubagentFailed,
+    #[serde(rename = "session.subagent.cancelled")]
+    SubagentCancelled,
 }
 
 impl EventType {
     /// Every variant, in definition order. Handy for tests and documentation.
-    pub const ALL: [EventType; 22] = [
+    pub const ALL: [EventType; 27] = [
         EventType::ClientMessageSend,
         EventType::ServerMessageSend,
         EventType::ProviderRequest,
@@ -124,6 +134,11 @@ impl EventType {
         EventType::SandboxError,
         EventType::SandboxRequest,
         EventType::SandboxResponse,
+        EventType::SubagentStart,
+        EventType::SubagentRunning,
+        EventType::SubagentCompleted,
+        EventType::SubagentFailed,
+        EventType::SubagentCancelled,
     ];
 
     /// The canonical wire/storage string for this event type.
@@ -154,6 +169,11 @@ impl EventType {
             EventType::SandboxError => "session.sandbox.error",
             EventType::SandboxRequest => "sandbox.request",
             EventType::SandboxResponse => "sandbox.response",
+            EventType::SubagentStart => "session.subagent.start",
+            EventType::SubagentRunning => "session.subagent.running",
+            EventType::SubagentCompleted => "session.subagent.completed",
+            EventType::SubagentFailed => "session.subagent.failed",
+            EventType::SubagentCancelled => "session.subagent.cancelled",
         }
     }
 }
@@ -197,7 +217,17 @@ mod tests {
         for ev in EventType::ALL {
             assert!(seen.insert(ev.as_str()), "duplicate wire string: {ev}");
         }
-        assert_eq!(seen.len(), 22);
+        assert_eq!(seen.len(), 27);
+        assert_eq!(
+            &EventType::ALL[22..],
+            &[
+                EventType::SubagentStart,
+                EventType::SubagentRunning,
+                EventType::SubagentCompleted,
+                EventType::SubagentFailed,
+                EventType::SubagentCancelled,
+            ]
+        );
     }
 
     #[test]

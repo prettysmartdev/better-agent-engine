@@ -130,6 +130,8 @@ pub async fn serve(
 
     let mut state = AppState::with_registries(store, mcp_registry, provider_registry);
     state.turn_timeout = config.turn_timeout;
+    state.subagent_timeout = config.subagent_timeout;
+    state.max_subagents_per_session = config.max_subagents_per_session;
     state.sandbox_driver = sandbox_driver;
 
     // Sandbox image status is in-memory only: re-provision every declaring

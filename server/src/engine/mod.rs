@@ -8,6 +8,8 @@
 //! - [`sandbox`] — the sandbox drivers ([`sandbox::SandboxDriver`]): Docker /
 //!   Apple Containers backed shell-execution sandboxes, provisioned per
 //!   profile and started per session.
+//! - [`subagent`] — fire-and-forget CLI subagents, always executed through a
+//!   session's already-started remote sandbox.
 //! - [`session`] — the session message loop ([`session::run_turn`]): stream
 //!   history, call the provider (with fallbacks), dispatch tool calls, and
 //!   persist every step to `session_events`.
@@ -17,3 +19,4 @@ pub mod mcp;
 pub mod provider;
 pub mod sandbox;
 pub mod session;
+pub mod subagent;

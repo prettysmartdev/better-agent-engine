@@ -49,7 +49,8 @@ use tokio::sync::Mutex;
 use super::broadcast::{self, EventBroadcaster};
 use super::mcp::McpSession;
 use super::provider::{self, ProviderConfig};
-use super::sandbox::{ExecResult, SandboxDriver, SandboxHandle};
+use super::sandbox::{CommandRunner, ExecResult, SandboxDriver, SandboxHandle};
+use super::subagent::{self, SubagentStatus, SubagentTask, SubagentToolDef};
 use crate::events::EventType;
 use crate::store::sessions::{self, EventRecord, SessionRecord, STATE_ERROR};
 use crate::store::{profiles::ProfileRecord, Store};
@@ -153,6 +154,10 @@ pub async fn run_turn(
     mcp: Option<Arc<Mutex<McpSession>>>,
     sandbox_driver: Arc<dyn SandboxDriver>,
     sandbox: Option<Arc<Mutex<SandboxHandle>>>,
+    subagents: Arc<std::sync::Mutex<HashMap<String, HashMap<String, SubagentTask>>>>,
+    command_runner: Arc<dyn CommandRunner>,
+    subagent_timeout: std::time::Duration,
+    max_subagents_per_session: usize,
     acting_client_key_id: &str,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
@@ -190,11 +195,37 @@ pub async fn run_turn(
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
         .collect();
 
+    // Remote declarations retain config in storage but expose only ordinary
+    // provider tool fields. They are a fourth, server-side dispatch bucket.
+    let subagent_declarations: Vec<SubagentToolDef> = session
+        .subagent_tools
+        .get(acting_client_key_id)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    let subagent_tool_names: HashSet<String> = subagent_declarations
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    let subagent_tools: Vec<Value> = subagent_declarations
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name, "description": t.description,
+                "input_schema": t.input_schema.clone().unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect();
+
     // Merge the session's MCP tool definitions (from `tools/list` at connect
     // time) into what we advertise to the provider, and snapshot the
     // `tool_name -> server_name` routes for dispatch and event tagging.
     let mut advertised_tools = client_tools;
     advertised_tools.extend(sandbox_tools);
+    advertised_tools.extend(subagent_tools);
     let mcp_routes: std::collections::HashMap<String, String> = match &mcp {
         Some(m) => {
             let guard = m.lock().await;
@@ -203,7 +234,7 @@ pub async fn run_turn(
         }
         None => std::collections::HashMap::new(),
     };
-    let tools_value = Value::Array(advertised_tools);
+    let advertised_tools = advertised_tools;
 
     // Resolve the profile's provider name references against the startup
     // registry. A non-string primary reference or a primary name absent from
@@ -249,6 +280,18 @@ pub async fn run_turn(
         .map_err(TurnError)?;
 
     for _ in 0..MAX_ITERATIONS {
+        // Recomputed for every provider iteration: status visibility is live
+        // state, never a persisted declaration.
+        let mut iteration_tools = advertised_tools.clone();
+        if subagents
+            .lock()
+            .expect("subagents mutex poisoned")
+            .get(sid)
+            .is_some_and(|m| !m.is_empty())
+        {
+            iteration_tools.push(subagent::status_tool_definition());
+        }
+        let tools_value = Value::Array(iteration_tools);
         let history_value = Value::Array(history.clone());
 
         // --- Provider attempt sequence: primary, then each fallback. ---
@@ -368,6 +411,10 @@ pub async fn run_turn(
                     "client"
                 } else if sandbox_tool_names.contains(name) {
                     "sandbox"
+                } else if subagent_tool_names.contains(name)
+                    || name == subagent::REMOTE_STATUS_TOOL_NAME
+                {
+                    "subagent"
                 } else {
                     "mcp"
                 }
@@ -406,7 +453,7 @@ pub async fn run_turn(
 
         let has_client = dispatches.contains(&"client");
 
-        // Always dispatch the server-side tools (sandbox + MCP) first, in
+        // Always dispatch the server-side tools (sandbox + subagent + MCP) first, in
         // tool_use order, collecting each one's `tool_result` block. This runs
         // for every turn shape — all-server, mixed, and all-client (a no-op
         // then) — so observers see server-side work live even when the turn
@@ -542,6 +589,41 @@ pub async fn run_turn(
                     "tool_use_id": tu.id,
                     "content": result_content,
                     "is_error": is_error,
+                }));
+                continue;
+            }
+
+            // Remote subagents are intentionally fire-and-forget. This branch
+            // returns the started acknowledgement in this turn; the detached
+            // task emits terminal lifecycle events after the turn ends.
+            if *dispatch == "subagent" {
+                let (result_content, is_error) = if name == subagent::REMOTE_STATUS_TOOL_NAME {
+                    remote_status_result(&subagents, sid, &tu.input)
+                } else {
+                    launch_remote_subagent(
+                        store,
+                        broadcaster,
+                        sid,
+                        cid,
+                        name,
+                        &tu.input,
+                        &subagent_declarations,
+                        &sandbox,
+                        sandbox_driver.clone(),
+                        subagents.clone(),
+                        command_runner.clone(),
+                        subagent_timeout,
+                        max_subagents_per_session,
+                    )
+                    .await
+                };
+                events.push(log_event(
+                    store, broadcaster, sid, cid, EventType::ToolResult,
+                    json!({ "tool_use_id": tu.id, "dispatch": "subagent", "is_error": is_error, "content": result_content }),
+                )?);
+                server_tool_results.push(json!({
+                    "type": "tool_result", "tool_use_id": tu.id,
+                    "content": result_content, "is_error": is_error,
                 }));
                 continue;
             }
@@ -682,6 +764,331 @@ pub async fn run_turn(
     finish_failed(store, sid, events)
 }
 
+/// Server-form tool-result content: a compact JSON object in one text block.
+fn subagent_content(value: Value) -> Value {
+    json!([{ "type": "text", "text": value.to_string() }])
+}
+
+/// Read remote task state and acknowledge terminal entries only after their
+/// one permitted status response has been built.
+fn remote_status_result(
+    subagents: &Arc<std::sync::Mutex<HashMap<String, HashMap<String, SubagentTask>>>>,
+    session_id: &str,
+    input: &Value,
+) -> (Value, bool) {
+    let requested = input.get("subagent_id").and_then(Value::as_str);
+    let mut map = subagents.lock().expect("subagents mutex poisoned");
+    let Some(tasks) = map.get_mut(session_id) else {
+        return if requested.is_some() {
+            (
+                subagent_content(json!({ "error": "unknown subagent_id" })),
+                true,
+            )
+        } else {
+            (subagent_content(json!({ "subagents": [] })), false)
+        };
+    };
+    let mut ids: Vec<String> = match requested {
+        Some(id) => {
+            if !tasks.contains_key(id) {
+                return (
+                    subagent_content(json!({ "error": "unknown subagent_id" })),
+                    true,
+                );
+            }
+            vec![id.to_owned()]
+        }
+        None => tasks.keys().cloned().collect(),
+    };
+    if requested.is_none() {
+        ids.sort_by_key(|id| tasks.get(id).map(|t| t.launch_sequence));
+    }
+    let entries: Vec<Value> = ids
+        .iter()
+        .filter_map(|id| tasks.get(id).map(|t| t.status_json(id)))
+        .collect();
+    let terminal: Vec<String> = ids
+        .into_iter()
+        .filter(|id| tasks.get(id).is_some_and(|t| t.status.terminal()))
+        .collect();
+    for id in terminal {
+        tasks.remove(&id);
+    }
+    let empty = tasks.is_empty();
+    if empty {
+        map.remove(session_id);
+    }
+    (subagent_content(json!({ "subagents": entries })), false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn launch_remote_subagent(
+    store: &Store,
+    broadcaster: &EventBroadcaster,
+    session_id: &str,
+    client_key_id: &str,
+    tool_name: &str,
+    input: &Value,
+    declarations: &[SubagentToolDef],
+    sandbox: &Option<Arc<Mutex<SandboxHandle>>>,
+    sandbox_driver: Arc<dyn SandboxDriver>,
+    subagents: Arc<std::sync::Mutex<HashMap<String, HashMap<String, SubagentTask>>>>,
+    runner: Arc<dyn CommandRunner>,
+    default_timeout: std::time::Duration,
+    max_subagents: usize,
+) -> (Value, bool) {
+    let (harness, model, prompt) = match (
+        input.get("harness").and_then(Value::as_str),
+        input.get("model").and_then(Value::as_str),
+        input.get("prompt").and_then(Value::as_str),
+    ) {
+        (Some(h), Some(m), Some(p))
+            if !h.trim().is_empty() && !m.trim().is_empty() && !p.trim().is_empty() =>
+        {
+            (h.to_owned(), m.to_owned(), p.to_owned())
+        }
+        _ => {
+            return (
+                subagent_content(
+                    json!({ "error": "launch_subagent requires string \"harness\", \"model\", and \"prompt\"" }),
+                ),
+                true,
+            )
+        }
+    };
+    let Some(tool) = declarations.iter().find(|d| d.name == tool_name) else {
+        return (
+            subagent_content(json!({ "error": format!("unknown harness {:?}", harness) })),
+            true,
+        );
+    };
+    let Some(def) = tool
+        .subagents
+        .iter()
+        .find(|d| d.harness == harness)
+        .cloned()
+    else {
+        return (
+            subagent_content(json!({ "error": format!("unknown harness {:?}", harness) })),
+            true,
+        );
+    };
+    if subagents
+        .lock()
+        .expect("subagents mutex poisoned")
+        .get(session_id)
+        .map(|m| {
+            m.values()
+                .filter(|t| t.status == SubagentStatus::Running)
+                .count()
+        })
+        .unwrap_or(0)
+        >= max_subagents
+    {
+        return (
+            subagent_content(
+                json!({ "error": format!("subagent limit reached (max {max_subagents} per session)") }),
+            ),
+            true,
+        );
+    }
+    let Some(sandbox) = sandbox else {
+        let msg = format!("no remote sandbox is running for tool '{tool_name}'; call session.startRemoteSandbox first");
+        return (subagent_content(json!({ "error": msg })), true);
+    };
+    let handle = sandbox.lock().await.clone();
+    if handle.image != tool.image {
+        return (
+            subagent_content(
+                json!({ "error": format!("remote sandbox image mismatch: subagent declared {:?} but the running sandbox uses {:?}", tool.image, handle.image) }),
+            ),
+            true,
+        );
+    }
+
+    let subagent_id = crate::store::generate_id(subagent::SUBAGENT_ID_PREFIX);
+    let common = |detail: Value| json!({ "dispatch": "remote", "subagent_id": subagent_id, "harness": harness, "model": model, "detail": detail });
+    if let Err(e) = broadcast::insert_and_publish(
+        store,
+        broadcaster,
+        session_id,
+        Some(client_key_id),
+        EventType::SubagentStart,
+        &common(Value::Null),
+    ) {
+        tracing::error!("failed to log subagent start: {e}");
+    }
+    subagents
+        .lock()
+        .expect("subagents mutex poisoned")
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(
+            subagent_id.clone(),
+            SubagentTask::running(harness.clone(), model.clone()),
+        );
+
+    let task_id = subagent_id.clone();
+    let session_id = session_id.to_owned();
+    let client_key_id = client_key_id.to_owned();
+    let store = store.clone();
+    let broadcaster = broadcaster.clone();
+    let command = subagent::interpolate(&def.command_template, &model, &prompt, &def.prompt_via);
+    let stdin = (def.prompt_via == "stdin").then(|| prompt.into_bytes());
+    let args = vec![
+        "exec".to_owned(),
+        "-i".to_owned(),
+        handle.id,
+        "sh".to_owned(),
+        "-c".to_owned(),
+        command,
+    ];
+    let program = sandbox_driver.cli_program().to_owned();
+    let timeout = subagent::timeout_for(&def, default_timeout);
+    let background_subagents = subagents.clone();
+    let background_harness = harness.clone();
+    let background_model = model.clone();
+    let background_session_id = session_id.clone();
+    let background_client_key_id = client_key_id.clone();
+    let background_store = store.clone();
+    let background_broadcaster = broadcaster.clone();
+    // A command can resolve immediately (especially in tests, or for a very
+    // short CLI). Hold the detached task until the synchronous `running`
+    // lifecycle event has been persisted so the canonical start -> running ->
+    // terminal ordering cannot race.
+    let running_gate = Arc::new(tokio::sync::Notify::new());
+    let background_running_gate = running_gate.clone();
+    let join = tokio::spawn(async move {
+        background_running_gate.notified().await;
+        let outcome = tokio::time::timeout(
+            timeout,
+            runner.run_with_stdin(&program, &args, stdin.as_deref()),
+        )
+        .await;
+        let (event_type, reason, exit_code, detail, stdout, stderr, truncated, status) =
+            match outcome {
+                Err(_) => (
+                    EventType::SubagentFailed,
+                    Some("timeout".to_owned()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    SubagentStatus::TimedOut,
+                ),
+                Ok(Err(e)) => (
+                    EventType::SubagentFailed,
+                    Some("spawn_failed".to_owned()),
+                    None,
+                    Some(e.to_string()),
+                    None,
+                    None,
+                    false,
+                    SubagentStatus::Failed,
+                ),
+                Ok(Ok(out)) => {
+                    let code = out.status.code().unwrap_or(-1);
+                    let (stdout, a) = subagent::truncate_output(&out.stdout);
+                    let (stderr, b) = subagent::truncate_output(&out.stderr);
+                    if code == 0 {
+                        (
+                            EventType::SubagentCompleted,
+                            None,
+                            Some(0),
+                            None,
+                            Some(stdout),
+                            Some(stderr),
+                            a || b,
+                            SubagentStatus::Completed,
+                        )
+                    } else {
+                        (
+                            EventType::SubagentFailed,
+                            Some("nonzero_exit".to_owned()),
+                            Some(code),
+                            None,
+                            Some(stdout),
+                            Some(stderr),
+                            a || b,
+                            SubagentStatus::Failed,
+                        )
+                    }
+                }
+            };
+        let updated = {
+            let mut all = background_subagents
+                .lock()
+                .expect("subagents mutex poisoned");
+            let Some(task) = all
+                .get_mut(&background_session_id)
+                .and_then(|m| m.get_mut(&task_id))
+            else {
+                return;
+            };
+            if task.status != SubagentStatus::Running {
+                false
+            } else {
+                task.status = status;
+                task.reason = reason.clone();
+                task.exit_code = exit_code;
+                task.detail = detail.clone();
+                task.stdout = stdout;
+                task.stderr = stderr;
+                task.truncated = truncated;
+                task.task = None;
+                true
+            }
+        };
+        if !updated {
+            return;
+        }
+        let mut payload = json!({ "dispatch": "remote", "subagent_id": task_id, "harness": background_harness, "model": background_model, "detail": detail });
+        if event_type == EventType::SubagentCompleted {
+            payload["exit_code"] = json!(0);
+        }
+        if event_type == EventType::SubagentFailed {
+            payload["reason"] = json!(reason);
+            payload["exit_code"] = json!(exit_code);
+        }
+        if let Err(e) = broadcast::insert_and_publish(
+            &background_store,
+            &background_broadcaster,
+            &background_session_id,
+            Some(&background_client_key_id),
+            event_type,
+            &payload,
+        ) {
+            tracing::error!("failed to log remote subagent terminal event: {e}");
+        }
+    });
+    if let Some(task) = subagents
+        .lock()
+        .expect("subagents mutex poisoned")
+        .get_mut(session_id.as_str())
+        .and_then(|m| m.get_mut(&subagent_id))
+    {
+        task.task = Some(join);
+    }
+    if let Err(e) = broadcast::insert_and_publish(
+        &store,
+        &broadcaster,
+        session_id.as_str(),
+        Some(client_key_id.as_str()),
+        EventType::SubagentRunning,
+        &common(Value::Null),
+    ) {
+        tracing::error!("failed to log subagent running: {e}");
+    }
+    running_gate.notify_one();
+    (
+        subagent_content(
+            json!({ "subagent_id": subagent_id, "harness": harness, "model": model, "status": "started" }),
+        ),
+        false,
+    )
+}
+
 /// Move the session to `error` and return a ProvidersFailed turn carrying the
 /// events logged so far.
 fn finish_failed(
@@ -796,6 +1203,124 @@ fn tool_use_blocks(content: &Value) -> Vec<ToolUse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Output;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    struct UnitRunner {
+        started: Notify,
+        release: Notify,
+        called: AtomicBool,
+    }
+
+    impl UnitRunner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: Notify::new(),
+                release: Notify::new(),
+                called: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl CommandRunner for UnitRunner {
+        fn run<'a>(
+            &'a self,
+            program: &'a str,
+            args: &'a [String],
+        ) -> super::super::sandbox::BoxFuture<'a, std::io::Result<Output>> {
+            self.run_with_stdin(program, args, None)
+        }
+
+        fn run_with_stdin<'a>(
+            &'a self,
+            _program: &'a str,
+            _args: &'a [String],
+            _stdin: Option<&'a [u8]>,
+        ) -> super::super::sandbox::BoxFuture<'a, std::io::Result<Output>> {
+            self.called.store(true, Ordering::SeqCst);
+            self.started.notify_one();
+            Box::pin(async move {
+                self.release.notified().await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    Ok(Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: b"done".to_vec(),
+                        stderr: Vec::new(),
+                    })
+                }
+                #[cfg(not(unix))]
+                {
+                    unreachable!("server CI is Unix-like");
+                }
+            })
+        }
+    }
+
+    struct UnitSandboxDriver;
+
+    impl super::super::sandbox::SandboxDriver for UnitSandboxDriver {
+        fn cli_program(&self) -> &'static str {
+            "mock-engine"
+        }
+
+        fn ensure_image<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> super::super::sandbox::BoxFuture<
+            'a,
+            Result<super::super::sandbox::EnsureOutcome, super::super::sandbox::SandboxError>,
+        > {
+            Box::pin(async {
+                Err(super::super::sandbox::SandboxError::Runtime {
+                    detail: "not used".into(),
+                })
+            })
+        }
+
+        fn start<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> super::super::sandbox::BoxFuture<
+            'a,
+            Result<super::super::sandbox::SandboxHandle, super::super::sandbox::SandboxError>,
+        > {
+            Box::pin(async {
+                Err(super::super::sandbox::SandboxError::Runtime {
+                    detail: "not used".into(),
+                })
+            })
+        }
+
+        fn exec<'a>(
+            &'a self,
+            _handle: &'a super::super::sandbox::SandboxHandle,
+            _command: &'a str,
+        ) -> super::super::sandbox::BoxFuture<
+            'a,
+            Result<super::super::sandbox::ExecResult, super::super::sandbox::SandboxError>,
+        > {
+            Box::pin(async {
+                Err(super::super::sandbox::SandboxError::Runtime {
+                    detail: "not used".into(),
+                })
+            })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _handle: &'a super::super::sandbox::SandboxHandle,
+        ) -> super::super::sandbox::BoxFuture<'a, Result<(), super::super::sandbox::SandboxError>>
+        {
+            Box::pin(async {
+                Err(super::super::sandbox::SandboxError::Runtime {
+                    detail: "not used".into(),
+                })
+            })
+        }
+    }
 
     #[test]
     fn tool_use_blocks_ignores_text() {
@@ -811,5 +1336,56 @@ mod tests {
     #[test]
     fn tool_use_blocks_on_string_content() {
         assert!(tool_use_blocks(&json!("just text")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_launch_dispatch_is_non_blocking_unit() {
+        let runner = UnitRunner::new();
+        let store = Store::open_in_memory().unwrap();
+        let broadcaster = EventBroadcaster::new();
+        let subagents = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let declaration = SubagentToolDef {
+            name: "launch_subagent".into(),
+            description: None,
+            input_schema: None,
+            image: "image".into(),
+            subagents: vec![super::super::subagent::SubagentDef {
+                harness: "mock".into(),
+                command_template: "mock --model {model}".into(),
+                prompt_via: "stdin".into(),
+                timeout_secs: Some(60),
+            }],
+        };
+        let sandbox = Arc::new(tokio::sync::Mutex::new(SandboxHandle {
+            id: "container".into(),
+            image: "image".into(),
+        }));
+        let started = tokio::time::Instant::now();
+        let (content, is_error) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            launch_remote_subagent(
+                &store,
+                &broadcaster,
+                "ses_unit",
+                "key_unit",
+                "launch_subagent",
+                &json!({ "harness": "mock", "model": "m", "prompt": "p" }),
+                &[declaration],
+                &Some(sandbox),
+                Arc::new(UnitSandboxDriver),
+                subagents,
+                runner.clone(),
+                std::time::Duration::from_secs(60),
+                8,
+            ),
+        )
+        .await
+        .expect("dispatch must not await the runner");
+        assert!(!is_error);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(content[0]["text"].as_str().unwrap().contains("started"));
+        runner.started.notified().await;
+        assert!(runner.called.load(Ordering::SeqCst));
+        runner.release.notify_one();
     }
 }

@@ -29,6 +29,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Output;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
@@ -59,6 +61,10 @@ use baesrv::store::{generate_id, Store};
 /// - `/mcp2` — two undeclared MCP tool uses, exercising the in-process loop.
 /// - `/mixed` — one undeclared MCP tool use and one client tool use.
 /// - `/mixed_sandbox` — one sandbox tool use and one client tool use.
+/// - `/subagent` — launch or status scripts selected by the user's prompt.
+/// - `/subagent_unknown` — directly calls the synthesized status tool with an
+///   unknown id, proving the failure is an in-band tool result.
+/// - `/subagent_lifecycle` — launch scripts for success/failure/timeout/cancel.
 /// - `/fail` — always HTTP 500 (a broken provider, for the fallback walk).
 async fn mock_handler(req: Request) -> Response {
     let path = req.uri().path().to_string();
@@ -89,7 +95,74 @@ async fn mock_handler(req: Request) -> Response {
             .into_response();
     }
 
-    let out = if path.starts_with("/tool") {
+    let out = if path.starts_with("/subagent_unknown") {
+        if has_tool_result {
+            final_text_turn("unknown status handled")
+        } else {
+            tool_use_turn(
+                "tu_subagent_unknown",
+                "remote_subagent_status",
+                json!({ "subagent_id": "sba_00000000000000000000000000000000" }),
+            )
+        }
+    } else if path.starts_with("/subagent_lifecycle") {
+        if has_tool_result {
+            final_text_turn("lifecycle handled")
+        } else {
+            let scenario = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .rev()
+                .find(|m| {
+                    m.get("role").and_then(Value::as_str) == Some("user")
+                        && !m.get("content").is_some_and(Value::is_array)
+                })
+                .and_then(|m| m.get("content").and_then(Value::as_str))
+                .unwrap_or("success");
+            let harness = if scenario.contains("failure") {
+                "failure"
+            } else if scenario.contains("timeout") {
+                "timeout"
+            } else if scenario.contains("cancel") {
+                "cancel"
+            } else {
+                "success"
+            };
+            tool_use_turn(
+                &format!("tu_subagent_{harness}"),
+                "launch_subagent",
+                json!({ "harness": harness, "model": "mock-model", "prompt": "do work" }),
+            )
+        }
+    } else if path.starts_with("/subagent") {
+        if has_tool_result {
+            final_text_turn("subagent handled")
+        } else {
+            let prompt = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .rev()
+                .find(|m| {
+                    m.get("role").and_then(Value::as_str) == Some("user")
+                        && !m.get("content").is_some_and(Value::is_array)
+                })
+                .and_then(|m| m.get("content").and_then(Value::as_str))
+                .unwrap_or("launch");
+            if prompt.contains("status") {
+                tool_use_turn("tu_subagent_status", "remote_subagent_status", json!({}))
+            } else {
+                tool_use_turn(
+                    "tu_subagent_launch",
+                    "launch_subagent",
+                    json!({ "harness": "mock", "model": "mock-model", "prompt": "do work" }),
+                )
+            }
+        }
+    } else if path.starts_with("/tool") {
         if has_tool_result {
             json!({ "role": "assistant", "stop_reason": "end_turn",
                     "content": [{ "type": "text", "text": "tool round-trip complete" }] })
@@ -419,6 +492,9 @@ fn default_provider_registry(
         entry("mixed", "mixed", "test-token"),
         entry("mixed_sandbox", "mixed_sandbox", "test-token"),
         entry("sandbox", "sandbox", "test-token"),
+        entry("subagent", "subagent", "test-token"),
+        entry("subagent_unknown", "subagent_unknown", "test-token"),
+        entry("subagent_lifecycle", "subagent_lifecycle", "test-token"),
         entry("triage", "triage", "test-token"),
         entry("fail", "fail", "test-token"),
         entry("badenv", "text", "${BAE_TEST_DEFINITELY_UNSET_XYZ}"),
@@ -504,6 +580,27 @@ async fn boot_server_capture(
     turn_timeout: Option<Duration>,
     sandbox_driver: Option<Arc<dyn baesrv::engine::sandbox::SandboxDriver>>,
 ) -> (TestServer, AppState) {
+    boot_server_capture_with_runner(
+        mcp_registry,
+        provider_registry,
+        turn_timeout,
+        sandbox_driver,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Boot variant used by remote-subagent tests. The runner and timeout must be
+/// installed before the router captures its `AppState` clone.
+async fn boot_server_capture_with_runner(
+    mcp_registry: std::collections::HashMap<String, baesrv::config_file::McpServerConfig>,
+    provider_registry: std::collections::HashMap<String, baesrv::engine::provider::ProviderConfig>,
+    turn_timeout: Option<Duration>,
+    sandbox_driver: Option<Arc<dyn baesrv::engine::sandbox::SandboxDriver>>,
+    command_runner: Option<Arc<dyn baesrv::engine::sandbox::CommandRunner>>,
+    subagent_timeout: Option<Duration>,
+) -> (TestServer, AppState) {
     let dir = std::env::temp_dir().join(format!("baesrv-it-{}", generate_id("")));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("test.db");
@@ -521,6 +618,12 @@ async fn boot_server_capture(
         // integration harness swaps in an offline mock exactly the way
         // `cli::build_sandbox_driver` installs the real one at boot.
         state.sandbox_driver = driver;
+    }
+    if let Some(runner) = command_runner {
+        state.command_runner = runner;
+    }
+    if let Some(timeout) = subagent_timeout {
+        state.subagent_timeout = timeout;
     }
 
     let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -564,6 +667,28 @@ async fn start_server_with_sandbox(
         providers,
         None,
         Some(driver),
+    )
+    .await
+}
+
+/// Boot a sandbox-backed server with the injectable remote-subagent command
+/// runner installed before the routers are constructed. The production
+/// `AppState` stores the runner as an `Arc`, so this is the same seam the RPC
+/// path consumes, without ever invoking a host CLI.
+async fn start_server_with_sandbox_runner(
+    driver: Arc<dyn baesrv::engine::sandbox::SandboxDriver>,
+    runner: Arc<dyn baesrv::engine::sandbox::CommandRunner>,
+    subagent_timeout: Option<Duration>,
+) -> (TestServer, AppState) {
+    let mock = start_mock().await;
+    let providers = default_provider_registry(&mock);
+    boot_server_capture_with_runner(
+        HashMap::new(),
+        providers,
+        None,
+        Some(driver),
+        Some(runner),
+        subagent_timeout,
     )
     .await
 }
@@ -4579,8 +4704,8 @@ async fn mixed_kind_fallback_chain_either_direction() {
 // asserted directly, alongside the persisted/broadcast event log.
 
 use baesrv::engine::sandbox::{
-    BoxFuture, EnsureOutcome, ExecResult, SandboxDriver, SandboxError, SandboxHandle,
-    SandboxImageStatus,
+    BoxFuture, CommandRunner, EnsureOutcome, ExecResult, SandboxDriver, SandboxError,
+    SandboxHandle, SandboxImageStatus,
 };
 use std::collections::HashSet;
 
@@ -4741,6 +4866,134 @@ impl SandboxDriver for MockSandboxDriver {
     }
 }
 
+// --- Offline remote-subagent command runner --------------------------------
+
+enum RunnerScript {
+    Immediate(Output),
+    Wait(Output),
+    Fail(String),
+}
+
+type CommandCall = (String, Vec<String>, Option<Vec<u8>>);
+
+struct RunnerInner {
+    scripts: Mutex<Vec<RunnerScript>>,
+    calls: Mutex<Vec<CommandCall>>,
+    started: tokio::sync::Notify,
+    started_flag: AtomicBool,
+    release: tokio::sync::Notify,
+    dropped: AtomicBool,
+}
+
+#[derive(Clone)]
+struct MockCommandRunner {
+    inner: Arc<RunnerInner>,
+}
+
+struct DropMarker(Arc<RunnerInner>);
+
+impl Drop for DropMarker {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl MockCommandRunner {
+    fn new(scripts: Vec<RunnerScript>) -> Self {
+        Self {
+            inner: Arc::new(RunnerInner {
+                scripts: Mutex::new(scripts),
+                calls: Mutex::new(Vec::new()),
+                started: tokio::sync::Notify::new(),
+                started_flag: AtomicBool::new(false),
+                release: tokio::sync::Notify::new(),
+                dropped: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    async fn wait_started(&self) {
+        if self.inner.started_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        self.inner.started.notified().await;
+    }
+
+    fn release(&self) {
+        self.inner.release.notify_waiters();
+    }
+
+    fn dropped(&self) -> bool {
+        self.inner.dropped.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> Vec<(String, Vec<String>, Option<Vec<u8>>)> {
+        self.inner.calls.lock().unwrap().clone()
+    }
+}
+
+impl CommandRunner for MockCommandRunner {
+    fn run<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+    ) -> BoxFuture<'a, std::io::Result<Output>> {
+        self.run_with_stdin(program, args, None)
+    }
+
+    fn run_with_stdin<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+        stdin: Option<&'a [u8]>,
+    ) -> BoxFuture<'a, std::io::Result<Output>> {
+        let script = self.inner.scripts.lock().unwrap().remove(0);
+        self.inner.calls.lock().unwrap().push((
+            program.to_owned(),
+            args.to_vec(),
+            stdin.map(ToOwned::to_owned),
+        ));
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            inner.started_flag.store(true, Ordering::SeqCst);
+            inner.started.notify_waiters();
+            let _drop_marker = DropMarker(inner.clone());
+            match script {
+                RunnerScript::Immediate(output) => Ok(output),
+                RunnerScript::Wait(output) => {
+                    inner.release.notified().await;
+                    Ok(output)
+                }
+                RunnerScript::Fail(detail) => Err(std::io::Error::other(detail)),
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+fn command_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout,
+        stderr,
+    }
+}
+
+fn remote_subagent_tool(image: &str, harnesses: &[&str]) -> Value {
+    json!({
+        "name": "launch_subagent",
+        "description": "Launch a CLI subagent (mock) to work on a task in the background.",
+        "input_schema": { "type": "object" },
+        "image": image,
+        "subagents": harnesses.iter().map(|h| json!({
+            "harness": h,
+            "command_template": "mock-cli --model {model}",
+            "prompt_via": "stdin",
+        })).collect::<Vec<_>>(),
+    })
+}
+
 // --- Sandbox-specific TestServer helpers ------------------------------------
 
 impl TestServer {
@@ -4784,6 +5037,32 @@ impl TestServer {
         let skey = v["session_key"].as_str().unwrap().to_string();
         self.register_driver(&sid, &skey).await;
         (sid, skey)
+    }
+
+    /// Open a session with a remote `subagent_tools` declaration and register
+    /// its driver, preserving the same setup used by the SDKs.
+    async fn open_session_with_subagent_tools(
+        &self,
+        client_key: &str,
+        tools: Value,
+        subagent_tools: Value,
+    ) -> (String, String, Value) {
+        let (status, v, raw) = self
+            .client_post(
+                "/api/v1/sessions",
+                Some(client_key),
+                json!({
+                    "client_version": "1.0.0",
+                    "tools": tools,
+                    "subagent_tools": subagent_tools,
+                }),
+            )
+            .await;
+        assert_eq!(status, 201, "open session (subagent_tools) failed: {raw}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let skey = v["session_key"].as_str().unwrap().to_string();
+        self.register_driver(&sid, &skey).await;
+        (sid, skey, v)
     }
 
     /// The full persisted event list (each item includes `payload`), oldest
@@ -5216,6 +5495,627 @@ async fn session_close_implicitly_stops_running_remote_sandbox() {
     let stop = find_ev(&evs, "session.sandbox.stop");
     assert_eq!(stop["payload"]["reason"], json!("session_close"));
     assert_ordered(&evs, "session.sandbox.stop", "session.sandbox.stopped");
+}
+
+// ===========================================================================
+// WI 0010 — Native CLI subagents (remote/server side)
+// ===========================================================================
+
+fn subagent_launch_id(events: &Value) -> String {
+    events["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|event| {
+            event["event_type"] == json!("tool.result")
+                && event["payload"]["dispatch"] == json!("subagent")
+                && event["payload"]["is_error"] == json!(false)
+                && event["payload"]["content"][0]["text"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .is_some_and(|result| result["status"] == json!("started"))
+        })
+        .and_then(|event| event["payload"]["content"][0]["text"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|result| result["subagent_id"].as_str().map(str::to_owned))
+        .expect("launch_subagent result with a subagent_id")
+}
+
+async fn wait_for_subagent_event(ts: &TestServer, sid: &str, skey: &str, event_type: &str) {
+    for _ in 0..200 {
+        let events = ts.session_events(sid, skey).await;
+        if events.iter().any(|e| e["event_type"] == json!(event_type)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{event_type} was not logged for {sid}");
+}
+
+fn subagent_event_sequence(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            event["event_type"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("session.subagent."))
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_subagent_dispatch_is_non_blocking_and_completes_in_background() {
+    let output = command_output(0, b"done".to_vec(), Vec::new());
+    let runner = MockCommandRunner::new(vec![RunnerScript::Wait(output)]);
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) =
+        start_server_with_sandbox_runner(Arc::new(driver), Arc::new(runner.clone()), None).await;
+    let profile = ts
+        .create_profile_with_sandboxes("subagent", json!(["subagent-image"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let declaration = remote_subagent_tool("subagent-image", &["mock"]);
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(&key, json!([]), json!([declaration]))
+        .await;
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "subagent-image" }),
+    )
+    .await;
+
+    let began = tokio::time::Instant::now();
+    let (_status, response, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "launch" }))
+        .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "run_turn awaited the sleeping runner: {raw}"
+    );
+    let launch_id = subagent_launch_id(&response);
+    let launch_result = response["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["event_type"] == json!("tool.result")
+                && event["payload"]["dispatch"] == json!("subagent")
+                && event["payload"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("\"status\":\"started\""))
+        })
+        .unwrap();
+    let result: Value = serde_json::from_str(
+        launch_result["payload"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["subagent_id"], json!(launch_id));
+    assert_eq!(result["harness"], json!("mock"));
+    assert_eq!(result["model"], json!("mock-model"));
+    assert_eq!(result["status"], json!("started"));
+
+    // Lifecycle logs are broadcast synchronously during dispatch (and are
+    // visible in the stream notifications); read the durable log here because
+    // the terminal result's `events` list intentionally contains only the
+    // turn-owned records.
+    let sync_events = ts.session_events(&sid, &skey).await;
+    assert!(sync_events
+        .iter()
+        .any(|e| e["event_type"] == json!("session.subagent.start")));
+    assert!(sync_events
+        .iter()
+        .any(|e| e["event_type"] == json!("session.subagent.running")));
+    assert!(!sync_events
+        .iter()
+        .any(|e| e["event_type"] == json!("session.subagent.completed")));
+
+    runner.wait_started().await;
+    assert!(!runner.dropped(), "pending command future ended too early");
+    runner.release();
+    wait_for_subagent_event(&ts, &sid, &skey, "session.subagent.completed").await;
+    let events = ts.session_events(&sid, &skey).await;
+    assert_eq!(
+        subagent_event_sequence(&events)
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "session.subagent.start",
+            "session.subagent.running",
+            "session.subagent.completed"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_status_tool_visibility_and_eviction_after_acknowledgment() {
+    let runner = MockCommandRunner::new(vec![RunnerScript::Immediate(command_output(
+        0,
+        b"done".to_vec(),
+        Vec::new(),
+    ))]);
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) =
+        start_server_with_sandbox_runner(Arc::new(driver), Arc::new(runner), None).await;
+    let profile = ts
+        .create_profile_with_sandboxes("subagent", json!(["subagent-image"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(
+            &key,
+            json!([]),
+            json!([remote_subagent_tool("subagent-image", &["mock"])]),
+        )
+        .await;
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "subagent-image" }),
+    )
+    .await;
+
+    let (_status, launch_response, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "launch" }))
+        .await;
+    assert_eq!(
+        launch_response["message"]["role"],
+        json!("assistant"),
+        "{raw}"
+    );
+    let launch_events = launch_response["events"].as_array().unwrap();
+    let provider_requests: Vec<&Value> = launch_events
+        .iter()
+        .filter(|e| e["event_type"] == json!("provider.request"))
+        .collect();
+    assert!(!provider_requests.is_empty());
+    assert!(!req_tool_names(&provider_requests[0]["payload"])
+        .contains(&"remote_subagent_status".to_owned()));
+    assert!(provider_requests
+        .iter()
+        .skip(1)
+        .any(|e| req_tool_names(&e["payload"]).contains(&"remote_subagent_status".to_owned())));
+    let launched_id = subagent_launch_id(&launch_response);
+
+    let (_status, status_response, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "status" }))
+        .await;
+    assert_eq!(
+        status_response["message"]["role"],
+        json!("assistant"),
+        "{raw}"
+    );
+    let status_requests: Vec<&Value> = status_response["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == json!("provider.request"))
+        .collect();
+    assert!(req_tool_names(&status_requests[0]["payload"])
+        .contains(&"remote_subagent_status".to_owned()));
+    assert!(!req_tool_names(&status_requests.last().unwrap()["payload"])
+        .contains(&"remote_subagent_status".to_owned()));
+    let status_result = status_response["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["event_type"] == json!("tool.result")
+                && e["payload"]["dispatch"] == json!("subagent")
+                && e["payload"]["is_error"] == json!(false)
+        })
+        .expect("acknowledging status result");
+    let status_content: Value = serde_json::from_str(
+        status_result["payload"]["content"][0]["text"]
+            .as_str()
+            .expect("status text"),
+    )
+    .expect("status JSON");
+    assert_eq!(status_content["subagents"][0]["subagent_id"], launched_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_subagent_lifecycle_sequences_cover_success_failure_timeout_and_cancel() {
+    let cases = [
+        (
+            "success",
+            RunnerScript::Immediate(command_output(0, b"ok".to_vec(), Vec::new())),
+            "session.subagent.completed",
+            None,
+        ),
+        (
+            "failure",
+            RunnerScript::Immediate(command_output(7, b"bad".to_vec(), b"err".to_vec())),
+            "session.subagent.failed",
+            Some("nonzero_exit"),
+        ),
+        (
+            "timeout",
+            RunnerScript::Wait(command_output(0, Vec::new(), Vec::new())),
+            "session.subagent.failed",
+            Some("timeout"),
+        ),
+        (
+            "cancel",
+            RunnerScript::Wait(command_output(0, Vec::new(), Vec::new())),
+            "session.subagent.cancelled",
+            Some("explicit"),
+        ),
+    ];
+
+    for (scenario, script, terminal, reason) in cases {
+        let runner = MockCommandRunner::new(vec![script]);
+        let driver = MockSandboxDriver::new();
+        let timeout = (scenario == "timeout").then_some(Duration::from_millis(25));
+        let (ts, _state) =
+            start_server_with_sandbox_runner(Arc::new(driver), Arc::new(runner.clone()), timeout)
+                .await;
+        let profile = ts
+            .create_profile_with_sandboxes(
+                "subagent_lifecycle",
+                json!(["subagent-image"]),
+                json!([]),
+            )
+            .await;
+        let key = ts.create_key(&profile).await;
+        let (sid, skey, _) = ts
+            .open_session_with_subagent_tools(
+                &key,
+                json!([]),
+                json!([remote_subagent_tool(
+                    "subagent-image",
+                    &["success", "failure", "timeout", "cancel"],
+                )]),
+            )
+            .await;
+        ts.rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "subagent-image" }),
+        )
+        .await;
+        let (_status, response, raw) = ts
+            .send_message(&sid, &skey, json!({ "content": scenario }))
+            .await;
+        assert_eq!(response["message"]["role"], json!("assistant"), "{raw}");
+        let subagent_id = subagent_launch_id(&response);
+        if scenario == "cancel" {
+            runner.wait_started().await;
+            let cancel = ts
+                .rpc_terminal(
+                    &sid,
+                    &skey,
+                    "session.cancelSubagent",
+                    json!({ "subagent_id": subagent_id }),
+                )
+                .await;
+            assert_eq!(cancel["result"]["was_running"], json!(true));
+        }
+        wait_for_subagent_event(&ts, &sid, &skey, terminal).await;
+        let events = ts.session_events(&sid, &skey).await;
+        let lifecycle = subagent_event_sequence(&events);
+        assert_eq!(
+            lifecycle
+                .iter()
+                .map(|e| e["event_type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            if terminal == "session.subagent.completed" {
+                vec![
+                    "session.subagent.start",
+                    "session.subagent.running",
+                    "session.subagent.completed",
+                ]
+            } else if terminal == "session.subagent.cancelled" {
+                vec![
+                    "session.subagent.start",
+                    "session.subagent.running",
+                    "session.subagent.cancelled",
+                ]
+            } else {
+                vec![
+                    "session.subagent.start",
+                    "session.subagent.running",
+                    "session.subagent.failed",
+                ]
+            }
+        );
+        for event in &lifecycle {
+            assert_eq!(event["payload"]["dispatch"], json!("remote"));
+            assert_eq!(event["payload"]["subagent_id"], json!(subagent_id));
+            assert_eq!(event["payload"]["harness"], json!(scenario));
+            assert_eq!(event["payload"]["model"], json!("mock-model"));
+        }
+        if let Some(reason) = reason {
+            assert_eq!(
+                lifecycle.last().unwrap()["payload"]["reason"],
+                json!(reason)
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_allowlist_and_image_gating_match_existing_client_and_sandbox_gates() {
+    let ts = start_server().await;
+    let profile = ts.create_profile("subagent", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let client_tool = json!({
+        "name": "launch_subagent",
+        "description": "client launch",
+        "input_schema": { "type": "object" },
+    });
+    let (status, _body, raw) = ts
+        .client_post(
+            "/api/v1/sessions",
+            Some(&key),
+            json!({ "client_version": "1.0.0", "tools": [client_tool] }),
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "client launch tool must use the normal allowlist: {raw}"
+    );
+    assert!(raw.contains("tool_not_allowed"));
+
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) = start_server_with_sandbox_runner(
+        Arc::new(driver.clone()),
+        Arc::new(MockCommandRunner::new(Vec::new())),
+        None,
+    )
+    .await;
+    let profile = ts
+        .create_profile_with_sandboxes("subagent", json!(["allowed-image"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(
+            &key,
+            json!([]),
+            json!([remote_subagent_tool("outside-allowlist", &["mock"])]),
+        )
+        .await;
+    // The image gate remains the exact existing startRemoteSandbox gate. A
+    // remote declaration does not create a second allowlist or bypass it.
+    let denied = ts
+        .rpc_terminal(
+            &sid,
+            &skey,
+            "session.startRemoteSandbox",
+            json!({ "image": "outside-allowlist" }),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], json!(-32011));
+    assert_eq!(driver.count("start:outside-allowlist"), 0);
+
+    // A declared remote image outside the profile's list cannot be smuggled
+    // into the already-running allowed container either: the dispatch image
+    // check rejects the mismatch before the command runner is touched.
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "allowed-image" }),
+    )
+    .await;
+    let (_status, response, _raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "launch" }))
+        .await;
+    let result = response["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.result"))
+        .unwrap();
+    assert_eq!(result["payload"]["is_error"], json!(true));
+    assert_eq!(
+        result["payload"]["content"][0]["text"],
+        json!("{\"error\":\"remote sandbox image mismatch: subagent declared \\\"outside-allowlist\\\" but the running sandbox uses \\\"allowed-image\\\"\"}")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_subagent_without_started_sandbox_is_error_shaped_and_never_host_executes() {
+    let runner = MockCommandRunner::new(Vec::new());
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) =
+        start_server_with_sandbox_runner(Arc::new(driver), Arc::new(runner.clone()), None).await;
+    let profile = ts
+        .create_profile_with_sandboxes("subagent", json!(["subagent-image"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(
+            &key,
+            json!([]),
+            json!([remote_subagent_tool("subagent-image", &["mock"])]),
+        )
+        .await;
+    let (_status, response, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "launch" }))
+        .await;
+    assert_eq!(response["message"]["role"], json!("assistant"), "{raw}");
+    let result = response["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == json!("tool.result"))
+        .unwrap();
+    assert_eq!(result["payload"]["is_error"], json!(true));
+    assert_eq!(
+        result["payload"]["content"][0]["text"],
+        json!("{\"error\":\"no remote sandbox is running for tool 'launch_subagent'; call session.startRemoteSandbox first\"}")
+    );
+    assert!(
+        runner.calls().is_empty(),
+        "remote launch used a host runner"
+    );
+    let events = ts.session_events(&sid, &skey).await;
+    assert!(!events.iter().any(|e| {
+        e["event_type"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("session.subagent."))
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_subagent_session_close_aborts_running_task_and_logs_session_close_cancel() {
+    let runner = MockCommandRunner::new(vec![RunnerScript::Wait(command_output(
+        0,
+        Vec::new(),
+        Vec::new(),
+    ))]);
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) =
+        start_server_with_sandbox_runner(Arc::new(driver), Arc::new(runner.clone()), None).await;
+    let profile = ts
+        .create_profile_with_sandboxes("subagent", json!(["subagent-image"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(
+            &key,
+            json!([]),
+            json!([remote_subagent_tool("subagent-image", &["mock"])]),
+        )
+        .await;
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "subagent-image" }),
+    )
+    .await;
+    let (_status, response, _raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "launch" }))
+        .await;
+    let _subagent_id = subagent_launch_id(&response);
+    runner.wait_started().await;
+    let (status, _body, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&skey))
+        .await;
+    assert_eq!(status, 200, "close: {raw}");
+    for _ in 0..100 {
+        if runner.dropped() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        runner.dropped(),
+        "session close did not abort the command future"
+    );
+    let events = ts.session_events(&sid, &skey).await;
+    let cancel = events
+        .iter()
+        .find(|e| e["event_type"] == json!("session.subagent.cancelled"))
+        .expect("session-close cancellation event");
+    assert_eq!(cancel["payload"]["dispatch"], json!("remote"));
+    assert_eq!(cancel["payload"]["reason"], json!("session_close"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_subagent_status_reports_capped_output_and_truncated_flag() {
+    let runner = MockCommandRunner::new(vec![RunnerScript::Immediate(command_output(
+        0,
+        vec![b'x'; 70_000],
+        vec![b'y'; 70_000],
+    ))]);
+    let driver = MockSandboxDriver::new();
+    let (ts, _state) =
+        start_server_with_sandbox_runner(Arc::new(driver), Arc::new(runner), None).await;
+    let profile = ts
+        .create_profile_with_sandboxes("subagent", json!(["subagent-image"]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(
+            &key,
+            json!([]),
+            json!([remote_subagent_tool("subagent-image", &["mock"])]),
+        )
+        .await;
+    ts.rpc_terminal(
+        &sid,
+        &skey,
+        "session.startRemoteSandbox",
+        json!({ "image": "subagent-image" }),
+    )
+    .await;
+    let (_status, launch, _raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "launch" }))
+        .await;
+    let subagent_id = subagent_launch_id(&launch);
+    wait_for_subagent_event(&ts, &sid, &skey, "session.subagent.completed").await;
+    let (_status, status, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "status" }))
+        .await;
+    assert_eq!(status["message"]["role"], json!("assistant"), "{raw}");
+    let result_event = status["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["event_type"] == json!("tool.result")
+                && e["payload"]["tool_use_id"] == json!("tu_subagent_status")
+        })
+        .expect("status tool result");
+    let content: Value = serde_json::from_str(
+        result_event["payload"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let entry = &content["subagents"][0];
+    assert_eq!(entry["subagent_id"], json!(subagent_id));
+    assert_eq!(entry["truncated"], json!(true));
+    assert_eq!(entry["stdout"].as_str().unwrap().len(), 65_536);
+    assert_eq!(entry["stderr"].as_str().unwrap().len(), 65_536);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_remote_subagent_status_is_an_in_band_tool_error() {
+    let ts = start_server().await;
+    let profile = ts
+        .create_profile("subagent_unknown", json!([]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey, _) = ts
+        .open_session_with_subagent_tools(
+            &key,
+            json!([]),
+            json!([remote_subagent_tool("unused-image", &["mock"])]),
+        )
+        .await;
+    let (status, response, raw) = ts
+        .send_message(&sid, &skey, json!({ "content": "unknown" }))
+        .await;
+    assert_eq!(status, 200, "unknown status must not abort the turn: {raw}");
+    assert_eq!(
+        response["message"]["content"][0]["text"],
+        json!("unknown status handled")
+    );
+    let result = response["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["event_type"] == json!("tool.result")
+                && e["payload"]["tool_use_id"] == json!("tu_subagent_unknown")
+        })
+        .expect("unknown status tool result");
+    assert_eq!(result["payload"]["is_error"], json!(true));
+    assert_eq!(
+        result["payload"]["content"][0]["text"],
+        json!("{\"error\":\"unknown subagent_id\"}")
+    );
 }
 
 // --- F) remote sandbox lifecycle, failure paths -----------------------------

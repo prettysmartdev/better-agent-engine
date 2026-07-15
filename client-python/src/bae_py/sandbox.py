@@ -119,6 +119,17 @@ class SandboxDriver(abc.ABC):
     async def stop(self, handle: SandboxHandle) -> None:
         """Stop and remove the container. Idempotent on an already-gone id."""
 
+    def engine_program(self) -> str:
+        """The CLI program name (``docker`` / ``container``) this driver wraps.
+
+        Not abstract (default ``"docker"``, :class:`AppleContainerDriver` overrides
+        to ``"container"``) so existing subclasses are unaffected. Lets a
+        ``Local``-target subagent (:mod:`bae_py.subagent`) build its own
+        ``<program> exec -i <cid> sh -c …`` invocation with stdin attached — the
+        driver's own :meth:`exec` never attaches stdin.
+        """
+        return "docker"
+
 
 # ---------------------------------------------------------------------------
 # CLI drivers (Docker / Apple Containers)
@@ -255,6 +266,9 @@ class AppleContainerDriver(SandboxDriver):
     async def stop(self, handle: SandboxHandle) -> None:
         await _cli_stop(_APPLE_CLI, handle)
 
+    def engine_program(self) -> str:
+        return "container"
+
 
 # ---------------------------------------------------------------------------
 # Shell escaping (the command-injection boundary)
@@ -276,8 +290,13 @@ def shell_quote(arg: str) -> str:
 _PLACEHOLDER = re.compile(r"\{([^}]*)\}")
 
 
-def _parse_params(template: str) -> list[str]:
-    """Ordered, unique ``{param}`` names in a template; raise on a malformed one."""
+def parse_params(template: str) -> list[str]:
+    """Ordered, unique ``{param}`` names in a template; raise on a malformed one.
+
+    Package-internal (not part of the public API, exported to no ``__all__``) —
+    :mod:`bae_py.subagent` reuses it verbatim for subagent command templates, the
+    same ``pub(crate)`` seam the Rust SDK exposes on ``sandbox.rs``.
+    """
     params: list[str] = []
     last = 0
     for m in _PLACEHOLDER.finditer(template):
@@ -291,10 +310,13 @@ def _parse_params(template: str) -> list[str]:
     return params
 
 
-def _interpolate(template: str, input: dict[str, Any]) -> str:
+def interpolate(template: str, input: dict[str, Any]) -> str:
     """Single pass: copy literal text and splice each ``{name}`` in as the
     shell-escaped input value, so a substituted value can never be re-interpreted
     as a placeholder.
+
+    Package-internal, like :func:`parse_params` — the injection boundary
+    :mod:`bae_py.subagent` reuses for its own command templates.
     """
 
     def repl(m: re.Match[str]) -> str:
@@ -358,6 +380,10 @@ class SandboxSession:
     def set_local_driver(self, driver: SandboxDriver) -> None:
         """Replace the local driver (e.g. :class:`AppleContainerDriver`, or a fake)."""
         self._driver = driver
+
+    def engine_program(self) -> str:
+        """The active local driver's CLI program name (:meth:`SandboxDriver.engine_program`)."""
+        return self._driver.engine_program()
 
     def _require_rpc(self) -> SandboxRpc:
         if self._rpc is None:
@@ -593,7 +619,7 @@ def run_shell_named(
     remote-auto, else a client-dispatched tool. Raises :class:`ValueError` if
     ``command_template`` is malformed.
     """
-    params = _parse_params(command_template)
+    params = parse_params(command_template)
     properties = {
         p: {
             "type": "string",
@@ -636,7 +662,7 @@ class _Template:
     template: str
 
     def build(self, input: dict[str, Any]) -> str:
-        return _interpolate(self.template, input)
+        return interpolate(self.template, input)
 
 
 def _exec_result_content(result: ExecResult) -> Content:

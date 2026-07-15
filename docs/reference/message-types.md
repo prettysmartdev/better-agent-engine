@@ -66,7 +66,7 @@ The server's final assistant turn for this iteration of the loop.
 
 **Mixed and all-client turns:** when the turn contains at least one
 `dispatch:"client"` tool, every `tool_use` block in this event's `content` —
-client-, sandbox-, and MCP-dispatched alike — carries a `dispatch` field, the
+client-, sandbox-, MCP-, and subagent-dispatched alike — carries a `dispatch` field, the
 same value as that block's [`tool.call`](#toolcall) event below:
 
 ```json
@@ -79,7 +79,7 @@ same value as that block's [`tool.call`](#toolcall) event below:
 }
 ```
 
-The `sandbox`/`mcp` blocks above have already been dispatched and answered by
+The `sandbox`/`mcp`/remote-subagent blocks above have already been dispatched and answered by
 the server by the time this event is emitted; only the `client` block is left
 for the harness to execute. See [Client API — tool call
 response](client-api.md#sessionsendmessage) for the full client contract.
@@ -220,13 +220,28 @@ The server or harness is about to invoke a tool.
 }
 ```
 
+**Subagent dispatch:**
+
+```json
+{
+  "id":        "tu_sub789",
+  "name":      "launch_subagent",
+  "input":     {"harness": "claude", "model": "claude-sonnet-5", "prompt": "…"},
+  "dispatch":  "subagent",
+  "server_name": null
+}
+```
+
 - `dispatch` is `"client"` for tools declared at session open, `"mcp"` for
   tools handled server-side by a configured MCP server, and `"sandbox"` for
   Auto-mode sandbox tools declared in the session's `sandbox_tools` array and
   dispatched server-side against the session's remote sandbox — see
   [Sandboxes — Auto vs. manual remote dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch).
+  `"subagent"` is used for server-dispatched remote subagents and their
+  synthesized status tool. A local subagent launch is an ordinary `"client"`
+  dispatch.
 - `server_name` is the MCP server's name from `bae-config.toml` for `"mcp"`
-  dispatch, or `null` for `"client"`/`"sandbox"` dispatch, or if the tool name
+  dispatch, or `null` for `"client"`/`"sandbox"`/`"subagent"` dispatch, or if the tool name
   was not found in any server's tool list (indicates a mis-routed call).
 
 ---
@@ -279,6 +294,20 @@ The result returned from a tool call.
   "dispatch":    "sandbox",
   "is_error":    false,
   "content":     [{"type": "text", "text": "Python 3.12.3\n"}]
+}
+```
+
+**Subagent result (remote launch or status):**
+
+```json
+{
+  "tool_use_id": "tu_sub789",
+  "dispatch":    "subagent",
+  "server_name": null,
+  "is_error":    false,
+  "content":     [
+    {"type": "text", "text": "{\"subagent_id\":\"sba_…\",\"harness\":\"claude\",\"model\":\"claude-sonnet-5\",\"status\":\"started\"}"}
+  ]
 }
 ```
 
@@ -395,6 +424,112 @@ The result of an Auto-dispatch sandbox tool call.
 
 ---
 
+### `session.subagent.start`
+
+A configured CLI-subagent launch was validated and accepted. The event is
+emitted before the background subprocess is started.
+
+```json
+{
+  "dispatch": "remote",
+  "subagent_id": "sba_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "harness": "claude",
+  "model": "claude-sonnet-5",
+  "detail": null
+}
+```
+
+`dispatch` is `remote` for a server-launched subagent and `local` for a
+client-harness report. Validation failures produce an error-shaped tool result
+and no subagent lifecycle events.
+
+---
+
+### `session.subagent.running`
+
+The launch was handed to the background task and the subprocess was spawned.
+Remote launches emit this event synchronously before returning the
+`{"status":"started"}` tool result; local SDKs report it after their own
+spawn. SDKs hold any immediately produced terminal report until this running
+report completes, so a fast process cannot produce `completed` or `failed`
+before `running`.
+
+```json
+{
+  "dispatch": "remote",
+  "subagent_id": "sba_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "harness": "claude",
+  "model": "claude-sonnet-5",
+  "detail": null
+}
+```
+
+---
+
+### `session.subagent.completed`
+
+The subagent exited successfully with exit code zero.
+
+```json
+{
+  "dispatch": "remote",
+  "subagent_id": "sba_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "harness": "claude",
+  "model": "claude-sonnet-5",
+  "detail": null,
+  "exit_code": 0
+}
+```
+
+Captured stdout/stderr is returned by the status tool, not copied into the
+lifecycle event. Remote terminal events may be appended after the turn that
+launched the subagent has already completed.
+
+---
+
+### `session.subagent.failed`
+
+The subprocess failed, exited non-zero, or exceeded its timeout.
+
+```json
+{
+  "dispatch": "remote",
+  "subagent_id": "sba_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "harness": "claude",
+  "model": "claude-sonnet-5",
+  "detail": "command not found",
+  "reason": "spawn_failed",
+  "exit_code": null
+}
+```
+
+`reason` is `nonzero_exit`, `spawn_failed`, or `timeout`. A timed-out
+subagent is exposed as `timed_out` by the status tool but uses this event with
+`reason: "timeout"`.
+
+---
+
+### `session.subagent.cancelled`
+
+The subagent was killed by explicit cancellation or session teardown.
+
+```json
+{
+  "dispatch": "remote",
+  "subagent_id": "sba_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "harness": "claude",
+  "model": "claude-sonnet-5",
+  "detail": null,
+  "reason": "explicit",
+  "exit_code": null
+}
+```
+
+`reason` is `explicit` for `session.cancelSubagent` (or SDK cancellation)
+and `session_close` when the session is closed while the task is running.
+
+---
+
 ### `session.open`
 
 Emitted when the session is created.
@@ -403,7 +538,8 @@ Emitted when the session is created.
 {
   "client_version": "1.0.0",
   "tools":          ["get_current_time"],
-  "sandbox_tools":  ["run_shell_command"]
+  "sandbox_tools":  ["run_shell_command"],
+  "subagent_tools": ["launch_subagent"]
 }
 ```
 
@@ -413,6 +549,10 @@ Emitted when the session is created.
   open (see [Client API — `sandbox_tools`](client-api.md#post-apiv1sessions--open-a-session)
   and [Sandboxes](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)) —
   empty when none were registered.
+- `subagent_tools` is the list of remote-launch tool names declared at open;
+  empty when none were registered. Local `launch_subagent` tools are listed
+  under `tools`, while their `local_subagent_status` tool is dynamic and is
+  not listed here.
 
 ---
 
@@ -427,7 +567,8 @@ tool set" fact, just via the join path instead of create.
 {
   "client_version": "1.2.0",
   "tools":          ["only_b"],
-  "sandbox_tools":  []
+  "sandbox_tools":  [],
+  "subagent_tools": ["launch_subagent"]
 }
 ```
 
@@ -738,6 +879,57 @@ session.stopRemoteSandbox                           -- session.sandbox.stop, ses
 See [Sandboxes](../guides/sandboxes.md) for the full lifecycle, the
 auto/manual dispatch distinction, and local-sandbox telemetry via
 `session.reportLocalSandbox`.
+
+**Local subagent lifecycle (client-launched):**
+
+```text
+session.open                    (tools: launch_subagent; status absent)
+client.message.send
+provider.request
+provider.response      (ok: true)
+tool.call              (dispatch: client, name: launch_subagent)
+session.subagent.start (dispatch: local)
+session.subagent.running (dispatch: local)
+server.message.send    (launch tool result: status "started"; turn pauses)
+… background CLI runs in the client harness …
+session.subagent.completed (dispatch: local, exit_code: 0)
+client.message.send
+provider.request       (local_subagent_status is now advertised)
+tool.call              (dispatch: client, name: local_subagent_status)
+tool.result            (dispatch: client, captured output)
+server.message.send    (status acknowledged; status tool disappears next turn)
+```
+
+The local `start`/`running`/terminal events are client-reported telemetry. A
+failure or timeout uses `session.subagent.failed`; cancellation uses
+`session.subagent.cancelled`.
+
+**Remote subagent lifecycle (server-launched):**
+
+```text
+client.message.send
+provider.request
+provider.response      (ok: true)
+tool.call              (dispatch: subagent, name: launch_subagent)
+session.subagent.start (dispatch: remote)
+session.subagent.running (dispatch: remote)
+tool.result            (dispatch: subagent, status "started")
+provider.request       (same turn continues; no wait for the CLI)
+provider.response
+server.message.send
+… detached CLI runs inside the session's remote sandbox …
+session.subagent.completed (dispatch: remote, exit_code: 0)
+client.message.send
+provider.request       (remote_subagent_status is now advertised)
+tool.call              (dispatch: subagent, name: remote_subagent_status)
+tool.result            (dispatch: subagent, captured output; terminal entry acknowledged)
+provider.response
+server.message.send    (status tool disappears on the following turn)
+```
+
+The remote terminal event is produced by the detached task after the launch
+turn has returned, so it can arrive independently of the launch turn's event
+result. The terminal status response evicts that entry after acknowledging it.
 
 **Multi-driver session (create, join, both drive):**
 

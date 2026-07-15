@@ -106,6 +106,8 @@ export interface SandboxDriver {
   exec(handle: SandboxHandle, command: string): Promise<ExecResult>;
   /** Stop and remove the container. Idempotent on an already-gone id. */
   stop(handle: SandboxHandle): Promise<void>;
+  /** Container engine executable used for an exec with attached stdin. */
+  engineProgram?(): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +238,9 @@ async function cliStop(cli: Cli, handle: SandboxHandle): Promise<void> {
  * `docker stop <id>`.
  */
 export class DockerDriver implements SandboxDriver {
+  engineProgram(): string {
+    return DOCKER_CLI.program;
+  }
   ensureImage(image: string): Promise<void> {
     return cliEnsureImage(DOCKER_CLI, image);
   }
@@ -257,6 +262,10 @@ export class DockerDriver implements SandboxDriver {
  */
 export class AppleContainerDriver implements SandboxDriver {
   private constructor() {}
+
+  engineProgram(): string {
+    return APPLE_CLI.program;
+  }
 
   /** Construct after checking the host OS (`process.platform === "darwin"`). */
   static create(
@@ -301,7 +310,7 @@ export function shellQuote(arg: string): string {
 }
 
 /** Ordered, unique `{param}` names in a template; throws on a malformed one. */
-function parseParams(template: string): string[] {
+export function parseParams(template: string): string[] {
   const params: string[] = [];
   const re = /\{([^}]*)\}/g;
   let m: RegExpExecArray | null;
@@ -326,7 +335,10 @@ function parseParams(template: string): string[] {
  * the **shell-escaped** input value. A single pass guarantees a substituted
  * value can never itself be re-interpreted as a placeholder.
  */
-function interpolate(template: string, input: Record<string, unknown>): string {
+export function interpolate(
+  template: string,
+  input: Record<string, unknown>,
+): string {
   return template.replace(/\{([^}]*)\}/g, (_full, name: string) => {
     const value = input[name];
     if (typeof value !== "string") {
@@ -383,6 +395,11 @@ export class SandboxSession {
   /** Replace the local driver (e.g. {@link AppleContainerDriver}, or a fake). */
   setLocalDriver(driver: SandboxDriver): void {
     this.driver = driver;
+  }
+
+  /** The configured local container engine executable. */
+  engineProgram(): string {
+    return this.driver.engineProgram?.() ?? "docker";
   }
 
   private requireRpc(): SandboxRpc {

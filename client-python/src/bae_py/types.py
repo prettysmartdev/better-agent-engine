@@ -201,6 +201,13 @@ class EventType(str, Enum):
     # Sandbox Auto-dispatch round-trip (unprefixed, mirroring mcp.request/response).
     SANDBOX_REQUEST = "sandbox.request"
     SANDBOX_RESPONSE = "sandbox.response"
+    # Subagent lifecycle (WI 0010); ``dispatch`` in the payload is ``local`` or
+    # ``remote``. Appended after SANDBOX_RESPONSE per the interface contract.
+    SUBAGENT_START = "session.subagent.start"
+    SUBAGENT_RUNNING = "session.subagent.running"
+    SUBAGENT_COMPLETED = "session.subagent.completed"
+    SUBAGENT_FAILED = "session.subagent.failed"
+    SUBAGENT_CANCELLED = "session.subagent.cancelled"
 
 
 @dataclass(slots=True)
@@ -422,5 +429,15 @@ def describe_event(event: SessionEvent) -> str:
             return f"sandbox request: {event.payload.get('tool')}"
         case EventType.SANDBOX_RESPONSE:
             return f"sandbox response (ok={event.payload.get('ok')})"
+        case EventType.SUBAGENT_START:
+            return f"subagent starting: {event.payload.get('harness')} ({event.payload.get('dispatch')})"
+        case EventType.SUBAGENT_RUNNING:
+            return f"subagent running: {event.payload.get('harness')} ({event.payload.get('dispatch')})"
+        case EventType.SUBAGENT_COMPLETED:
+            return f"subagent completed (exit_code={event.payload.get('exit_code')})"
+        case EventType.SUBAGENT_FAILED:
+            return f"subagent failed ({event.payload.get('reason')})"
+        case EventType.SUBAGENT_CANCELLED:
+            return f"subagent cancelled ({event.payload.get('reason')})"
         case _:
             assert_never(et)

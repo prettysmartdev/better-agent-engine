@@ -59,6 +59,23 @@ from .sandbox import (
     shell_quote,
 )
 from .secure import constant_time_equal, random_hex
+from .subagent import (
+    DEFAULT_SUBAGENT_TIMEOUT_SECS,
+    LAUNCH_SUBAGENT_TOOL,
+    LOCAL_SUBAGENT_STATUS_TOOL,
+    MAX_SUBAGENTS_PER_SESSION,
+    SUBAGENT_OUTPUT_CAP_BYTES,
+    ProcessSubagentRunner,
+    RunnerOutput,
+    SubagentDef,
+    SubagentLaunch,
+    SubagentRpc,
+    SubagentRunner,
+    SubagentSession,
+    SubagentTool,
+    SubagentToolDef,
+    launch_subagent,
+)
 from .tool import Tool, ToolHandler, ToolRegistry
 from .types import (
     Content,
@@ -118,6 +135,22 @@ __all__ = [
     "run_shell_command",
     "run_shell_named",
     "shell_quote",
+    # subagent tools
+    "SubagentSession",
+    "SubagentDef",
+    "SubagentLaunch",
+    "SubagentTool",
+    "SubagentToolDef",
+    "SubagentRunner",
+    "ProcessSubagentRunner",
+    "RunnerOutput",
+    "SubagentRpc",
+    "launch_subagent",
+    "DEFAULT_SUBAGENT_TIMEOUT_SECS",
+    "MAX_SUBAGENTS_PER_SESSION",
+    "SUBAGENT_OUTPUT_CAP_BYTES",
+    "LAUNCH_SUBAGENT_TOOL",
+    "LOCAL_SUBAGENT_STATUS_TOOL",
     # file tools
     "FileToolConfig",
     "read_file_tool",

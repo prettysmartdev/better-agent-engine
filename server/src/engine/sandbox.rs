@@ -37,6 +37,7 @@ use std::pin::Pin;
 use std::process::Output;
 use std::sync::Arc;
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// A boxed, sendable future — the return shape of every [`SandboxDriver`]
@@ -104,6 +105,12 @@ impl std::error::Error for SandboxError {}
 /// on a profile is the per-profile *image allowlist* layered on top of this
 /// host-wide driver.
 pub trait SandboxDriver: Send + Sync {
+    /// The container CLI used for `exec`. Kept on the driver so another
+    /// server-managed workload can run inside the same already-started
+    /// container without introducing a host-execution fallback.
+    fn cli_program(&self) -> &'static str {
+        "docker"
+    }
     /// Idempotent: inspect `image` locally; pull it if absent. Called both by
     /// the profile-write background task and defensively before [`Self::start`].
     fn ensure_image<'a>(
@@ -144,6 +151,18 @@ pub trait CommandRunner: Send + Sync {
         program: &'a str,
         args: &'a [String],
     ) -> BoxFuture<'a, std::io::Result<Output>>;
+
+    /// Like [`Self::run`], with bytes written to the child's stdin before it
+    /// is awaited. Test runners that only model completed commands may retain
+    /// the default; the production runner implements real stdin plumbing.
+    fn run_with_stdin<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+        _stdin: Option<&'a [u8]>,
+    ) -> BoxFuture<'a, std::io::Result<Output>> {
+        self.run(program, args)
+    }
 }
 
 /// The production runner: [`tokio::process::Command`], output fully captured,
@@ -156,10 +175,42 @@ impl CommandRunner for TokioCommandRunner {
         program: &'a str,
         args: &'a [String],
     ) -> BoxFuture<'a, std::io::Result<Output>> {
+        self.run_with_stdin(program, args, None)
+    }
+
+    fn run_with_stdin<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+        stdin: Option<&'a [u8]>,
+    ) -> BoxFuture<'a, std::io::Result<Output>> {
         Box::pin(async move {
             let mut cmd = Command::new(program);
             cmd.args(args).kill_on_drop(true);
-            cmd.output().await
+            if stdin.is_some() {
+                cmd.stdin(std::process::Stdio::piped());
+            }
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn()?;
+            let stdin_writer = if let (Some(bytes), Some(mut input)) = (stdin, child.stdin.take()) {
+                let bytes = bytes.to_vec();
+                // Drain stdout/stderr through `wait_with_output` concurrently
+                // with a potentially large prompt write. Awaiting the write
+                // first can deadlock when the child fills stdout before it
+                // consumes all of stdin.
+                Some(tokio::spawn(async move {
+                    input.write_all(&bytes).await?;
+                    input.shutdown().await
+                }))
+            } else {
+                None
+            };
+            let output = child.wait_with_output().await?;
+            if let Some(writer) = stdin_writer {
+                writer.await.map_err(std::io::Error::other)??;
+            }
+            Ok(output)
         })
     }
 }
@@ -243,6 +294,9 @@ impl DockerDriver {
 }
 
 impl SandboxDriver for DockerDriver {
+    fn cli_program(&self) -> &'static str {
+        "docker"
+    }
     fn ensure_image<'a>(
         &'a self,
         image: &'a str,
@@ -371,6 +425,9 @@ impl AppleContainerDriver {
 }
 
 impl SandboxDriver for AppleContainerDriver {
+    fn cli_program(&self) -> &'static str {
+        "container"
+    }
     fn ensure_image<'a>(
         &'a self,
         image: &'a str,

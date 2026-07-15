@@ -133,7 +133,7 @@ export interface Profile {
 // handling it here is a compile error.
 // ---------------------------------------------------------------------------
 
-/** The closed set of 22 event type strings. */
+/** The closed set of 27 event type strings. */
 export type EventType =
   | "client.message.send"
   | "server.message.send"
@@ -156,7 +156,12 @@ export type EventType =
   | "session.sandbox.stopped"
   | "session.sandbox.error"
   | "sandbox.request"
-  | "sandbox.response";
+  | "sandbox.response"
+  | "session.subagent.start"
+  | "session.subagent.running"
+  | "session.subagent.completed"
+  | "session.subagent.failed"
+  | "session.subagent.cancelled";
 
 export interface ClientMessagePayload {
   role: "user";
@@ -198,11 +203,11 @@ export interface ToolCallPayload {
   id: string;
   name: string;
   input: Record<string, unknown>;
-  dispatch: "client" | "sandbox" | "mcp";
+  dispatch: "client" | "sandbox" | "mcp" | "subagent";
 }
 export interface ToolResultPayload {
   tool_use_id: string;
-  dispatch: "client" | "sandbox" | "mcp";
+  dispatch: "client" | "sandbox" | "mcp" | "subagent";
   content: unknown;
   /** Present on `mcp`-dispatched results: the server that produced it. */
   server_name?: string | null;
@@ -239,6 +244,8 @@ export interface SessionOpenPayload {
   tools: string[];
   /** Names of the client's Auto-mode sandbox tools (server-dispatched). */
   sandbox_tools: string[];
+  /** Names of the client's remote subagent launch declarations. */
+  subagent_tools?: string[];
 }
 /**
  * Payload of a `session.join` event: a second (or further) client key minted a
@@ -250,6 +257,8 @@ export interface SessionJoinPayload {
   tools: string[];
   /** Names of the client's Auto-mode sandbox tools (server-dispatched). */
   sandbox_tools: string[];
+  /** Names of the client's remote subagent launch declarations. */
+  subagent_tools?: string[];
 }
 /**
  * Payload of a `session.driver.register` event: a client key registered as a
@@ -353,6 +362,27 @@ export type SandboxResponsePayload =
       error: string;
     };
 
+/** Common payload carried by every local/remote subagent lifecycle event. */
+export interface SubagentCommonPayload {
+  dispatch: "local" | "remote";
+  subagent_id: string;
+  harness: string;
+  model: string;
+  detail: string | null;
+}
+export type SubagentStartPayload = SubagentCommonPayload;
+export type SubagentRunningPayload = SubagentCommonPayload;
+export type SubagentCompletedPayload = SubagentCommonPayload & {
+  exit_code: number;
+};
+export type SubagentFailedPayload = SubagentCommonPayload & {
+  reason: "nonzero_exit" | "spawn_failed" | "timeout";
+  exit_code: number | null;
+};
+export type SubagentCancelledPayload = SubagentCommonPayload & {
+  reason: "explicit" | "session_close";
+};
+
 /** Maps each `event_type` to its payload shape. */
 interface EventPayloads {
   "client.message.send": ClientMessagePayload;
@@ -377,6 +407,11 @@ interface EventPayloads {
   "session.sandbox.error": SandboxLifecyclePayload;
   "sandbox.request": SandboxRequestPayload;
   "sandbox.response": SandboxResponsePayload;
+  "session.subagent.start": SubagentStartPayload;
+  "session.subagent.running": SubagentRunningPayload;
+  "session.subagent.completed": SubagentCompletedPayload;
+  "session.subagent.failed": SubagentFailedPayload;
+  "session.subagent.cancelled": SubagentCancelledPayload;
 }
 
 /** The envelope every event is wrapped in (also the events-endpoint row shape). */
@@ -450,6 +485,16 @@ export function describeEvent(event: SessionEvent): string {
       return `sandbox request ${event.payload.tool}`;
     case "sandbox.response":
       return `sandbox response (ok=${event.payload.ok})`;
+    case "session.subagent.start":
+      return `subagent start (${event.payload.harness}, ${event.payload.dispatch})`;
+    case "session.subagent.running":
+      return `subagent running (${event.payload.harness}, ${event.payload.dispatch})`;
+    case "session.subagent.completed":
+      return `subagent completed (${event.payload.harness}, ${event.payload.dispatch})`;
+    case "session.subagent.failed":
+      return `subagent failed (${event.payload.reason}, ${event.payload.dispatch})`;
+    case "session.subagent.cancelled":
+      return `subagent cancelled (${event.payload.reason}, ${event.payload.dispatch})`;
     default:
       return assertNever(event);
   }
@@ -474,6 +519,9 @@ export type RpcMethod =
   | "session.unsubscribe"
   | "session.execRemoteSandbox"
   | "session.reportLocalSandbox"
+  | "session.reportLocalSubagent"
+  | "session.cancelSubagent"
+  | "session.updateClientTools"
   | "session.startRemoteSandbox"
   | "session.stopRemoteSandbox";
 

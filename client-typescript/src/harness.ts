@@ -19,6 +19,13 @@ import {
 } from "./sandbox.js";
 import type { ToolDefinition } from "./tool.js";
 import {
+  SubagentSession,
+  type LocalSubagentReport,
+  type SubagentRpc,
+  type SubagentTool,
+  type SubagentToolDef,
+} from "./subagent.js";
+import {
   eventFromFrame,
   expectOk,
   FetchTransport,
@@ -67,6 +74,10 @@ export class Harness {
   private readonly sandbox = new SandboxSession();
   /** Auto-mode sandbox tool declarations, sent in the session-open list. */
   private readonly sandboxDefs: SandboxToolDef[] = [];
+  /** Remote subagent declarations sent in the session-open body. */
+  private readonly subagentDefs: SubagentToolDef[] = [];
+  /** Late-bound local subagent handle shared with registered tools and Session. */
+  private readonly subagent = new SubagentSession(this.sandbox);
 
   constructor(config: Config, options: HarnessOptions = {}) {
     this.config = config;
@@ -99,6 +110,21 @@ export class Harness {
       this.tools.set(tool.tool.name, tool.tool);
     } else {
       this.sandboxDefs.push(tool.def);
+    }
+    return this;
+  }
+
+  /** A handle for constructing local or remote subagent bindings before connect. */
+  subagentSession(): SubagentSession {
+    return this.subagent;
+  }
+
+  /** Register a builtin subagent tool, routing callable and declaration forms. */
+  registerSubagentTool(tool: SubagentTool): this {
+    if (tool.kind === "tool") {
+      this.tools.set(tool.tool.name, tool.tool);
+    } else {
+      this.subagentDefs.push(tool.def);
     }
     return this;
   }
@@ -153,6 +179,9 @@ export class Harness {
       ...(this.sandboxDefs.length > 0
         ? { sandbox_tools: this.sandboxDefs.map((d) => ({ ...d })) }
         : {}),
+      ...(this.subagentDefs.length > 0
+        ? { subagent_tools: this.subagentDefs.map((d) => ({ ...d })) }
+        : {}),
     };
     const res = await this.transport.request({
       method: "POST",
@@ -172,10 +201,22 @@ export class Harness {
       this.tools,
       this.hooks,
       this.sandbox,
+      this.subagent,
     );
+    this.subagent.setBaseClientTools(
+      [...this.tools.values()].map((t) => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.input_schema,
+      })),
+    );
+    if (this.subagent.hasLocal()) {
+      session.registerTool(this.subagent.statusTool());
+    }
     // Late-bind the sandbox transport now that the session exists, so any
     // sandbox tool built pre-connect can reach the remote RPC methods.
     this.sandbox.bind(session);
+    this.subagent.bind(session);
     return session;
   }
 
@@ -213,7 +254,7 @@ export class Harness {
  * server-returned tool calls to registered handlers and posting results back
  * until a non-tool-call assistant turn arrives — and `close()` ends it.
  */
-export class Session implements SandboxRpc {
+export class Session implements SandboxRpc, SubagentRpc {
   /** Monotonic JSON-RPC request id, unique per session. */
   private nextRpcId = 1;
 
@@ -225,6 +266,7 @@ export class Session implements SandboxRpc {
     private readonly tools: Map<string, ToolDefinition>,
     private readonly hooks: Hooks,
     private readonly sandbox: SandboxSession = new SandboxSession(),
+    private readonly subagent: SubagentSession = new SubagentSession(sandbox),
   ) {}
 
   /**
@@ -235,6 +277,11 @@ export class Session implements SandboxRpc {
    */
   sandboxSession(): SandboxSession {
     return this.sandbox;
+  }
+
+  /** A handle to this session's local subagent capability. */
+  subagentSession(): SubagentSession {
+    return this.subagent;
   }
 
   /** Register an additional client-dispatched tool on the live session. */
@@ -267,6 +314,30 @@ export class Session implements SandboxRpc {
       container_id: containerId,
       detail,
     });
+  }
+
+  /** Report a local subagent lifecycle transition (`session.reportLocalSubagent`). */
+  async reportLocalSubagent(report: LocalSubagentReport): Promise<void> {
+    await this.sandboxRpc("session.reportLocalSubagent", report);
+  }
+
+  /** Replace this client's dynamic tool declarations for the next provider call. */
+  async updateClientTools(
+    tools: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    await this.sandboxRpc("session.updateClientTools", { tools });
+  }
+
+  /** Cancel a server-tracked remote subagent through the RPC seam. */
+  async cancelRemoteSubagent(subagentId: string): Promise<unknown> {
+    return this.sandboxRpc("session.cancelSubagent", {
+      subagent_id: subagentId,
+    });
+  }
+
+  /** Cancel a local subagent in-process; terminal/unknown ids are no-ops. */
+  async cancelSubagent(subagentId: string): Promise<void> {
+    await this.subagent.cancelSubagent(subagentId);
   }
 
   /**
@@ -424,6 +495,7 @@ export class Session implements SandboxRpc {
    * own remote sandbox at session close.
    */
   async close(): Promise<void> {
+    await this.subagent.closeAll();
     await this.sandbox.stopAllLocal();
     const res = await this.transport.request({
       method: "DELETE",

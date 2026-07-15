@@ -49,8 +49,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use super::sessions::{
-    auth_session, event_view, stop_remote_sandbox, tool_result_blocks, MessageBody,
-    SandboxStopOutcome,
+    auth_session, enforce_tool_allowlist, event_view, stop_remote_sandbox, tool_result_blocks,
+    ClientToolDef, MessageBody, SandboxStopOutcome,
 };
 use crate::api::AppState;
 use crate::engine::{broadcast, session};
@@ -297,6 +297,30 @@ pub async fn rpc(
             .await
         }
         "session.reportLocalSandbox" => report_local_sandbox_rpc(
+            &state,
+            &session,
+            &acting_client_key_id,
+            id_present,
+            req_id,
+            &params,
+        ),
+        "session.reportLocalSubagent" => report_local_subagent_rpc(
+            &state,
+            &session,
+            &acting_client_key_id,
+            id_present,
+            req_id,
+            &params,
+        ),
+        "session.cancelSubagent" => cancel_subagent_rpc(
+            &state,
+            &session,
+            &acting_client_key_id,
+            id_present,
+            req_id,
+            &params,
+        ),
+        "session.updateClientTools" => update_client_tools_rpc(
             &state,
             &session,
             &acting_client_key_id,
@@ -664,6 +688,10 @@ async fn drive_send_message(
         mcp,
         state.sandbox_driver.clone(),
         sandbox,
+        state.subagents.clone(),
+        state.command_runner.clone(),
+        state.subagent_timeout,
+        state.max_subagents_per_session,
         &acting_client_key_id,
     );
     tokio::pin!(turn_fut);
@@ -1323,6 +1351,282 @@ fn report_local_sandbox_rpc(
             single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"))
         }
     }
+}
+
+/// Local-subagent lifecycle telemetry. Like local sandbox telemetry this is
+/// visibility only: a registered harness may report it, but the server never
+/// treats it as an authoritative process handle.
+fn report_local_subagent_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) = require_registered_driver(
+        state,
+        session,
+        acting_client_key_id,
+        "session.reportLocalSubagent",
+    ) {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    let event_type = match params.get("state").and_then(Value::as_str) {
+        Some("start") => EventType::SubagentStart,
+        Some("running") => EventType::SubagentRunning,
+        Some("completed") => EventType::SubagentCompleted,
+        Some("failed") => EventType::SubagentFailed,
+        Some("cancelled") => EventType::SubagentCancelled,
+        _ => return single_or_empty(id_present, error_obj(req_id, -32602, "Invalid params: \"state\" must be \"start\", \"running\", \"completed\", \"failed\", or \"cancelled\"")),
+    };
+    let required = |name: &str| {
+        params
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let (Some(subagent_id), Some(harness), Some(model)) = (
+        required("subagent_id"),
+        required("harness"),
+        required("model"),
+    ) else {
+        return single_or_empty(id_present, error_obj(req_id, -32602, "Invalid params: \"subagent_id\", \"harness\", and \"model\" must be non-empty strings"));
+    };
+    for name in ["detail", "reason"] {
+        if !matches!(
+            params.get(name),
+            None | Some(Value::Null) | Some(Value::String(_))
+        ) {
+            return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32602,
+                    format!("Invalid params: \"{name}\" must be a string or null"),
+                ),
+            );
+        }
+    }
+    if !params.get("exit_code").is_none_or(|v| v.as_i64().is_some()) {
+        return single_or_empty(
+            id_present,
+            error_obj(
+                req_id,
+                -32602,
+                "Invalid params: \"exit_code\" must be an integer",
+            ),
+        );
+    }
+    let mut payload = json!({
+        "dispatch": "local", "subagent_id": subagent_id, "harness": harness,
+        "model": model, "detail": params.get("detail").cloned().unwrap_or(Value::Null),
+    });
+    match event_type {
+        EventType::SubagentCompleted => {
+            payload["exit_code"] = params.get("exit_code").cloned().unwrap_or(Value::Null)
+        }
+        EventType::SubagentFailed => {
+            payload["reason"] = params.get("reason").cloned().unwrap_or(Value::Null);
+            payload["exit_code"] = params.get("exit_code").cloned().unwrap_or(Value::Null);
+        }
+        EventType::SubagentCancelled => {
+            payload["reason"] = params.get("reason").cloned().unwrap_or(Value::Null)
+        }
+        _ => {}
+    }
+    match broadcast::insert_and_publish(
+        &state.store,
+        &state.broadcaster,
+        &session.id,
+        Some(acting_client_key_id),
+        event_type,
+        &payload,
+    ) {
+        Ok(_) => single_or_empty(id_present, result_obj(req_id, json!({ "reported": true }))),
+        Err(e) => {
+            tracing::error!("database error in /rpc: {e}");
+            single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"))
+        }
+    }
+}
+
+fn cancel_subagent_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) = require_registered_driver(
+        state,
+        session,
+        acting_client_key_id,
+        "session.cancelSubagent",
+    ) {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    let Some(subagent_id) = params
+        .get("subagent_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return single_or_empty(
+            id_present,
+            error_obj(req_id, -32602, "Invalid params: missing \"subagent_id\""),
+        );
+    };
+    let cancelled = {
+        let mut all = state.subagents.lock().expect("subagents mutex poisoned");
+        let Some(task) = all
+            .get_mut(&session.id)
+            .and_then(|m| m.get_mut(subagent_id))
+        else {
+            return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32014,
+                    format!(
+                        "subagent_not_found: no tracked subagent {subagent_id:?} for this session"
+                    ),
+                ),
+            );
+        };
+        if task.status != crate::engine::subagent::SubagentStatus::Running {
+            None
+        } else {
+            if let Some(join) = task.task.take() {
+                join.abort();
+            }
+            task.status = crate::engine::subagent::SubagentStatus::Cancelled;
+            task.reason = Some("explicit".to_owned());
+            Some((task.harness.clone(), task.model.clone()))
+        }
+    };
+    let was_running = cancelled.is_some();
+    if let Some((harness, model)) = cancelled {
+        if let Err(e) = broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            &session.id,
+            Some(acting_client_key_id),
+            EventType::SubagentCancelled,
+            &json!({ "dispatch": "remote", "subagent_id": subagent_id, "harness": harness, "model": model, "detail": Value::Null, "reason": "explicit" }),
+        ) {
+            tracing::error!("failed to log subagent cancellation: {e}");
+        }
+    }
+    single_or_empty(
+        id_present,
+        result_obj(
+            req_id,
+            json!({ "cancelled": true, "subagent_id": subagent_id, "was_running": was_running }),
+        ),
+    )
+}
+
+fn update_client_tools_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) = require_registered_driver(
+        state,
+        session,
+        acting_client_key_id,
+        "session.updateClientTools",
+    ) {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    if session.state != STATE_OPEN {
+        return single_or_empty(
+            id_present,
+            error_obj(
+                req_id,
+                -32000,
+                format!("session is {}, not open", session.state),
+            ),
+        );
+    }
+    let Some(raw_tools) = params.get("tools").cloned() else {
+        return single_or_empty(
+            id_present,
+            error_obj(req_id, -32602, "Invalid params: missing \"tools\""),
+        );
+    };
+    let tools: Vec<ClientToolDef> =
+        match serde_json::from_value::<Vec<ClientToolDef>>(raw_tools.clone()) {
+            Ok(tools) if tools.iter().all(|t| !t.name.trim().is_empty()) => tools,
+            Err(e) => {
+                return single_or_empty(
+                    id_present,
+                    error_obj(req_id, -32602, format!("Invalid params: {e}")),
+                )
+            }
+            _ => {
+                return single_or_empty(
+                    id_present,
+                    error_obj(
+                        req_id,
+                        -32602,
+                        "Invalid params: every tool requires a non-empty \"name\"",
+                    ),
+                )
+            }
+        };
+    let profile = match state
+        .store
+        .with_conn(|c| profiles::get(c, &session.profile_id))
+    {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"))
+        }
+        Err(e) => {
+            tracing::error!("database error in /rpc: {e}");
+            return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+        }
+    };
+    if tools
+        .iter()
+        .any(|t| t.name == crate::engine::subagent::REMOTE_STATUS_TOOL_NAME)
+    {
+        return single_or_empty(id_present, error_obj(req_id, -32015, "tool_not_allowed: tool \"remote_subagent_status\" is not in the profile's allowlist"));
+    }
+    if let Err(_e) = enforce_tool_allowlist(&profile, &tools) {
+        let name = tools
+            .iter()
+            .find(|t| {
+                !profile
+                    .allowed_tools
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(&t.name)))
+            })
+            .map(|t| t.name.as_str())
+            .unwrap_or("");
+        return single_or_empty(
+            id_present,
+            error_obj(
+                req_id,
+                -32015,
+                format!("tool_not_allowed: tool {name:?} is not in the profile's allowlist"),
+            ),
+        );
+    }
+    if let Err(e) = state
+        .store
+        .with_conn(|c| sessions::set_client_tools(c, &session.id, acting_client_key_id, &raw_tools))
+    {
+        tracing::error!("database error in /rpc: {e}");
+        return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+    }
+    single_or_empty(id_present, result_obj(req_id, json!({ "updated": true })))
 }
 
 // ---------------------------------------------------------------------------

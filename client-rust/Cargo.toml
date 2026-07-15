@@ -20,11 +20,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Ergonomic error enum for the public `Error` type.
 thiserror = "2"
+# Cryptographically-random bytes for locally-generated subagent ids
+# ([`subagent`]): 16 OS-random bytes rendered as `sba_<hex>`, the same id shape
+# the server mints for remote subagents. Already in the tree via reqwest/rustls.
+getrandom = "0.2"
 # The local sandbox driver ([`sandbox`]) shells out to the `docker`/`container`
 # CLI via `tokio::process`, exactly as the server's driver does — no Docker SDK.
 # `process` gives async subprocesses; `io-util` is required by `Command::output`.
-# The library still never spawns tasks; it only awaits subprocesses it starts.
-tokio = { version = "1", default-features = false, features = ["process", "io-util", "sync"] }
+# `rt`/`time` back the fire-and-forget subagent watcher tasks ([`subagent`]) —
+# the one place the library spawns background tasks (with a kill-on-timeout and
+# a `kill_on_drop` child), rather than only awaiting subprocesses it starts.
+tokio = { version = "1", default-features = false, features = ["process", "io-util", "sync", "rt", "time"] }
 
 [dev-dependencies]
 # Async runtime for the examples and the async unit tests. Not needed by the

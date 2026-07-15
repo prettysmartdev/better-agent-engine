@@ -60,8 +60,9 @@ def test_message_from_wire_and_to_wire() -> None:
 
 
 def test_event_type_is_closed_and_complete() -> None:
-    # The exact twenty-two strings from the wire contract (§8); WI 0006 added the
-    # eight sandbox events to the original fourteen.
+    # The exact twenty-seven strings from the wire contract (§8); WI 0006 added
+    # the eight sandbox events to the original fourteen, WI 0010 the five
+    # subagent lifecycle events.
     assert {e.value for e in EventType} == {
         "client.message.send",
         "server.message.send",
@@ -85,6 +86,11 @@ def test_event_type_is_closed_and_complete() -> None:
         "session.sandbox.error",
         "sandbox.request",
         "sandbox.response",
+        "session.subagent.start",
+        "session.subagent.running",
+        "session.subagent.completed",
+        "session.subagent.failed",
+        "session.subagent.cancelled",
     }
 
 

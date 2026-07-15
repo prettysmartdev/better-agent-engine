@@ -37,6 +37,10 @@ use crate::sandbox::{
     ExecResult, LocalSandboxReport, RemoteSandboxStarted, RemoteSandboxStopped, SandboxFuture,
     SandboxRpc, SandboxSession, SandboxTool, SandboxToolDef,
 };
+use crate::subagent::{
+    LocalSubagentReport, SubagentFuture, SubagentRpc, SubagentSession, SubagentTool,
+    SubagentToolDef,
+};
 use crate::tool::Tool;
 use crate::types::{
     Content, ContentBlock, EventView, JsonRpcFrame, JsonRpcRequest, Message, Profile,
@@ -468,6 +472,75 @@ impl SandboxRpc for HttpTransport {
     }
 }
 
+impl HttpTransport {
+    /// `session.reportLocalSubagent`: mirror a local subagent lifecycle
+    /// transition into the session's event log. Telemetry, like
+    /// `reportLocalSandbox` — no turn-loop involvement.
+    async fn report_local_subagent_rpc(&self, report: &LocalSubagentReport) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.reportLocalSubagent", report);
+        self.drive_to_terminal(&req).await
+    }
+
+    /// `session.updateClientTools`: full-replace this client's advertised
+    /// client-tool list (drives the disappearing status tool).
+    async fn update_client_tools_rpc(&self, tools: Vec<serde_json::Value>) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(
+            self.next_id(),
+            "session.updateClientTools",
+            json!({ "tools": tools }),
+        );
+        self.drive_to_terminal(&req).await
+    }
+
+    /// `session.cancelSubagent`: cancel a **remote** (server-tracked) subagent.
+    async fn cancel_subagent_rpc(&self, subagent_id: &str) -> Result<(), Error> {
+        let req = JsonRpcRequest::new(
+            self.next_id(),
+            "session.cancelSubagent",
+            json!({ "subagent_id": subagent_id }),
+        );
+        self.drive_to_terminal(&req).await
+    }
+
+    /// Drive a non-turn JSON-RPC request to its terminal frame, surfacing an
+    /// error frame as [`Error::Rpc`] and discarding the terminal `result`.
+    async fn drive_to_terminal<P: Serialize>(&self, req: &JsonRpcRequest<P>) -> Result<(), Error> {
+        let mut reader = self.open_rpc(req).await?;
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if frame.id.is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SubagentRpc for HttpTransport {
+    fn report_local_subagent(
+        &self,
+        report: LocalSubagentReport,
+    ) -> SubagentFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.report_local_subagent_rpc(&report).await })
+    }
+
+    fn update_client_tools(
+        &self,
+        tools: Vec<serde_json::Value>,
+    ) -> SubagentFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.update_client_tools_rpc(tools).await })
+    }
+
+    fn cancel_subagent(&self, subagent_id: String) -> SubagentFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.cancel_subagent_rpc(&subagent_id).await })
+    }
+}
+
 /// Does this turn's event list mark an all-providers-failed outcome? The server
 /// no longer returns a `502`: the failure turn arrives as a normal terminal
 /// result, distinguished only by a `session.error`/`all_providers_failed` event.
@@ -564,6 +637,9 @@ struct OpenRequest {
     /// registered, so the field is invisible to servers/harnesses not using it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sandbox_tools: Vec<serde_json::Value>,
+    /// Remote-launch subagent declarations; omitted when none are registered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subagent_tools: Vec<serde_json::Value>,
 }
 
 /// `POST /api/v1/sessions` success body.
@@ -605,19 +681,29 @@ pub struct Harness {
     /// Auto-mode sandbox tool declarations, sent in the session-open
     /// `sandbox_tools` array.
     sandbox_defs: Vec<SandboxToolDef>,
+    /// The late-bound subagent handle shared with every subagent tool and the
+    /// eventual [`Session`]; its transport is filled in [`Harness::open`].
+    subagent: SubagentSession,
+    /// Remote-launch subagent declarations, sent in the session-open
+    /// `subagent_tools` array.
+    subagent_defs: Vec<SubagentToolDef>,
 }
 
 impl Harness {
     /// Create a harness from a [`Config`], with an empty tool registry and no
     /// hooks.
     pub fn new(config: Config) -> Self {
+        let sandbox = SandboxSession::new();
+        let subagent = SubagentSession::new(sandbox.clone());
         Self {
             config,
             http: reqwest::Client::new(),
             tools: HashMap::new(),
             hooks: Hooks::default(),
-            sandbox: SandboxSession::new(),
+            sandbox,
             sandbox_defs: Vec::new(),
+            subagent,
+            subagent_defs: Vec::new(),
         }
     }
 
@@ -649,6 +735,39 @@ impl Harness {
             }
             SandboxTool::Def(d) => {
                 self.sandbox_defs.push(d);
+            }
+        }
+        self
+    }
+
+    /// A handle to this harness's subagent capability, for building subagent
+    /// tools **before** `connect()`. Its transport is late-bound at connect; see
+    /// [`crate::subagent`] for the required ordering. Pass the handle to
+    /// [`launch_subagent`](crate::subagent::launch_subagent), then register the
+    /// result with [`with_subagent_tool`](Harness::with_subagent_tool).
+    pub fn subagent_session(&self) -> SubagentSession {
+        self.subagent.clone()
+    }
+
+    /// Register a builtin subagent tool, routing it to the correct place: a
+    /// client-dispatched [`SubagentTool::Tool`] (a `Local` launch) joins the
+    /// ordinary tool registry — and pulls in the automatic `local_subagent_status`
+    /// tool at connect — while a [`SubagentTool::Def`] (a `Remote` launch) joins
+    /// the session-open `subagent_tools` list. Builder-style; returns `self`.
+    pub fn with_subagent_tool(mut self, tool: SubagentTool) -> Self {
+        self.register_subagent_tool(tool);
+        self
+    }
+
+    /// Register a builtin subagent tool in place (non-consuming). See
+    /// [`with_subagent_tool`](Harness::with_subagent_tool).
+    pub fn register_subagent_tool(&mut self, tool: SubagentTool) -> &mut Self {
+        match tool {
+            SubagentTool::Tool(t) => {
+                self.tools.insert(t.name.clone(), t);
+            }
+            SubagentTool::Def(d) => {
+                self.subagent_defs.push(d);
             }
         }
         self
@@ -718,10 +837,12 @@ impl Harness {
         let Harness {
             config,
             http,
-            tools,
+            mut tools,
             hooks,
             sandbox,
             sandbox_defs,
+            subagent,
+            subagent_defs,
         } = self;
 
         let body = OpenRequest {
@@ -730,6 +851,10 @@ impl Harness {
             sandbox_tools: sandbox_defs
                 .iter()
                 .map(SandboxToolDef::declaration)
+                .collect(),
+            subagent_tools: subagent_defs
+                .iter()
+                .map(SubagentToolDef::declaration)
                 .collect(),
         };
 
@@ -759,6 +884,18 @@ impl Harness {
         // sandbox tool built pre-connect can reach `session.execRemoteSandbox` /
         // `session.reportLocalSandbox` the first time it fires.
         sandbox.bind(transport.clone() as Arc<dyn SandboxRpc>);
+        subagent.bind(transport.clone() as Arc<dyn SubagentRpc>);
+
+        // If a Local launch tool was registered, wire the automatic
+        // `local_subagent_status` tool: capture the declared client-tool list
+        // (so `session.updateClientTools` can full-replace it) and register the
+        // status tool for **dispatch only** — it is advertised dynamically, never
+        // in the session-open `tools` array.
+        if subagent.has_local() {
+            subagent.set_base_client_tools(body.tools.clone());
+            let status = subagent.status_tool();
+            tools.insert(status.name.clone(), status);
+        }
 
         // Register as a driver before any send: session.sendMessage requires it
         // (a `-32001` error otherwise). Application code never calls this.
@@ -771,6 +908,7 @@ impl Harness {
             tools,
             hooks,
             sandbox,
+            subagent,
         })
     }
 }
@@ -786,6 +924,7 @@ pub struct Session {
     tools: HashMap<String, Tool>,
     hooks: Hooks,
     sandbox: SandboxSession,
+    subagent: SubagentSession,
 }
 
 impl Session {
@@ -882,6 +1021,28 @@ impl Session {
         self.transport.stop_remote_sandbox_rpc().await
     }
 
+    /// A clone of this session's [`SubagentSession`] handle — for building
+    /// subagent tools after connect, or driving cancellation directly. Note a
+    /// `Local` launch tool must be built and registered on the [`Harness`]
+    /// **before** connect (it is declared in the session-open `tools` array).
+    pub fn subagent_session(&self) -> SubagentSession {
+        self.subagent.clone()
+    }
+
+    /// Cancel a **local** subagent in-process (`Session::cancel_subagent`):
+    /// abort its background task (killing the child), mark it `Cancelled`, and
+    /// report `cancelled{reason:"explicit"}`. Idempotent on a terminal/unknown
+    /// id. Does not touch remote subagents — use
+    /// [`cancel_remote_subagent`](Session::cancel_remote_subagent) for those.
+    pub async fn cancel_subagent(&self, subagent_id: &str) {
+        self.subagent.cancel_subagent(subagent_id).await
+    }
+
+    /// Cancel a **remote** (server-tracked) subagent via `session.cancelSubagent`.
+    pub async fn cancel_remote_subagent(&self, subagent_id: &str) -> Result<(), Error> {
+        self.transport.cancel_subagent_rpc(subagent_id).await
+    }
+
     /// Subscribe to this session's live `session.event` feed via the
     /// `session.subscribe` JSON-RPC method, invoking `on_event` for each event
     /// in order. With a `since_event_id`, the server first replays persisted
@@ -914,10 +1075,13 @@ impl Session {
     /// Close the session on the server (idempotent from the caller's view; a
     /// second close returns a `session_closed` [`Error::Api`]).
     ///
-    /// Before releasing the session, stops any still-running **local** sandboxes
-    /// this session started — reporting `stopped` for each — mirroring how the
-    /// server stops its own remote sandbox at session close.
+    /// Before releasing the session, kills any still-running **local**
+    /// subagents (reporting `cancelled{reason:"session_close"}` for each and
+    /// retiring the status tool), then stops any still-running **local**
+    /// sandboxes this session started — mirroring how the server tears down its
+    /// own remote subagents and sandbox at session close.
     pub async fn close(&mut self) -> Result<(), Error> {
+        self.subagent.close_all().await;
         self.sandbox.stop_all_local().await;
         self.transport.close().await
     }
@@ -1937,5 +2101,326 @@ mod tests {
         // The client harness actually dispatched the tool, issuing the fully
         // interpolated command over `session.execRemoteSandbox`.
         assert_eq!(*rpc.execs.lock().unwrap(), vec!["ls -la".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-SDK local-subagent parity (WI 0010)
+    //
+    // The three client SDKs must observe an IDENTICAL ordered live event
+    // sequence for the same scripted local launch -> poll(running) ->
+    // poll(completed) flow, driven entirely through client-dispatched tools
+    // (no server-side subagent dispatch is exercised here — that is the
+    // server suite's job). The canonical sequence below MUST stay
+    // byte-for-byte identical to the arrays in the TS and Python SDK parity
+    // tests:
+    //   - client-typescript/src/subagent.test.ts (LOCAL_SUBAGENT_PARITY_SEQUENCE)
+    //   - client-python/tests/test_subagent_parity.py (same name)
+    // -----------------------------------------------------------------------
+
+    /// The full observed sequence across two `send()` calls: launch, a poll
+    /// that still finds it `running`, a "check back later" reply, then (after
+    /// the fake subprocess is released to "exit") a second `send()` whose poll
+    /// finds it `completed`.
+    const LOCAL_SUBAGENT_PARITY_SEQUENCE: [&str; 18] = [
+        "provider.request",
+        "provider.response",
+        "server.message.send", // assistant: tool_use launch_subagent
+        "client.message.send", // tool_result: {"status":"started",...}
+        "provider.request",
+        "provider.response",
+        "server.message.send", // assistant: tool_use local_subagent_status
+        "client.message.send", // tool_result: {"subagents":[{"status":"running",...}]}
+        "provider.request",
+        "provider.response",
+        "server.message.send", // assistant: final text; first send() ends
+        "provider.request",
+        "provider.response",
+        "server.message.send", // assistant: tool_use local_subagent_status (2nd send())
+        "client.message.send", // tool_result: {"subagents":[{"status":"completed",...}]}
+        "provider.request",
+        "provider.response",
+        "server.message.send", // assistant: final text; second send() ends
+    ];
+
+    /// A [`crate::subagent::SubagentRunner`] whose single subprocess blocks on
+    /// a [`tokio::sync::Notify`] gate until the test releases it, so the
+    /// launch -> poll(running) -> poll(completed) ordering is deterministic.
+    struct GatedSubagentRunner {
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl crate::subagent::SubagentRunner for GatedSubagentRunner {
+        fn run<'a>(
+            &'a self,
+            _program: &'a str,
+            _args: &'a [String],
+            _stdin: Option<&'a [u8]>,
+        ) -> SubagentFuture<'a, std::io::Result<crate::subagent::RunnerOutput>> {
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                Ok(crate::subagent::RunnerOutput {
+                    stdout: "subagent done".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            })
+        }
+    }
+
+    /// A recording [`SubagentRpc`]: mirrors `RecordingSandboxRpc` above, plus a
+    /// notify fired on every terminal `reportLocalSubagent` — the test's
+    /// synchronization point for the detached watcher.
+    #[derive(Default)]
+    struct RecordingSubagentRpc {
+        updates: Mutex<Vec<Vec<serde_json::Value>>>,
+        terminal_notify: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    }
+
+    impl SubagentRpc for RecordingSubagentRpc {
+        fn report_local_subagent(
+            &self,
+            report: LocalSubagentReport,
+        ) -> SubagentFuture<'_, Result<(), Error>> {
+            let terminal = matches!(report.state.as_str(), "completed" | "failed" | "cancelled");
+            if terminal {
+                if let Some(n) = self.terminal_notify.lock().unwrap().as_ref() {
+                    n.notify_one();
+                }
+            }
+            Box::pin(async { Ok(()) })
+        }
+        fn update_client_tools(
+            &self,
+            tools: Vec<serde_json::Value>,
+        ) -> SubagentFuture<'_, Result<(), Error>> {
+            self.updates.lock().unwrap().push(tools);
+            Box::pin(async { Ok(()) })
+        }
+        fn cancel_subagent(&self, _subagent_id: String) -> SubagentFuture<'_, Result<(), Error>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The five scripted assistant turns backing [`LOCAL_SUBAGENT_PARITY_SEQUENCE`].
+    fn local_subagent_parity_outcomes() -> Vec<Result<SendOutcome, Error>> {
+        vec![
+            // Turn A1: assistant launches a subagent.
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: Message::assistant(vec![tool_use(
+                        "tu_launch",
+                        "launch_subagent",
+                        json!({ "harness": "claude", "model": "claude-sonnet-5", "prompt": "do the task" }),
+                        None,
+                    )]),
+                    events: vec![],
+                },
+                notifications: vec![
+                    parity_event("provider.request", json!({ "attempt": 0 })),
+                    parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                    parity_event(
+                        "server.message.send",
+                        json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "tu_launch", "name": "launch_subagent", "input": { "harness": "claude", "model": "claude-sonnet-5", "prompt": "do the task" } }] }),
+                    ),
+                ],
+            }),
+            // Turn A2: assistant polls; the fake subprocess is still gated.
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: Message::assistant(vec![tool_use(
+                        "tu_poll1",
+                        "local_subagent_status",
+                        json!({}),
+                        None,
+                    )]),
+                    events: vec![],
+                },
+                notifications: vec![
+                    parity_event(
+                        "client.message.send",
+                        json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu_launch" }] }),
+                    ),
+                    parity_event("provider.request", json!({ "attempt": 0 })),
+                    parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                    parity_event(
+                        "server.message.send",
+                        json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "tu_poll1", "name": "local_subagent_status", "input": {} }] }),
+                    ),
+                ],
+            }),
+            // Turn A3: assistant reports back and the first send() ends.
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: Message::assistant(vec![ContentBlock::Text {
+                        text: "still running, I'll check back".into(),
+                    }]),
+                    events: vec![],
+                },
+                notifications: vec![
+                    parity_event(
+                        "client.message.send",
+                        json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu_poll1" }] }),
+                    ),
+                    parity_event("provider.request", json!({ "attempt": 0 })),
+                    parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                    parity_event(
+                        "server.message.send",
+                        json!({ "role": "assistant", "content": [{ "type": "text", "text": "still running, I'll check back" }] }),
+                    ),
+                ],
+            }),
+            // Turn B1: a fresh send() polls again; by now the subagent completed.
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: Message::assistant(vec![tool_use(
+                        "tu_poll2",
+                        "local_subagent_status",
+                        json!({}),
+                        None,
+                    )]),
+                    events: vec![],
+                },
+                notifications: vec![
+                    parity_event("provider.request", json!({ "attempt": 0 })),
+                    parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                    parity_event(
+                        "server.message.send",
+                        json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "tu_poll2", "name": "local_subagent_status", "input": {} }] }),
+                    ),
+                ],
+            }),
+            // Turn B2: assistant reports completion; second send() ends.
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: Message::assistant(vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }]),
+                    events: vec![],
+                },
+                notifications: vec![
+                    parity_event(
+                        "client.message.send",
+                        json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu_poll2" }] }),
+                    ),
+                    parity_event("provider.request", json!({ "attempt": 0 })),
+                    parity_event("provider.response", json!({ "ok": true, "status": 200 })),
+                    parity_event(
+                        "server.message.send",
+                        json!({ "role": "assistant", "content": [{ "type": "text", "text": "done" }] }),
+                    ),
+                ],
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn local_subagent_scenario_matches_canonical_sequence_across_two_sends() {
+        let transport = MockTransport::new(local_subagent_parity_outcomes());
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let rpc = Arc::new(RecordingSubagentRpc::default());
+        let terminal_notify = Arc::new(tokio::sync::Notify::new());
+        *rpc.terminal_notify.lock().unwrap() = Some(terminal_notify.clone());
+
+        let subagent_session = SubagentSession::new(SandboxSession::new());
+        subagent_session.bind(rpc.clone() as Arc<dyn SubagentRpc>);
+        subagent_session.set_base_client_tools(vec![json!({
+            "name": "launch_subagent",
+            "description": "launch",
+            "input_schema": {},
+        })]);
+        subagent_session.set_runner(Arc::new(GatedSubagentRunner { gate: gate.clone() }));
+
+        let launch_tool = crate::subagent::launch_subagent(
+            &subagent_session,
+            vec![crate::subagent::SubagentDef::new("claude", "cat")],
+            crate::subagent::SubagentLaunch::Local(crate::sandbox::SandboxTarget::None),
+        )
+        .into_tool()
+        .expect("local launch yields a client-dispatched tool");
+        let status_tool = subagent_session.status_tool();
+        let tools = registry(vec![launch_tool, status_tool]);
+
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = observed.clone();
+        let mut hooks = Hooks::default().on_event(move |ev| {
+            sink.lock().unwrap().push(ev.event_type.clone());
+            Ok(())
+        });
+
+        // First send(): launch, then poll while still running.
+        let out1 = run_loop(
+            &transport,
+            &tools,
+            &mut hooks,
+            Message::user("please launch a subagent"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out1.text(), "still running, I'll check back");
+
+        // Let the fake subprocess "exit" and wait for the watcher's terminal report.
+        gate.notify_one();
+        terminal_notify.notified().await;
+
+        // Second send(): poll again, now completed.
+        let out2 = run_loop(&transport, &tools, &mut hooks, Message::user("check again"))
+            .await
+            .unwrap();
+        assert_eq!(out2.text(), "done");
+
+        let guard = observed.lock().unwrap();
+        let seq: Vec<&str> = guard.iter().map(String::as_str).collect();
+        assert_eq!(seq, LOCAL_SUBAGENT_PARITY_SEQUENCE);
+        drop(guard);
+
+        // Structural parity of the actual tool_result content exchanged with
+        // the server at each turn (not just the event-type skeleton) —
+        // per the contract's "structural comparison, not raw bytes" note.
+        let sent = transport.sent.borrow();
+        let tool_result_content = |turn: usize| -> serde_json::Value {
+            match &sent[turn].message.content {
+                Content::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::ToolResult { content, .. } => {
+                        serde_json::from_str(content.as_str().unwrap()).unwrap()
+                    }
+                    other => panic!("expected tool_result, got {other:?}"),
+                },
+                other => panic!("expected blocks, got {other:?}"),
+            }
+        };
+        // sent[0] is the first user turn; [1] the launch tool_result; [2] the
+        // running-poll tool_result; [3] the second send()'s user turn; [4]
+        // the completed-poll tool_result.
+        let started = tool_result_content(1);
+        assert_eq!(started["status"], json!("started"));
+        assert_eq!(started["harness"], json!("claude"));
+        assert_eq!(started["model"], json!("claude-sonnet-5"));
+        let subagent_id = started["subagent_id"].as_str().unwrap().to_string();
+
+        let running = tool_result_content(2);
+        assert_eq!(running["subagents"][0]["status"], json!("running"));
+        assert_eq!(running["subagents"][0]["subagent_id"], json!(subagent_id));
+
+        let completed = tool_result_content(4);
+        assert_eq!(completed["subagents"][0]["status"], json!("completed"));
+        assert_eq!(completed["subagents"][0]["subagent_id"], json!(subagent_id));
+        assert_eq!(completed["subagents"][0]["stdout"], json!("subagent done"));
+
+        // `updateClientTools` fired exactly on the two transitions — never
+        // redundantly (the eviction on the completed poll removes it again).
+        let updates = rpc.updates.lock().unwrap();
+        assert_eq!(
+            updates.len(),
+            2,
+            "empty->non-empty at launch, non-empty->empty at eviction"
+        );
+        assert!(updates[0]
+            .iter()
+            .any(|t| t["name"] == json!("local_subagent_status")));
+        assert!(!updates[1]
+            .iter()
+            .any(|t| t["name"] == json!("local_subagent_status")));
     }
 }

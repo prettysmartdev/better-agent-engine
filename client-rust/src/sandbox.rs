@@ -151,6 +151,16 @@ pub trait SandboxDriver: Send + Sync {
     /// Stop and remove the container. Idempotent; safe on an already-gone id.
     fn stop<'a>(&'a self, handle: &'a SandboxHandle)
         -> SandboxFuture<'a, Result<(), SandboxError>>;
+
+    /// The container-engine program name (`"docker"` / `"container"`).
+    ///
+    /// Used by [`crate::subagent`], which builds its own `exec -i <id> sh -c …`
+    /// invocation (attaching stdin for the subagent prompt) rather than going
+    /// through [`SandboxDriver::exec`], which never attaches stdin. Defaults to
+    /// `"docker"` so existing/fake drivers need no change.
+    fn engine_program(&self) -> &'static str {
+        "docker"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +373,9 @@ impl SandboxDriver for AppleContainerDriver {
     ) -> SandboxFuture<'a, Result<(), SandboxError>> {
         Box::pin(cli_stop(&APPLE_CLI, handle))
     }
+    fn engine_program(&self) -> &'static str {
+        "container"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +406,10 @@ pub fn shell_quote(arg: &str) -> String {
 /// template. Panics on a malformed template (unterminated `{` or empty `{}`) —
 /// a template is a compile-time-literal developer input, so a bad one is a bug
 /// to surface loudly at construction, not a runtime tool error.
-fn parse_params(template: &str) -> Vec<String> {
+///
+/// Also reused by [`crate::subagent`] so subagent command templates parse and
+/// validate their placeholders through the exact same primitive.
+pub(crate) fn parse_params(template: &str) -> Vec<String> {
     let mut params: Vec<String> = Vec::new();
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
@@ -448,7 +464,10 @@ impl CommandSource {
 /// the **shell-escaped** input value. A single pass (rather than repeated
 /// `replace`) guarantees a substituted value can never itself be re-interpreted
 /// as a placeholder.
-fn interpolate(template: &str, input: &Value) -> Result<String, BoxError> {
+///
+/// Reused by [`crate::subagent`] so `{model}`/`{prompt}` interpolation shares
+/// the identical single-pass, shell-escaped substitution.
+pub(crate) fn interpolate(template: &str, input: &Value) -> Result<String, BoxError> {
     let mut out = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
@@ -609,6 +628,14 @@ impl SandboxSession {
 
     fn driver(&self) -> Arc<dyn SandboxDriver> {
         self.inner.driver.lock().unwrap().clone()
+    }
+
+    /// The current local driver's container-engine program name
+    /// (`"docker"` / `"container"`). Used by [`crate::subagent`] to build a
+    /// stdin-attached `exec -i` invocation against a container this session
+    /// started.
+    pub fn engine_program(&self) -> &'static str {
+        self.driver().engine_program()
     }
 
     /// Run `command` in the session's **remote** sandbox via

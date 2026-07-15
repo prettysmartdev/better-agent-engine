@@ -27,6 +27,7 @@ from ..sandbox import (
     SandboxTool,
     SandboxToolDef,
 )
+from ..subagent import SubagentSession, SubagentTool, SubagentToolDef
 from ..tool import Tool, ToolRegistry
 from ..types import (
     EventType,
@@ -73,6 +74,11 @@ class Harness:
         # plus any Auto-mode declarations sent in the session-open list.
         self._sandbox = SandboxSession()
         self._sandbox_defs: list[SandboxToolDef] = []
+        # The late-bound subagent handle (shares the sandbox handle's container
+        # machinery for Local{image} launches), plus any Remote-launch
+        # declarations sent in the session-open `subagent_tools` list.
+        self._subagent = SubagentSession(self._sandbox)
+        self._subagent_defs: list[SubagentToolDef] = []
 
     def register_tool(self, tool: Tool) -> "Harness":
         """Add a tool. Returns self for chaining."""
@@ -97,6 +103,31 @@ class Harness:
             self._registry.add(tool.tool)
         elif tool.definition is not None:
             self._sandbox_defs.append(tool.definition)
+        return self
+
+    def subagent_session(self) -> SubagentSession:
+        """A handle to this harness's subagent capability, for building
+        subagent tools **before** ``connect()``. Its transport is late-bound at
+        connect; see :mod:`bae_py.subagent`. Pass it to
+        :func:`~bae_py.subagent.launch_subagent`, then register the result with
+        :meth:`register_subagent_tool`.
+        """
+        return self._subagent
+
+    def register_subagent_tool(self, tool: SubagentTool) -> "Harness":
+        """Register a builtin subagent tool, routing it correctly: a
+        client-dispatched (``Local``) launch tool joins the ordinary registry;
+        a ``Remote``-launch declaration joins the session-open
+        ``subagent_tools`` list. Returns self.
+
+        The companion ``local_subagent_status`` tool is wired separately, for
+        dispatch only, at :meth:`connect`/:meth:`join` time — see
+        :mod:`bae_py.subagent`'s module docs.
+        """
+        if tool.tool is not None:
+            self._registry.add(tool.tool)
+        elif tool.definition is not None:
+            self._subagent_defs.append(tool.definition)
         return self
 
     def set_hooks(self, hooks: Hooks) -> "Harness":
@@ -137,14 +168,21 @@ class Harness:
         """
         transport = self._transport or HttpxTransport()
         try:
+            # Snapshot the declared tools *before* the dynamic status tool (if
+            # any) is added to the registry below — it must never appear in the
+            # session-open list, only be dispatchable (WI 0010 §5.7).
+            declared_tools = self._registry.declarations()
             open_body: dict[str, Any] = {
                 "client_version": self.config.client_version,
-                "tools": self._registry.declarations(),
+                "tools": declared_tools,
             }
             # Only present when Auto-mode sandbox tools are registered, so a
             # session without them sends the exact same body as before.
             if self._sandbox_defs:
                 open_body["sandbox_tools"] = [d.declaration() for d in self._sandbox_defs]
+            # Only present when a Remote-launch subagent tool is registered.
+            if self._subagent_defs:
+                open_body["subagent_tools"] = [d.declaration() for d in self._subagent_defs]
             resp = await transport.request(
                 "POST",
                 url,
@@ -163,10 +201,20 @@ class Harness:
                 profile=Profile.from_wire(body["profile"]),
                 owns_transport=self._owns_transport,
                 sandbox=self._sandbox,
+                subagent=self._subagent,
             )
-            # Late-bind the sandbox transport now that the session exists, so any
-            # sandbox tool built pre-connect can reach the remote RPC methods.
+            # Late-bind the sandbox/subagent transports now that the session
+            # exists, so any tool built pre-connect can reach the remote RPC
+            # methods.
             self._sandbox.bind(session)
+            self._subagent.bind(session)
+            self._subagent.set_base_client_tools(declared_tools)
+            # Wire the dynamic `local_subagent_status` tool for dispatch only
+            # (never advertised statically) iff a Local launch tool was
+            # registered by now; it becomes visible to the provider later via
+            # `session.updateClientTools`.
+            if self._subagent.has_local():
+                self._registry.add(self._subagent.status_tool())
             # Register as a driver before any send: session.sendMessage requires
             # it (a -32001 error otherwise). Application code never calls this.
             await session._register_driver()
@@ -200,6 +248,7 @@ class Session:
         profile: Profile,
         owns_transport: bool,
         sandbox: SandboxSession | None = None,
+        subagent: SubagentSession | None = None,
     ) -> None:
         self.config = config
         self.session_id = session_id
@@ -215,6 +264,7 @@ class Session:
         #: Monotonic JSON-RPC request id, unique per session.
         self._rpc_id = 0
         self._sandbox = sandbox if sandbox is not None else SandboxSession()
+        self._subagent = subagent if subagent is not None else SubagentSession(self._sandbox)
 
     async def send(self, message: "str | Message") -> Message:
         """Send a user turn and drive the full round-trip (harness loop).
@@ -285,6 +335,16 @@ class Session:
         """
         return self._sandbox
 
+    def subagent_session(self) -> SubagentSession:
+        """A handle to this session's subagent capability, for building subagent
+        tools after connect (register the resulting client-dispatched tools with
+        :meth:`register_tool`). Note that the dynamic ``local_subagent_status``
+        dispatch wiring only happens automatically at
+        :meth:`~bae_py.harness.Harness.connect`/:meth:`~bae_py.harness.Harness.join`
+        time — see :mod:`bae_py.subagent`.
+        """
+        return self._subagent
+
     def register_tool(self, tool: Tool) -> "Session":
         """Register an additional client-dispatched tool on the live session."""
         self._registry.add(tool)
@@ -294,7 +354,7 @@ class Session:
         """Run ``command`` in the session's remote sandbox
         (``session.execRemoteSandbox``). Available to any tool handler or app code.
         """
-        result = await self._sandbox_rpc("session.execRemoteSandbox", {"command": command})
+        result = await self._rpc_call("session.execRemoteSandbox", {"command": command})
         return ExecResult(
             stdout=str(result.get("stdout", "")),
             stderr=str(result.get("stderr", "")),
@@ -309,7 +369,7 @@ class Session:
         detail: str | None = None,
     ) -> None:
         """Report a local sandbox lifecycle transition (``session.reportLocalSandbox``)."""
-        await self._sandbox_rpc(
+        await self._rpc_call(
             "session.reportLocalSandbox",
             {
                 "state": state,
@@ -339,7 +399,7 @@ class Session:
         ``Remote``-target tool (Auto-dispatched or :meth:`exec_remote_sandbox`)
         can run.
         """
-        result = await self._sandbox_rpc("session.startRemoteSandbox", {"image": image})
+        result = await self._rpc_call("session.startRemoteSandbox", {"image": image})
         started_at = result.get("started_at")
         return RemoteSandboxStarted(
             sandbox_id=str(result.get("sandbox_id", "")),
@@ -352,16 +412,66 @@ class Session:
         Raises :class:`RpcError` code ``-32013`` if none is running. (Session
         close also stops a still-running remote sandbox server-side.)
         """
-        result = await self._sandbox_rpc("session.stopRemoteSandbox", {})
+        result = await self._rpc_call("session.stopRemoteSandbox", {})
         return RemoteSandboxStopped(
             stopped=bool(result.get("stopped", False)),
             image=str(result.get("image", "")),
             sandbox_id=str(result.get("sandbox_id", "")),
         )
 
-    async def _sandbox_rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Issue one non-turn sandbox RPC over ``…/rpc`` and return its terminal
-        ``result``. Shaped like ``registerDriver``: a synchronous utility call.
+    async def report_local_subagent(
+        self,
+        *,
+        state: str,
+        subagent_id: str,
+        harness: str,
+        model: str,
+        detail: str | None = None,
+        reason: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        """Report a local subagent lifecycle transition
+        (``session.reportLocalSubagent``). Called by :class:`~bae_py.subagent.SubagentSession`;
+        available to application code for symmetry with :meth:`report_local_sandbox`."""
+        await self._rpc_call(
+            "session.reportLocalSubagent",
+            {
+                "state": state,
+                "subagent_id": subagent_id,
+                "harness": harness,
+                "model": model,
+                "detail": detail,
+                "reason": reason,
+                "exit_code": exit_code,
+            },
+        )
+
+    async def update_client_tools(self, tools: list[dict[str, Any]]) -> None:
+        """Full-replace this client's advertised tool list
+        (``session.updateClientTools``). Called automatically by
+        :class:`~bae_py.subagent.SubagentSession` to make ``local_subagent_status``
+        appear/disappear; general-purpose beyond subagents."""
+        await self._rpc_call("session.updateClientTools", {"tools": tools})
+
+    async def cancel_subagent(self, subagent_id: str) -> None:
+        """Cancel a **local** subagent in-process (idempotent) — a pure kill,
+        no RPC involved beyond the resulting telemetry report. Does not touch
+        remote subagents; use :meth:`cancel_remote_subagent` for those."""
+        await self._subagent.cancel_subagent(subagent_id)
+
+    async def cancel_remote_subagent(self, subagent_id: str) -> dict[str, Any]:
+        """Cancel a **remote** (server-tracked) subagent (``session.cancelSubagent``).
+        Idempotent: cancelling an already-terminal id is a no-op success
+        (``was_running: false`` in the result). Raises :class:`RpcError` code
+        ``-32014`` if the id was never tracked by the server (never existed, was
+        a local subagent, or was already evicted after status acknowledgment).
+        """
+        return await self._rpc_call("session.cancelSubagent", {"subagent_id": subagent_id})
+
+    async def _rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Issue one non-turn RPC over ``…/rpc`` (sandbox or subagent) and return
+        its terminal ``result``. Shaped like ``registerDriver``: a synchronous
+        utility call.
         """
         frames = self._transport.stream(
             "POST",
@@ -480,9 +590,12 @@ class Session:
         if self._closed:
             return
         self._closed = True
-        # Stop any still-running local sandboxes this session started (reporting
-        # ``stopped`` for each), mirroring how the server stops its own remote
-        # sandbox at session close.
+        # Cancel any still-running local subagents first (reporting
+        # ``cancelled{reason:"session_close"}`` for each), then stop any
+        # still-running local sandboxes this session started (reporting
+        # ``stopped`` for each) — mirrors how the server tears down
+        # ``AppState.subagents`` before ``AppState.sandboxes`` at session close.
+        await self._subagent.close_all()
         await self._sandbox.stop_all_local()
         try:
             resp = await self._transport.request(

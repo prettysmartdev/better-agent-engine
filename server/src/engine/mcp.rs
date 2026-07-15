@@ -228,7 +228,7 @@ impl Conn {
     /// caller's next step.
     async fn open(cfg: &McpServerConfig) -> Result<Conn, McpError> {
         match cfg.transport {
-            McpTransport::Stdio => Ok(Conn::Stdio(StdioConn::spawn(cfg)?)),
+            McpTransport::Stdio => Ok(Conn::Stdio(StdioConn::spawn(cfg).await?)),
             McpTransport::Http | McpTransport::Sse => Ok(Conn::Http(HttpConn::open(cfg)?)),
         }
     }
@@ -270,10 +270,36 @@ struct StdioConn {
     next_id: i64,
 }
 
+/// Whether an `io::Error` from spawning a subprocess is a *transient* OS
+/// resource failure worth retrying rather than a permanent misconfiguration.
+///
+/// `EAGAIN`/`ENOMEM`/`EMFILE`/`ENFILE` all mean `fork(2)`/`posix_spawn(2)` hit a
+/// temporary resource limit — a process/memory cap or a momentary
+/// file-descriptor exhaustion — which spikes precisely when many sessions (or a
+/// busy test suite) spawn stdio servers at once, especially on a host with a low
+/// `ulimit -n`, and clears on its own moments later as concurrent work releases
+/// the resource. A permanent error such as `ENOENT` ("command not found") must
+/// *not* be retried: the caller relies on those failing fast and non-fatally.
+fn is_transient_spawn_error(e: &std::io::Error) -> bool {
+    // The fork/posix_spawn resource-exhaustion errnos: ENOMEM (12), ENFILE (23,
+    // system-wide fd table full) and EMFILE (24, per-process fd limit) share
+    // their numbers across Linux and macOS. EAGAIN's raw number differs by
+    // platform (11 on Linux, 35 on macOS), but Rust maps it to the `WouldBlock`
+    // kind on both, so match the kind rather than the number for it.
+    matches!(e.raw_os_error(), Some(11) | Some(12) | Some(23) | Some(24))
+        || e.kind() == std::io::ErrorKind::WouldBlock
+}
+
 impl StdioConn {
     /// Spawn `command args...` with piped stdin/stdout (stderr discarded) and
     /// `kill_on_drop` so an abandoned session cannot leak the process.
-    fn spawn(cfg: &McpServerConfig) -> Result<StdioConn, McpError> {
+    ///
+    /// A spawn that fails with a *transient* resource errno (`EAGAIN`/`ENOMEM`)
+    /// is retried a few times with a short backoff: under bursty load many
+    /// sessions open stdio servers at once and `fork` momentarily fails,
+    /// clearing on its own. A permanent error (e.g. `ENOENT`) is returned on
+    /// the first attempt so a mistyped command still fails fast and non-fatally.
+    async fn spawn(cfg: &McpServerConfig) -> Result<StdioConn, McpError> {
         let command = cfg
             .command
             .as_deref()
@@ -291,15 +317,38 @@ impl StdioConn {
             })
             .collect();
         let args = args?;
-        let mut cmd = Command::new(&command);
-        cmd.args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| McpError::Connect(format!("spawn {command:?} failed: {e}")))?;
+
+        // Retry only transient resource failures, over a total wall-time budget
+        // of a few seconds with exponentially-backed-off, capped delays (25ms,
+        // 50ms, ... up to 400ms between tries). A single retry usually rides out
+        // a load spike, but a sustained burst of concurrent spawns on a low
+        // `ulimit` host (the whole test suite starting stdio fixtures at once)
+        // can take longer to drain, so keep retrying until the budget is spent
+        // rather than giving up after ~1s. A permanent error (e.g. ENOENT) still
+        // returns on the first attempt, so a mistyped command fails fast.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut backoff = Duration::from_millis(25);
+        let mut child = loop {
+            let mut cmd = Command::new(&command);
+            cmd.args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(e)
+                    if is_transient_spawn_error(&e)
+                        && tokio::time::Instant::now() + backoff < deadline =>
+                {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(400));
+                }
+                Err(e) => {
+                    return Err(McpError::Connect(format!("spawn {command:?} failed: {e}")));
+                }
+            }
+        };
         let stdin = child
             .stdin
             .take()
@@ -549,6 +598,29 @@ fn interpret_response(msg: &Value) -> Result<Value, McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_spawn_errors_are_retryable_permanent_ones_are_not() {
+        use std::io::{Error, ErrorKind};
+        // EAGAIN / ENOMEM / ENFILE / EMFILE (fork/posix_spawn resource
+        // exhaustion, including momentary file-descriptor exhaustion) are all
+        // retryable.
+        assert!(is_transient_spawn_error(&Error::from_raw_os_error(11)));
+        assert!(is_transient_spawn_error(&Error::from_raw_os_error(12)));
+        assert!(is_transient_spawn_error(&Error::from_raw_os_error(23)));
+        assert!(is_transient_spawn_error(&Error::from_raw_os_error(24)));
+        assert!(is_transient_spawn_error(&Error::new(
+            ErrorKind::WouldBlock,
+            "would block"
+        )));
+        // ENOENT ("command not found") must fail fast, never retry — the caller
+        // relies on a mistyped command surfacing immediately and non-fatally.
+        assert!(!is_transient_spawn_error(&Error::from_raw_os_error(2)));
+        assert!(!is_transient_spawn_error(&Error::new(
+            ErrorKind::NotFound,
+            "no such file"
+        )));
+    }
 
     #[test]
     fn to_provider_tool_renames_input_schema() {
