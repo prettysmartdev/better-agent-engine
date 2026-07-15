@@ -23,7 +23,8 @@
       "Bash(npx vitest *)",
       "Bash(npm run *)",
       "Bash(git -C /workspace status --short max/web)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 *)"
     ]
   }
 }
