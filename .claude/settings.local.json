@@ -15,7 +15,14 @@
       "Bash(node /tmp/claude-1000/-workspace/b2c63440-78dc-40f9-93b9-10cca5e5194c/scratchpad/repro.mjs)",
       "Bash(node -e \"console.log\\(require.resolve\\('playwright-core'\\)\\)\")",
       "Bash(node -e \"console.log\\(require.resolve\\('@playwright/test'\\)\\)\")",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(node .repro-scratch.mjs)",
+      "Bash(npx playwright *)",
+      "Bash(sudo -n true)",
+      "Bash(pkill -f \"vite --port 5199\")",
+      "Bash(npx vitest *)",
+      "Bash(npm run *)",
+      "Bash(git -C /workspace status --short max/web)"
     ]
   }
 }

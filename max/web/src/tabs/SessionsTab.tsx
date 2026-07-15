@@ -31,7 +31,7 @@ export default function SessionsTab() {
   }
 
   return (
-    <div className="tab sessions-tab">
+    <div className="sessions-tab">
       <div className="tab-head">
         <h1 className="tab-title">Sessions</h1>
         <label className="toggle">

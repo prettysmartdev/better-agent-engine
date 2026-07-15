@@ -62,7 +62,7 @@ export default function KeysTab() {
   const noProfiles = !profiles.loading && profiles.items.length === 0;
 
   return (
-    <div className="tab keys-tab">
+    <div className="keys-tab">
       <h1 className="tab-title">Keys</h1>
 
       {justCreated && (

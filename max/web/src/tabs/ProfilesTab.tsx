@@ -53,7 +53,7 @@ export default function ProfilesTab() {
   }
 
   return (
-    <div className="tab profiles-tab">
+    <div className="profiles-tab">
       <div className="tab-head">
         <h1 className="tab-title">Profiles</h1>
         <button
