@@ -22,6 +22,8 @@ __pycache__/
 data/
 bae-examples.env
 
+# awman workflow internals
+.awman/workflows
 
 # reference-assistant file-tool workspace (created at runtime by the example)
 examples/reference-assistant/workspace/
