@@ -1,12 +1,13 @@
 import type { ReactNode } from "react";
 import { Wordmark } from "./ui";
 
-export type TabId = "keys" | "profiles" | "sessions";
+export type TabId = "keys" | "profiles" | "sessions" | "config";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "sessions", label: "Sessions" },
   { id: "profiles", label: "Profiles" },
   { id: "keys", label: "Keys" },
+  { id: "config", label: "Config" },
 ];
 
 /**

@@ -440,6 +440,111 @@ how profiles reference these entries by name.
 
 ---
 
+## Config
+
+### `GET /admin/v1/config`
+
+Returns a single, combined snapshot of the MCP server registry, the LLM
+provider registry, and the telemetry configuration — everything
+[`/admin/v1/mcp-servers`](#get-adminv1mcp-servers) and
+[`/admin/v1/providers`](#get-adminv1providers) return individually, plus the
+fields those two endpoints omit for brevity (`command`, `args`, `url`,
+`headers` on MCP servers), plus the telemetry section neither exposes at
+all. Useful for a single-request, human-readable view of what a running
+server actually loaded from `bae-config.toml`, without reading the file on
+disk or making three separate admin-API calls.
+
+```sh
+ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
+curl http://127.0.0.1:8081/admin/v1/config \
+  -H "Authorization: Bearer $ADMIN_KEY"
+```
+
+**Response `200 OK`:**
+
+```json
+{
+  "mcp": {
+    "servers": [
+      {
+        "name": "filesystem",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"],
+        "url": null,
+        "headers": {}
+      },
+      {
+        "name": "search",
+        "transport": "sse",
+        "command": null,
+        "args": [],
+        "url": "https://mcp.example.com/sse",
+        "headers": { "Authorization": "••••••••" }
+      }
+    ]
+  },
+  "providers": {
+    "entries": [
+      {
+        "name": "anthropic-sonnet",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "base_url": "https://api.anthropic.com",
+        "auth_token": "••••••••"
+      }
+    ]
+  },
+  "telemetry": {
+    "enabled": true,
+    "otlp_endpoint": "http://otel-collector:4317",
+    "otlp_headers": { "Authorization": "••••••••" },
+    "sample_ratio": 1.0,
+    "service_name": "baesrv",
+    "traces": { "enabled": true },
+    "metrics": { "enabled": true, "disabled": ["bae.events.total"] }
+  }
+}
+```
+
+`mcp.servers` and `providers.entries` are each sorted by `name`, matching
+`/admin/v1/mcp-servers` and `/admin/v1/providers`. `providers.entries[].base_url`
+is the same **effective** value those two endpoints already use. `telemetry`
+is a single object, not a list — it mirrors the `[telemetry]` shape
+verbatim (see [Configuration — `[telemetry]`](configuration.md#telemetry)),
+including when telemetry is disabled: an absent `[telemetry]` table renders
+as a present-but-disabled `{"enabled": false, …}` object, not an empty or
+missing section.
+
+### Redaction convention
+
+Every secret-bearing field — MCP `headers` values, provider `auth_token`,
+and telemetry `otlp_headers` values — is replaced with the fixed marker
+`"••••••••"`, unconditionally. This applies whether the underlying config
+holds an unresolved `${ENV_VAR}` token or a literal secret typed directly
+into `bae-config.toml`: the redaction never inspects the value's shape, so
+there's no way for a literal secret to slip through unmasked. The marker is
+a fixed length regardless of the real value's length, so the response never
+leaks a secret's length as a side channel. Header/token **keys** (e.g.
+`Authorization`) are always preserved — only values are masked — and a
+present-but-empty value (`headers = { "X-Custom" = "" }`) is still replaced
+by the full marker, so "set but empty" is indistinguishable from "set to
+something real."
+
+`mcp.servers[].command`, `.args`, and `.url` are **not** secrets and are
+returned in full — the only reason `/admin/v1/mcp-servers` omits them today
+is brevity, not safety. `/admin/v1/config` is the endpoint to use when you
+need the full picture.
+
+An empty or missing config file, or one with none of `[mcp]`, `[providers]`,
+`[telemetry]`, still returns `200 OK` — never an error — with
+`{"mcp": {"servers": []}, "providers": {"entries": []}, "telemetry":
+{"enabled": false, …}}`. See
+[Configuration — Admin endpoint: `GET /admin/v1/config`](configuration.md#admin-endpoint-get-adminv1config)
+for the underlying config file schema each part of this response reflects.
+
+---
+
 ## Key security
 
 Keys are generated with 192 bits of entropy from the OS CSPRNG (24 random

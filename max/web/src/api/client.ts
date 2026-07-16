@@ -3,6 +3,7 @@
 // credentials and treat any 401 as "the session is gone, show login".
 
 import type {
+  ConfigResponse,
   KeyCreated,
   KeyListItem,
   Page,
@@ -172,6 +173,12 @@ export function listProviders(): Promise<Page<RegistryEntry>> {
 }
 export function listMcpServers(): Promise<Page<RegistryEntry>> {
   return request("GET", "/api/mcp-servers?limit=500");
+}
+
+// --- Config -------------------------------------------------------------
+
+export function getConfig(): Promise<ConfigResponse> {
+  return request("GET", "/api/config");
 }
 
 // --- Sessions -----------------------------------------------------------

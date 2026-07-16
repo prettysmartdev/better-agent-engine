@@ -147,6 +147,8 @@ delete unexpectedly fails with `409`.
 
 ## Walkthrough: Keys → Profiles → a live session's graph
 
+The top tab bar, left to right, is **Sessions, Profiles, Keys, Config**.
+
 1. **Log in** with the MAX password (see above). You land on the **Keys**
    tab.
 2. **Keys tab**: list existing client keys, or create one — pick a name and
@@ -176,6 +178,17 @@ MAX only ever **observes** — it never registers as a driver and never sends
 a message into a session. Watching a session in MAX never competes with,
 interferes with, or is visible to the session's real driver as anything
 other than another observer.
+
+6. **Config tab**: a read-only snapshot of the MCP server registry, the
+   provider registry, and the telemetry configuration `baesrv` loaded from
+   `bae-config.toml` at startup — no create/edit/delete affordances here,
+   just a fetch-and-render page equivalent to
+   [`GET /admin/v1/config`](../reference/admin-api.md#config). Every
+   secret-bearing value (MCP server `headers`, provider `auth_token`,
+   telemetry `otlp_headers`) renders as a fixed dots-only `••••••••` marker
+   exactly as the server sent it — MAX never regenerates, transforms, or
+   further masks it client-side, so what you see in the browser is exactly
+   what the admin API returned.
 
 ---
 

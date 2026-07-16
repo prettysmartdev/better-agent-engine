@@ -17,12 +17,16 @@
 //! - `mcp-servers` — read-only list of the configured MCP registry (no secrets).
 //! - `providers` — read-only list of the configured provider registry (no
 //!   secrets; `base_url` is the effective value).
+//! - `config` — read-only combined snapshot of all `bae-config.toml` sections
+//!   (`[mcp]`/`[providers]`/`[telemetry]`), with every secret-bearing value
+//!   redacted to a fixed marker.
 //! - `sandbox-status` — read-only, per-profile sandbox image provisioning
 //!   status from the in-memory tracker.
 //! - `sessions` — read-only session visibility: list (cursor-paginated, with an
 //!   optional `?state=` filter) and per-session event history, without ever
 //!   holding a session key (the only path to a `closed`/`error` session's log).
 
+pub mod config;
 pub mod keys;
 pub mod mcp;
 pub mod profiles;
@@ -65,6 +69,7 @@ pub fn router(state: AppState, auth_enabled: bool) -> Router {
         .route("/admin/v1/keys/{id}", axum::routing::delete(keys::delete))
         .route("/admin/v1/mcp-servers", get(mcp::list))
         .route("/admin/v1/providers", get(providers::list))
+        .route("/admin/v1/config", get(config::get))
         .route("/admin/v1/sandbox-status", get(sandbox::list))
         .route("/admin/v1/sessions", get(sessions::list))
         .route("/admin/v1/sessions/{id}/events", get(sessions::get_events));

@@ -509,6 +509,69 @@ otherwise) — never `auth_token`. See
 
 ---
 
+## Admin endpoint: `GET /admin/v1/config`
+
+Returns a single combined snapshot of the `[mcp]`, `[providers]`, and
+`[telemetry]` sections above — the same startup-parsed state the two
+endpoints just above already expose individually, plus the fields
+`/admin/v1/mcp-servers` omits for brevity (`command`, `args`, `url`,
+`headers`) and the telemetry config, which no other admin endpoint returns:
+
+```sh
+curl http://127.0.0.1:8081/admin/v1/config \
+  -H "Authorization: Bearer $ADMIN_KEY"
+```
+
+```json
+{
+  "mcp": {
+    "servers": [
+      {
+        "name": "filesystem",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"],
+        "url": null,
+        "headers": {}
+      }
+    ]
+  },
+  "providers": {
+    "entries": [
+      {
+        "name": "anthropic-sonnet",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "base_url": "https://api.anthropic.com",
+        "auth_token": "••••••••"
+      }
+    ]
+  },
+  "telemetry": {
+    "enabled": true,
+    "otlp_endpoint": "http://otel-collector:4317",
+    "otlp_headers": { "Authorization": "••••••••" },
+    "sample_ratio": 1.0,
+    "service_name": "baesrv",
+    "traces": { "enabled": true },
+    "metrics": { "enabled": true, "disabled": [] }
+  }
+}
+```
+
+`mcp.servers`/`providers.entries` are sorted by `name`; every secret-bearing
+value — MCP `headers`, provider `auth_token`, telemetry `otlp_headers` — is
+replaced with a fixed `"••••••••"` marker, unconditionally, whether the
+underlying config held an unresolved `${ENV_VAR}` token or a literal
+secret. This endpoint reflects the **same startup snapshot** as the
+`[mcp]`/`[providers]`/`[telemetry]` sections on this page — parsed once at
+boot, with [no hot reload](#no-hot-reload): editing `bae-config.toml` and
+calling this endpoint again returns the old values until `baesrv` is
+restarted. See [Admin API — Config](admin-api.md#config) for the full
+response shape and the redaction convention.
+
+---
+
 ## Admin endpoint: `GET /admin/v1/sandbox-status`
 
 Returns the in-memory sandbox-image provisioning status for every profile

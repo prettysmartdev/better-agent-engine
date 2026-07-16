@@ -3,6 +3,7 @@ import Layout, { type TabId } from "./components/Layout";
 import Login from "./components/Login";
 import { Spinner } from "./components/ui";
 import { checkSession, logout, setUnauthorizedHandler } from "./api/client";
+import ConfigTab from "./tabs/ConfigTab";
 import KeysTab from "./tabs/KeysTab";
 import ProfilesTab from "./tabs/ProfilesTab";
 import SessionsTab from "./tabs/SessionsTab";
@@ -54,6 +55,7 @@ export default function App() {
       {tab === "keys" && <KeysTab />}
       {tab === "profiles" && <ProfilesTab />}
       {tab === "sessions" && <SessionsTab />}
+      {tab === "config" && <ConfigTab />}
     </Layout>
   );
 }

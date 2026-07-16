@@ -141,6 +141,10 @@ pub async fn serve(
     state.subagent_timeout = config.subagent_timeout;
     state.max_subagents_per_session = config.max_subagents_per_session;
     state.sandbox_driver = sandbox_driver;
+    // Retain the raw telemetry config for the read-only /admin/v1/config
+    // endpoint. Cloned (not moved) because register_metrics below still needs
+    // `&telemetry_config`.
+    state.telemetry_config = std::sync::Arc::new(telemetry_config.clone());
 
     // Metrics are registered once now that the observable-gauge callbacks can
     // capture the fully constructed shared state. The OTLP PeriodicReader owns

@@ -187,6 +187,10 @@ export class AdminClient {
     return this.request({ method: "GET", path: "/admin/v1/mcp-servers" });
   }
 
+  getConfig(): Promise<unknown> {
+    return this.request({ method: "GET", path: "/admin/v1/config" });
+  }
+
   // --- Sessions (read-only admin routes from section B) -----------------
 
   listSessions(query: PageParams & { state?: string }): Promise<AdminPage> {

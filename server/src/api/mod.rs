@@ -24,7 +24,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::config_file::McpServerConfig;
+use crate::config_file::{McpServerConfig, TelemetryConfig};
 use crate::engine::broadcast::EventBroadcaster;
 use crate::engine::mcp::McpSession;
 use crate::engine::provider::ProviderConfig;
@@ -176,6 +176,14 @@ pub struct AppState {
     /// reference providers by name (`primary_provider` / `fallback_providers`),
     /// resolved at session-creation and message time.
     pub provider_registry: Arc<HashMap<String, ProviderConfig>>,
+    /// Parsed `[telemetry]` section from `bae-config.toml`, retained at startup
+    /// so the read-only `/admin/v1/config` endpoint can surface it. Same
+    /// lifecycle as [`AppState::mcp_registry`] / [`AppState::provider_registry`]:
+    /// read-only after startup, `TelemetryConfig::default()` (disabled) without
+    /// a config file or `[telemetry]` table, never persisted. Distinct from the
+    /// consumed [`AppState::telemetry_metrics`] handles — this holds the raw,
+    /// unresolved config (`otlp_headers` `${ENV_VAR}` tokens intact).
+    pub telemetry_config: Arc<TelemetryConfig>,
     /// Live per-session MCP connections. Populated at session creation and torn
     /// down at session close; keyed by session id. See [`McpSessions`].
     pub mcp_sessions: McpSessions,
@@ -250,6 +258,7 @@ impl AppState {
             http: reqwest::Client::new(),
             mcp_registry: Arc::new(mcp_registry),
             provider_registry: Arc::new(provider_registry),
+            telemetry_config: Arc::new(TelemetryConfig::default()),
             mcp_sessions: Arc::new(Mutex::new(HashMap::new())),
             broadcaster: EventBroadcaster::new(),
             drivers: Arc::new(Mutex::new(HashMap::new())),

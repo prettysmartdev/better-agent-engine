@@ -56,6 +56,39 @@ export interface RegistryEntry {
   [key: string]: unknown;
 }
 
+export interface McpServerConfigView {
+  name: string;
+  transport: "stdio" | "sse" | "http";
+  command: string | null;
+  args: string[];
+  url: string | null;
+  headers: Record<string, string>; // values are always the redaction marker
+}
+
+export interface ProviderConfigView {
+  name: string;
+  provider: string;
+  model: string;
+  base_url: string;
+  auth_token: string; // always the redaction marker
+}
+
+export interface TelemetryConfigView {
+  enabled: boolean;
+  otlp_endpoint: string | null;
+  otlp_headers: Record<string, string>; // values are always the redaction marker
+  sample_ratio: number;
+  service_name: string; // effective name ("baesrv" when unset)
+  traces: { enabled: boolean };
+  metrics: { enabled: boolean; disabled: string[] };
+}
+
+export interface ConfigResponse {
+  mcp: { servers: McpServerConfigView[] };
+  providers: { entries: ProviderConfigView[] };
+  telemetry: TelemetryConfigView;
+}
+
 export type SessionState = "open" | "closed" | "error";
 
 /** A session row from the sessions list. */

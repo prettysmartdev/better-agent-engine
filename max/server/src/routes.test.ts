@@ -32,6 +32,16 @@ describe("auth gate", () => {
     expect(res.status).toBe(401);
   });
 
+  it("requires the session cookie for /api/config", async () => {
+    const getConfig = vi.fn();
+    const app = makeApp({ getConfig });
+
+    const res = await request(app).get("/api/config");
+
+    expect(res.status).toBe(401);
+    expect(getConfig).not.toHaveBeenCalled();
+  });
+
   it("rejects a wrong password without revealing closeness", async () => {
     const app = makeApp({});
     const res = await request(app)
@@ -111,6 +121,27 @@ describe("proxy mapping", () => {
       type: "profile_in_use",
       detail: "active keys reference it",
     });
+  });
+
+  it("passes an /api/config AdminApiError through with its upstream status", async () => {
+    const getConfig = vi.fn(async () => {
+      throw new AdminApiError(
+        503,
+        "config_unavailable",
+        "configuration snapshot is unavailable",
+      );
+    });
+    const app = makeApp({ getConfig });
+    const cookie = await login(app);
+
+    const res = await request(app).get("/api/config").set("Cookie", cookie);
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({
+      type: "config_unavailable",
+      detail: "configuration snapshot is unavailable",
+    });
+    expect(getConfig).toHaveBeenCalledOnce();
   });
 
   it("passes the ?state= filter and pagination through to listSessions", async () => {

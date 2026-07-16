@@ -348,6 +348,7 @@ async fn dangerously_disable_admin_auth_leaves_routes_open() {
         "/admin/v1/profiles",
         "/admin/v1/keys",
         "/admin/v1/mcp-servers",
+        "/admin/v1/config",
     ] {
         assert_eq!(
             status_of(&client, &base, path, None).await,
@@ -462,6 +463,7 @@ async fn enforcement_rejects_missing_garbage_and_client_keys_on_every_route() {
         "/admin/v1/profiles",
         "/admin/v1/keys",
         "/admin/v1/mcp-servers",
+        "/admin/v1/config",
     ] {
         assert_eq!(
             status_of(&client, &base, path, None).await,

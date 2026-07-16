@@ -113,6 +113,28 @@ describe("AdminClient", () => {
     });
   });
 
+  it("builds GET /admin/v1/config with the admin bearer token", async () => {
+    const fetchImpl = mockFetch(200, {
+      mcp: { servers: [] },
+      providers: { entries: [] },
+      telemetry: { enabled: false },
+    });
+    const client = new AdminClient(
+      "127.0.0.1:8081",
+      "config-admin-token",
+      fetchImpl as unknown as typeof fetch,
+    );
+
+    await client.getConfig();
+
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(String(url)).toBe("http://127.0.0.1:8081/admin/v1/config");
+    expect((init as RequestInit).method).toBe("GET");
+    expect((init as RequestInit).headers).toMatchObject({
+      authorization: "Bearer config-admin-token",
+    });
+  });
+
   it("returns undefined on a 204", async () => {
     const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }));
     const client = new AdminClient(

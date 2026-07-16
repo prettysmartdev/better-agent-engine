@@ -99,6 +99,10 @@ export function createApiRouter(
     "/mcp-servers",
     proxy(() => admin.listMcpServers()),
   );
+  router.get(
+    "/config",
+    proxy(() => admin.getConfig()),
+  );
 
   // --- Sessions (read-only) --------------------------------------------
   router.get(
