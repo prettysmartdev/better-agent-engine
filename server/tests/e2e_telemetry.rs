@@ -20,15 +20,15 @@ use axum::{Json, Router};
 use bae_rs::{Config as ClientConfig, Harness, Tool};
 use opentelemetry::global;
 use opentelemetry::trace::{FutureExt as _, TraceContextExt as _, Tracer as _};
-use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry::Context;
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_proto::tonic::collector::trace::v1::{
-    trace_service_server::{TraceService, TraceServiceServer}, ExportTraceServiceRequest,
-    ExportTraceServiceResponse,
+    trace_service_server::{TraceService, TraceServiceServer},
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValue;
 use opentelemetry_proto::tonic::trace::v1::Span;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -255,7 +255,11 @@ fn test_dir(label: &str) -> PathBuf {
 }
 
 async fn start_server(provider: &str, telemetry: Option<&str>) -> RunningServer {
-    let dir = test_dir(if telemetry.is_some() { "enabled" } else { "disabled" });
+    let dir = test_dir(if telemetry.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    });
     std::fs::create_dir_all(&dir).expect("create test directory");
     let config = dir.join("bae-config.toml");
     let telemetry_section = telemetry.unwrap_or("[telemetry]\nenabled = false\n");
@@ -331,9 +335,7 @@ async fn create_client_key(server: &RunningServer) -> String {
         .await
         .expect("create client key request");
     assert_eq!(key.status(), StatusCode::CREATED);
-    key.json::<Value>()
-        .await
-        .expect("client key JSON")["key"]
+    key.json::<Value>().await.expect("client key JSON")["key"]
         .as_str()
         .expect("plaintext client key")
         .to_string()
@@ -368,7 +370,15 @@ fn find_span<'a>(spans: &'a [CapturedSpan], scope: &str, name: &str) -> &'a Capt
     spans
         .iter()
         .find(|captured| captured.scope == scope && captured.span.name == name)
-        .unwrap_or_else(|| panic!("missing {scope} span {name}; got {:?}", spans.iter().map(|s| (&s.scope, &s.span.name)).collect::<Vec<_>>()))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing {scope} span {name}; got {:?}",
+                spans
+                    .iter()
+                    .map(|s| (&s.scope, &s.span.name))
+                    .collect::<Vec<_>>()
+            )
+        })
 }
 
 fn direct_child<'a>(spans: &'a [CapturedSpan], parent: &[u8], name: &str) -> &'a CapturedSpan {
@@ -450,7 +460,10 @@ async fn otlp_receiver_observes_one_connected_client_server_trace_and_disabled_s
             .connect()
             .await
             .expect("SDK session connect");
-        let reply = session.send("run the canonical tool fixture").await.expect("SDK send");
+        let reply = session
+            .send("run the canonical tool fixture")
+            .await
+            .expect("SDK send");
         assert_eq!(reply.text(), "tool round-trip complete");
         session.close().await.expect("SDK session close");
     }
@@ -463,7 +476,9 @@ async fn otlp_receiver_observes_one_connected_client_server_trace_and_disabled_s
     // direct-export shortcut is involved on either side.
     server.stop().await;
     let spans = wait_for_spans(&receiver, 10).await;
-    client_provider.shutdown().expect("flush client test provider");
+    client_provider
+        .shutdown()
+        .expect("flush client test provider");
 
     // Admin setup requests precede the app-root span and intentionally have
     // their own trace.  The assertion is about the driven agent interaction:
@@ -482,7 +497,13 @@ async fn otlp_receiver_observes_one_connected_client_server_trace_and_disabled_s
         .collect();
     let topology: Vec<_> = bae_spans
         .iter()
-        .map(|captured| (captured.scope.as_str(), captured.span.name.as_str(), &captured.span.trace_id))
+        .map(|captured| {
+            (
+                captured.scope.as_str(),
+                captured.span.name.as_str(),
+                &captured.span.trace_id,
+            )
+        })
         .collect();
     assert_eq!(
         trace_ids.len(),
@@ -495,7 +516,9 @@ async fn otlp_receiver_observes_one_connected_client_server_trace_and_disabled_s
     // request owns the server tool-dispatch span.
     let send = spans
         .iter()
-        .filter(|captured| captured.scope == "bae.client" && captured.span.name == "bae.client.send")
+        .filter(|captured| {
+            captured.scope == "bae.client" && captured.span.name == "bae.client.send"
+        })
         .find(|send| {
             spans.iter().any(|request| {
                 request.scope == "baesrv"

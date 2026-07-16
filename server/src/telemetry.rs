@@ -177,7 +177,9 @@ impl TelemetryGuard {
                 Ok((kind, Err(e))) => tracing::warn!("telemetry {kind} shutdown failed: {e}"),
                 Ok((_kind, Ok(()))) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    tracing::warn!("telemetry shutdown timed out; remaining exports may be dropped");
+                    tracing::warn!(
+                        "telemetry shutdown timed out; remaining exports may be dropped"
+                    );
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -392,7 +394,9 @@ pub async fn init(config: &TelemetryConfig) -> Result<Telemetry, TelemetryInitEr
     let layer: BoxTraceLayer = Box::new(
         tracing_opentelemetry::layer()
             .with_tracer(tracer)
-            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span())),
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+            })),
     );
 
     tracing::info!(
@@ -989,7 +993,11 @@ impl Drop for SubagentSpanGuard {
             // The launching task was aborted (explicit cancel or session-close
             // teardown) before a terminal outcome was recorded — the durable
             // event is `SubagentCancelled`, so the span must agree.
-            set_str(&self.span, ATTR_SUBAGENT_OUTCOME, SUBAGENT_OUTCOME_CANCELLED);
+            set_str(
+                &self.span,
+                ATTR_SUBAGENT_OUTCOME,
+                SUBAGENT_OUTCOME_CANCELLED,
+            );
         }
     }
 }
@@ -1112,9 +1120,7 @@ mod tests {
 
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
 
-    fn metric_names(
-        exporter: &InMemoryMetricExporter,
-    ) -> std::collections::HashSet<String> {
+    fn metric_names(exporter: &InMemoryMetricExporter) -> std::collections::HashSet<String> {
         exporter
             .get_finished_metrics()
             .expect("read in-memory metrics")

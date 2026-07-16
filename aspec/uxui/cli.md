@@ -63,6 +63,7 @@ Verb-first, resource-typed positional, mapping 1:1 onto the admin API's CRUD sur
 - `update profile <id> <provider> <model>` (full replacement, mirroring the API's `PUT`)
 - `delete profile <id>` / `delete key <id>`
 - `auth create key` — local-only admin-key-pair generation (no API call); pre-provisions a shared admin credential across multiple server replicas.
+- `setup` — interactive quickstart wizard; local scaffolding (generates a launcher, `.env`, and `bae-config.toml`) with an optional final step that launches the deployment and creates a first profile/key. See [Setup wizard](#setup-wizard) below and [baectl reference — `baectl setup`](../../docs/reference/baectl.md#baectl-setup) for the full question list.
 
 Profiles get the full CRUD set; keys get create/list/delete only — there is
 no single-key-get or key-update endpoint on the admin API (keys are
@@ -82,6 +83,13 @@ Flag guidance (same conventions as `baesrv` above):
   document the admin API returned (an array for an auto-paginated list);
   default is a compact human-readable summary/table.
 - `--help` on every command and subcommand.
+- `setup`-only flags, not shared with the rest of `baectl` (no admin-API
+  call to make, so no `--json`/auto-configuration flags apply): `--dev`
+  (use locally-built `make image`/`make image-max` tags instead of the
+  published GHCR tags), `--apple` (emit a `bae-setup.sh` script driving
+  Apple's `container` CLI instead of `docker-compose.yml`), `--dir <DIR>`
+  (directory to read/write the generated files in, default `.`, mirroring
+  `auth create key`'s `--out-dir`).
 
 #### Auto-configuration
 Unlike `baesrv`, `baectl` is a client with nothing to bind — its
@@ -106,6 +114,17 @@ I/O Guidance (identical to `baesrv`'s conventions):
   error response, an unexpected/unparseable response body — version skew),
   2 usage error (a missing required positional or a value `baectl` rejects
   itself, e.g. a malformed `--fallback` spec).
+
+##### Setup wizard
+`setup` is the **one** `baectl` command whose "stdin: unused" line above does
+not apply — it reads interactive stdin/stdout Q&A (each question defaulted,
+so a bare enter walks the whole wizard) to build a deployment before a server
+exists to talk to. When stdin isn't a TTY (piped/CI), every question falls
+back to its default with nothing printed, and the launch question
+specifically defaults to declining rather than the interactive default — see
+[baectl reference — `baectl setup`](../../docs/reference/baectl.md#baectl-setup)
+for the full question list, generated-file shapes, and exit codes. Every
+other `baectl` command's "stdin: unused" line stays accurate.
 
 See [baectl reference](../../docs/reference/baectl.md) for the complete,
 implementation-verified command surface, and

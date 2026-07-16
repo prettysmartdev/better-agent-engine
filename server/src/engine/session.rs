@@ -1103,11 +1103,8 @@ async fn launch_remote_subagent(
     // construction here means every launched task owns a real guard from the
     // instant its JoinHandle is stored, and aborting it always records the
     // terminal `cancelled` outcome.
-    let subagent_span_guard = crate::telemetry::SubagentSpanGuard::new(
-        &session_id,
-        &task_id,
-        launch_link.as_ref(),
-    );
+    let subagent_span_guard =
+        crate::telemetry::SubagentSpanGuard::new(&session_id, &task_id, launch_link.as_ref());
     let join = tokio::spawn(async move {
         background_running_gate.notified().await;
         // The `bae.subagent` span is its OWN ROOT (never a child — the launching

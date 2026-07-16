@@ -2726,8 +2726,7 @@ fn span_has_link(
     span.links.links.iter().any(|link| {
         link.span_context.span_id() == target
             && link.attributes.iter().any(|attribute| {
-                attribute.key.as_str() == "bae.link.kind"
-                    && attribute.value.to_string() == kind
+                attribute.key.as_str() == "bae.link.kind" && attribute.value.to_string() == kind
             })
     })
 }
@@ -2755,11 +2754,18 @@ async fn telemetry_mixed_turn_exports_the_contract_span_tree() {
     }]);
     let (session_id, session_key, _) = ts.open_session(&client_key, tools).await;
     let (status, _first, raw) = ts
-        .send_message(&session_id, &session_key, json!({ "content": "mixed please" }))
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": "mixed please" }),
+        )
         .await;
     assert_eq!(status, 200, "mixed turn: {raw}");
     let (status, _, raw) = ts
-        .client_delete(&format!("/api/v1/sessions/{session_id}"), Some(&session_key))
+        .client_delete(
+            &format!("/api/v1/sessions/{session_id}"),
+            Some(&session_key),
+        )
         .await;
     assert_eq!(status, 200, "close telemetry session: {raw}");
 
@@ -2811,8 +2817,7 @@ async fn telemetry_mixed_turn_exports_the_contract_span_tree() {
         span_attribute(span, baesrv::telemetry::ATTR_TOOL_DISPATCH).as_deref() == Some("mcp")
     }));
     assert!(dispatches.iter().any(|span| {
-        span_attribute(span, baesrv::telemetry::ATTR_TOOL_DISPATCH).as_deref()
-            == Some("client")
+        span_attribute(span, baesrv::telemetry::ATTR_TOOL_DISPATCH).as_deref() == Some("client")
     }));
 }
 
@@ -2828,7 +2833,11 @@ async fn telemetry_paused_turn_resume_is_a_linked_continuation() {
     let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]);
     let (session_id, session_key, _) = ts.open_session(&client_key, tools).await;
     let (status, _, raw) = ts
-        .send_message(&session_id, &session_key, json!({ "content": "mixed please" }))
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": "mixed please" }),
+        )
         .await;
     assert_eq!(status, 200, "pause: {raw}");
     let (status, _, raw) = ts
@@ -2844,7 +2853,10 @@ async fn telemetry_paused_turn_resume_is_a_linked_continuation() {
         .await;
     assert_eq!(status, 200, "resume: {raw}");
     let (status, _, raw) = ts
-        .client_delete(&format!("/api/v1/sessions/{session_id}"), Some(&session_key))
+        .client_delete(
+            &format!("/api/v1/sessions/{session_id}"),
+            Some(&session_key),
+        )
         .await;
     assert_eq!(status, 200, "close resumed telemetry session: {raw}");
 

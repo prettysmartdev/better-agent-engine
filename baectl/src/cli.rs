@@ -13,6 +13,7 @@
 //! baectl list   keys [--limit --cursor --json]
 //! baectl delete key <id>
 //! baectl auth   create key [--name --out-dir]   (local only — no API call)
+//! baectl setup  [--dev --apple --dir]           (local scaffolding + launch)
 //! ```
 //!
 //! `<primary_provider>` (and each `--fallback`) is the **name** of a
@@ -92,6 +93,12 @@ enum Command {
     Delete(DeleteCmd),
     /// Local admin-key utilities (no API call).
     Auth(AuthCmd),
+    /// Interactive quickstart wizard: scaffold a compose/`--apple` launcher,
+    /// `.env`, and `bae-config.toml`, then optionally launch and create a first
+    /// profile + client key. Local file generation makes no API call; only the
+    /// optional launch step talks to a server (via `docker exec`, never the
+    /// host-side admin port).
+    Setup(SetupCmd),
 }
 
 #[derive(Args)]
@@ -245,6 +252,23 @@ struct DeleteArgs {
 }
 
 #[derive(Args)]
+struct SetupCmd {
+    /// Use the image tags a local `make image`/`make image-max` produces
+    /// (`better-agent-engine:latest` / `:max`) instead of the published GHCR
+    /// tags. For contributors iterating on a local build.
+    #[arg(long)]
+    dev: bool,
+    /// Emit a `bae-setup.sh` script driving Apple's `container` CLI instead of
+    /// a `docker-compose.yml`. Both output modes read the same `.env`.
+    #[arg(long)]
+    apple: bool,
+    /// Directory to read/write the three generated files in (default `.`),
+    /// mirroring `auth create key`'s `--out-dir` convention.
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    dir: PathBuf,
+}
+
+#[derive(Args)]
 struct AuthCmd {
     #[command(subcommand)]
     action: AuthAction,
@@ -300,6 +324,12 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         return run_auth_create_key(args);
     }
 
+    // `setup` scaffolds local files (and optionally launches) — it never builds
+    // a host-side admin client, so it must be handled before `build_client`.
+    if let Command::Setup(SetupCmd { dev, apple, dir }) = &cli.command {
+        return crate::setup::run(*dev, *apple, dir);
+    }
+
     let client = build_client(&cli)?;
     match cli.command {
         Command::Create(CreateCmd { resource }) => match resource {
@@ -339,8 +369,9 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
                 Ok(())
             }
         },
-        // `auth` is fully handled above.
+        // `auth` and `setup` are fully handled above (before the client build).
         Command::Auth(_) => unreachable!("auth handled before client build"),
+        Command::Setup(_) => unreachable!("setup handled before client build"),
     }
 }
 

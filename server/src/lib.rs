@@ -254,8 +254,7 @@ pub async fn serve(
     // (their sessions never got an explicit close), then flush+shutdown the
     // providers. A no-op when telemetry is disabled.
     state.end_all_session_spans();
-    let telemetry_budget =
-        shutdown_deadline.saturating_duration_since(std::time::Instant::now());
+    let telemetry_budget = shutdown_deadline.saturating_duration_since(std::time::Instant::now());
     telemetry_guard.shutdown(telemetry_budget);
 
     // Dropping the last `Store` clone here closes the SQLite connection.

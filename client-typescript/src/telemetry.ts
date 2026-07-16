@@ -35,7 +35,7 @@ export function injectAmbientContext(headers: Record<string, string>): void {
   propagation.inject(context.active(), carrier);
   for (const key of Object.keys(carrier)) {
     if (ALLOWED_PROPAGATION_HEADERS.has(key.toLowerCase())) {
-      headers[key] = carrier[key];
+      headers[key] = carrier[key]!;
     }
   }
 }
