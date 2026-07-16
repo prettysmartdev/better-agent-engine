@@ -18,6 +18,7 @@ import {
   type SandboxToolDef,
 } from "./sandbox.js";
 import type { ToolDefinition } from "./tool.js";
+import { clientTracer, recordSpanError, SpanKind } from "./telemetry.js";
 import {
   SubagentSession,
   type LocalSubagentReport,
@@ -419,24 +420,58 @@ export class Session implements SandboxRpc, SubagentRpc {
    */
   async send(input: string | Message): Promise<Message> {
     let message = toMessage(input);
+    let iteration = 0;
 
     for (;;) {
-      await this.runHook("before_send", (h) => h(message));
+      const currentMessage = message;
+      const currentIteration = iteration;
+      const next = await clientTracer.startActiveSpan(
+        "bae.client.send",
+        {
+          kind: SpanKind.CLIENT,
+          attributes: {
+            "bae.session.id": this.id,
+            "bae.rpc.method": "session.sendMessage",
+            "bae.client.iteration": currentIteration,
+          },
+        },
+        async (span) => {
+          try {
+            await this.runHook("before_send", (h) => h(currentMessage));
 
-      const { result, notifications } = await this.sendMessage(message);
-      for (const event of notifications) {
-        await this.runHook("on_event", (h) => h(event));
-      }
-      const assistant = result.message;
+            const { result, notifications } =
+              await this.sendMessage(currentMessage);
+            for (const event of notifications) {
+              await this.runHook("on_event", (h) => h(event));
+            }
+            const assistant = result.message;
 
-      await this.runHook("after_receive", (h) => h(assistant));
+            await this.runHook("after_receive", (h) => h(assistant));
 
-      const uses = toolUses(assistant);
-      if (uses.length === 0) {
-        return assistant;
-      }
+            const uses = toolUses(assistant);
+            if (uses.length === 0) {
+              return { assistant, nextMessage: undefined };
+            }
 
-      message = { role: "user", content: await this.dispatchTools(uses) };
+            return {
+              assistant,
+              nextMessage: {
+                role: "user" as const,
+                content: await this.dispatchTools(uses),
+              },
+            };
+          } catch (cause) {
+            recordSpanError(span, "send failed");
+            throw cause;
+          } finally {
+            span.end();
+          }
+        },
+      );
+
+      if (next.nextMessage === undefined) return next.assistant;
+      message = next.nextMessage;
+      iteration += 1;
     }
   }
 
@@ -576,29 +611,49 @@ export class Session implements SandboxRpc, SubagentRpc {
         continue;
       }
 
-      await this.runHook("before_tool_call", (h) => h(use));
+      const result = await clientTracer.startActiveSpan(
+        "bae.client.tool",
+        {
+          kind: SpanKind.INTERNAL,
+          attributes: {
+            "bae.tool.name": use.name,
+            "bae.tool.dispatch": "client",
+          },
+        },
+        async (span) => {
+          try {
+            await this.runHook("before_tool_call", (h) => h(use));
 
-      const tool = this.tools.get(use.name);
-      if (tool === undefined) {
-        // Reachable only for client-owned calls: a dispatch:"client" request
-        // can reveal a stale local declaration/handler mismatch, while a
-        // server-owned request never reaches here.
-        throw new UnknownToolError(use.name);
-      }
+            const tool = this.tools.get(use.name);
+            if (tool === undefined) {
+              // Reachable only for client-owned calls: a dispatch:"client"
+              // request can reveal a stale local declaration/handler mismatch,
+              // while a server-owned request never reaches here.
+              throw new UnknownToolError(use.name);
+            }
 
-      let content;
-      try {
-        content = await tool.handler(use.input);
-      } catch (cause) {
-        throw new ToolError(use.name, cause);
-      }
+            let content;
+            try {
+              content = await tool.handler(use.input);
+            } catch (cause) {
+              throw new ToolError(use.name, cause);
+            }
 
-      const result: ToolResult = {
-        tool_use_id: use.id,
-        name: use.name,
-        content,
-      };
-      await this.runHook("after_tool_call", (h) => h(result));
+            const toolResult: ToolResult = {
+              tool_use_id: use.id,
+              name: use.name,
+              content,
+            };
+            await this.runHook("after_tool_call", (h) => h(toolResult));
+            return toolResult;
+          } catch (cause) {
+            recordSpanError(span, "tool handler failed");
+            throw cause;
+          } finally {
+            span.end();
+          }
+        },
+      );
 
       blocks.push({
         type: "tool_result",

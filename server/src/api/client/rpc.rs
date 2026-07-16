@@ -234,14 +234,39 @@ pub async fn rpc(
                     }
                 }
             }
+            // Link this request's `http.request` span to the session anchor
+            // span (§2.3): a driver joining an existing session is linked to it,
+            // never nested under it. No-op when telemetry is off.
+            if let Some(ctx) = state.session_span_context(&session.id) {
+                crate::telemetry::add_link(
+                    &tracing::Span::current(),
+                    &ctx,
+                    crate::telemetry::LINK_SESSION,
+                );
+            }
             single_or_empty(
                 id_present,
                 result_obj(req_id, json!({ "registered": true })),
             )
         }
-        "session.sendMessage" => spawn_stream(move |tx| {
-            drive_send_message(state, session, acting_client_key_id, resp_id, params, tx)
-        }),
+        "session.sendMessage" => {
+            // Capture the active `http.request` span's context before spawning
+            // the turn task: `tokio::spawn` does not carry the tracing context,
+            // so the turn span (opened in the detached task) is parented back to
+            // this request via the captured context — the client↔server join.
+            let parent_cx = crate::telemetry::current_context();
+            spawn_stream(move |tx| {
+                drive_send_message(
+                    state,
+                    session,
+                    acting_client_key_id,
+                    resp_id,
+                    params,
+                    parent_cx,
+                    tx,
+                )
+            })
+        }
         "session.startRemoteSandbox" => {
             start_remote_sandbox_rpc(
                 &state,
@@ -364,12 +389,14 @@ pub async fn rpc(
 /// stays away past `BAE_TURN_TIMEOUT` is treated as abandoned by the next
 /// arrival: a `session.error` (`driver_turn_abandoned`) is logged and the gate
 /// is released to the next FIFO waiter; the session stays `open`.
+#[allow(clippy::too_many_arguments)]
 async fn drive_send_message(
     state: AppState,
     session: SessionRecord,
     acting_client_key_id: String,
     resp_id: Option<Value>,
     params: Value,
+    parent_cx: opentelemetry::Context,
     tx: mpsc::Sender<Bytes>,
 ) {
     // Explicit driver registration is the gate on sending — checked before the
@@ -434,6 +461,8 @@ async fn drive_send_message(
     // turn); empty unless this request resumes such a turn. Merged with the
     // client's own results below, before the turn is recorded.
     let mut stashed_server_results: Vec<Value> = Vec::new();
+    // The paused turn's span context, for the resume Link on the new turn span.
+    let mut resumed_span_context: Option<opentelemetry::trace::SpanContext> = None;
     let reclaimed = {
         let mut pending = state
             .pending_turns
@@ -450,6 +479,7 @@ async fn drive_send_message(
             pending.remove(&session.id).map(|pt| {
                 resumed_paused_turn = true;
                 stashed_server_results = pt.server_tool_results;
+                resumed_span_context = pt.span_context;
                 pt.guard
             })
         } else {
@@ -459,6 +489,7 @@ async fn drive_send_message(
                     resumed_paused_turn = true;
                     timed_out_paused_turn = true;
                     stashed_server_results = pt.server_tool_results;
+                    resumed_span_context = pt.span_context;
                     // Reclaim the parked guard for this request. This retires
                     // the expired exchange before any queued message can
                     // interleave with its synthetic cancellation results.
@@ -594,6 +625,11 @@ async fn drive_send_message(
                 let _ = state
                     .store
                     .with_conn(|c| sessions::close_session(c, &session.id, STATE_ERROR));
+                // The session moved to terminal `error`: end its anchor span now
+                // (marked Error), matching the provider-exhaustion teardown, so
+                // it is not left live with an inflated duration and Unset status
+                // (contract §1.1).
+                state.end_session_span(&session.id, Some("tool result merge invalid"));
                 emit_terminal(&tx, &resp_id, |id| {
                     error_obj(id, -32000, format!("tool result merge invalid: {reason}"))
                 })
@@ -659,6 +695,10 @@ async fn drive_send_message(
             let _ = state
                 .store
                 .with_conn(|c| sessions::close_session(c, &session.id, STATE_ERROR));
+            // The session moved to terminal `error`: end its anchor span now
+            // (marked Error) so it is not left live until a later DELETE or
+            // shutdown (contract §1.1).
+            state.end_session_span(&session.id, Some("profile unavailable"));
             emit_terminal(&tx, &resp_id, |id| {
                 error_obj(
                     id,
@@ -678,21 +718,39 @@ async fn drive_send_message(
     // attributed to it.
     let mcp = state.mcp_session(&session.id);
     let sandbox = state.sandbox(&session.id);
-    let turn_fut = session::run_turn(
-        &state.store,
-        &state.http,
-        &state.broadcaster,
-        &session,
-        &profile,
-        &state.provider_registry,
-        mcp,
-        state.sandbox_driver.clone(),
-        sandbox,
-        state.subagents.clone(),
-        state.command_runner.clone(),
-        state.subagent_timeout,
-        state.max_subagents_per_session,
+
+    // Open the `bae.turn` span: parented to this request's `http.request` span
+    // (via `parent_cx`, captured before the spawn), always Linked to the
+    // session anchor span, and — on a resume — additionally Linked to the paused
+    // turn's stored context. `run_turn`'s provider/tool/mcp/sandbox spans nest
+    // under it via `.instrument(...)`. No-op span when telemetry is disabled.
+    let turn_span = crate::telemetry::turn_span(
+        &parent_cx,
+        state.session_span_context(&session.id).as_ref(),
+        resumed_span_context.as_ref(),
+        &session.id,
         &acting_client_key_id,
+    );
+
+    let turn_fut = tracing::Instrument::instrument(
+        session::run_turn(
+            &state.store,
+            &state.http,
+            &state.broadcaster,
+            &session,
+            &profile,
+            &state.provider_registry,
+            mcp,
+            state.sandbox_driver.clone(),
+            sandbox,
+            state.subagents.clone(),
+            state.command_runner.clone(),
+            state.subagent_timeout,
+            state.max_subagents_per_session,
+            &acting_client_key_id,
+            &state.telemetry_metrics,
+        ),
+        turn_span.clone(),
     );
     tokio::pin!(turn_fut);
 
@@ -735,6 +793,21 @@ async fn drive_send_message(
 
     match turn_result {
         Ok(turn) => {
+            // Record the turn outcome on its span (and Error status on a
+            // provider-exhausted turn), then end the session anchor span when
+            // the turn moved the session to terminal `error`.
+            let outcome_str = match turn.outcome {
+                session::Outcome::Completed => "completed",
+                session::Outcome::Paused => "paused",
+                session::Outcome::ProvidersFailed => "providers_failed",
+            };
+            state.telemetry_metrics.record_turn_completed(outcome_str);
+            crate::telemetry::set_str(&turn_span, crate::telemetry::ATTR_TURN_OUTCOME, outcome_str);
+            if turn.outcome == session::Outcome::ProvidersFailed {
+                crate::telemetry::set_error(&turn_span, "all providers failed");
+                state.end_session_span(&session.id, Some("all providers failed"));
+            }
+
             // A Paused turn (client-side tool call in flight) keeps holding the
             // FIFO gate across requests: park the guard so only this caller's
             // continuation resumes without queuing. Completed/ProvidersFailed
@@ -742,6 +815,9 @@ async fn drive_send_message(
             // next FIFO waiter.
             if turn.outcome == session::Outcome::Paused {
                 if let Some(guard) = gate_guard.take() {
+                    // Capture the paused turn span's context so the resuming
+                    // request's new turn span can Link back to it (§2.2).
+                    let span_context = crate::telemetry::span_context(&turn_span);
                     state
                         .pending_turns
                         .lock()
@@ -757,6 +833,7 @@ async fn drive_send_message(
                                 // this owner resumes (empty on an all-client
                                 // pause). Freed with the PendingTurn if abandoned.
                                 server_tool_results: turn.pending_tool_results,
+                                span_context,
                             },
                         );
                 }
@@ -772,12 +849,14 @@ async fn drive_send_message(
         }
         Err(e) => {
             tracing::error!("session loop failed: {e}");
+            crate::telemetry::set_error(&turn_span, "session loop failed");
             emit_terminal(&tx, &resp_id, |id| {
                 error_obj(id, -32000, "session loop failed")
             })
             .await;
         }
     }
+    drop(turn_span);
     drop(gate_guard);
 }
 

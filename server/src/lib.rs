@@ -20,13 +20,14 @@ pub mod config_file;
 pub mod engine;
 pub mod events;
 pub mod store;
+pub mod telemetry;
 
 pub use config::Config;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use config_file::McpServerConfig;
+use config_file::{McpServerConfig, TelemetryConfig};
 use engine::provider::ProviderConfig;
 
 use tokio::net::TcpListener;
@@ -105,6 +106,10 @@ pub fn open_store(config: &Config) -> Result<Store, StoreError> {
 /// servers and LLM providers parsed from `bae-config.toml`; both are held
 /// in-memory on [`AppState`] and never persisted.
 ///
+/// `telemetry_config` is validated and carried through startup for the
+/// telemetry initialization layer; the layer itself is installed by the
+/// server telemetry step.
+///
 /// `admin_auth_enabled` decides whether the admin router enforces a bearer
 /// admin key. It is the result of [`admin_auth::bootstrap`], which the caller
 /// runs before this — after the store opens, before the listeners bind.
@@ -113,13 +118,16 @@ pub fn open_store(config: &Config) -> Result<Store, StoreError> {
 /// `BAE_SANDBOX_DRIVER` (built by `cli::run_serve`); the startup pass below
 /// re-triggers image provisioning for every profile that declares
 /// `available_sandboxes`, since the status map is in-memory only.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: Config,
     store: Store,
     mcp_registry: HashMap<String, McpServerConfig>,
     provider_registry: HashMap<String, ProviderConfig>,
+    telemetry_config: TelemetryConfig,
     admin_auth_enabled: bool,
     sandbox_driver: std::sync::Arc<dyn engine::sandbox::SandboxDriver>,
+    telemetry_guard: telemetry::TelemetryGuard,
 ) -> Result<(), RunError> {
     tracing::info!(
         version = VERSION,
@@ -133,6 +141,11 @@ pub async fn serve(
     state.subagent_timeout = config.subagent_timeout;
     state.max_subagents_per_session = config.max_subagents_per_session;
     state.sandbox_driver = sandbox_driver;
+
+    // Metrics are registered once now that the observable-gauge callbacks can
+    // capture the fully constructed shared state. The OTLP PeriodicReader owns
+    // collection/export cadence; this does not add a second timer loop.
+    state.telemetry_metrics = telemetry_guard.register_metrics(&telemetry_config, state.clone());
 
     // Sandbox image status is in-memory only: re-provision every declaring
     // profile so a restart never leaves status permanently stale (and a
@@ -209,6 +222,13 @@ pub async fn serve(
     );
     let _ = shutdown_tx.send(true);
 
+    // `BAE_SHUTDOWN_TIMEOUT` is the budget for the WHOLE shutdown — draining
+    // in-flight requests AND flushing telemetry — not for each stage
+    // separately. Track a single deadline so the drain and the telemetry
+    // flush/shutdown together never exceed it, or an orchestrator could kill
+    // the process mid-flush and lose the last spans of a session.
+    let shutdown_deadline = std::time::Instant::now() + config.shutdown_timeout;
+
     // Bound the drain: axum's graceful shutdown waits for in-flight requests
     // indefinitely, so cap it with the configured timeout.
     let drained = tokio::time::timeout(config.shutdown_timeout, async {
@@ -223,6 +243,16 @@ pub async fn serve(
             "drain timed out; shutting down anyway"
         ),
     }
+
+    // Flush telemetry within the REMAINING shutdown budget so the last spans of
+    // a session are not lost on restart/deploy while total shutdown stays within
+    // the single window. End any still-open `bae.session` anchor spans first
+    // (their sessions never got an explicit close), then flush+shutdown the
+    // providers. A no-op when telemetry is disabled.
+    state.end_all_session_spans();
+    let telemetry_budget =
+        shutdown_deadline.saturating_duration_since(std::time::Instant::now());
+    telemetry_guard.shutdown(telemetry_budget);
 
     // Dropping the last `Store` clone here closes the SQLite connection.
     summary_task.abort();

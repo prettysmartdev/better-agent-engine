@@ -42,6 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -159,6 +160,7 @@ pub async fn run_turn(
     subagent_timeout: std::time::Duration,
     max_subagents_per_session: usize,
     acting_client_key_id: &str,
+    metrics: &crate::telemetry::Metrics,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
     let cid = acting_client_key_id;
@@ -273,6 +275,23 @@ pub async fn run_turn(
         }
     };
     let configs: Vec<ProviderConfig> = std::iter::once(primary).chain(fallbacks).collect();
+    // Registry names aligned with `configs` for the `bae.provider.name` span
+    // attribute: the primary name, then each fallback that actually resolved
+    // (missing fallbacks were skipped in `resolve_from_profile`, same filter).
+    let config_names: Vec<String> = std::iter::once(
+        profile
+            .provider_config
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+    .chain(
+        fallback_names
+            .iter()
+            .filter(|n| provider_registry.contains_key(*n))
+            .cloned(),
+    )
+    .collect();
 
     // History streamed from the log; extended in-memory across MCP round-trips.
     let mut history: Vec<Value> = store
@@ -298,6 +317,15 @@ pub async fn run_turn(
         let mut success: Option<Value> = None;
         for (i, cfg) in configs.iter().enumerate() {
             let kind = if i == 0 { "primary" } else { "fallback" };
+            // One `bae.provider.attempt` child span per fallback-walk iteration,
+            // wrapping the `provider::call` await (contract §1.1).
+            let attempt_span = crate::telemetry::provider_attempt_span(
+                config_names.get(i).map(String::as_str).unwrap_or_default(),
+                cfg.provider.as_str(),
+                &cfg.model,
+                i,
+                kind,
+            );
             events.push(log_event(
                 store,
                 broadcaster,
@@ -316,8 +344,24 @@ pub async fn run_turn(
                 }),
             )?);
 
-            match provider::call(http, cfg, &history_value, &tools_value).await {
+            let provider_started = Instant::now();
+            match tracing::Instrument::instrument(
+                provider::call(http, cfg, &history_value, &tools_value),
+                attempt_span.clone(),
+            )
+            .await
+            {
                 Ok(resp) => {
+                    metrics.record_provider_attempt(
+                        cfg.provider.as_str(),
+                        "ok",
+                        provider_started.elapsed(),
+                    );
+                    crate::telemetry::set_i64(
+                        &attempt_span,
+                        crate::telemetry::ATTR_HTTP_STATUS,
+                        200,
+                    );
                     // The event records the raw, untranslated wire body; the
                     // loop consumes only the canonical translation.
                     events.push(log_event(
@@ -332,6 +376,19 @@ pub async fn run_turn(
                     break;
                 }
                 Err(e) => {
+                    metrics.record_provider_attempt(
+                        cfg.provider.as_str(),
+                        "error",
+                        provider_started.elapsed(),
+                    );
+                    if let Some(status) = e.status() {
+                        crate::telemetry::set_i64(
+                            &attempt_span,
+                            crate::telemetry::ATTR_HTTP_STATUS,
+                            status as i64,
+                        );
+                    }
+                    crate::telemetry::set_error(&attempt_span, e.detail());
                     events.push(log_event(
                         store,
                         broadcaster,
@@ -461,10 +518,23 @@ pub async fn run_turn(
         // here; the client executes them.
         let mut server_tool_results: Vec<Value> = Vec::new();
         for (tu, dispatch) in tool_uses.iter().zip(&dispatches) {
+            let name = tu.name.as_str();
+            // One `bae.tool.dispatch` child span per dispatched block, all four
+            // buckets. `input.bytes` is the serialized size — never the payload
+            // (contract §4). Held across the dispatch so its duration covers the
+            // work; is_error/output.bytes set below for server-executed buckets.
+            let input_bytes = serde_json::to_vec(&tu.input).map(|v| v.len()).unwrap_or(0) as i64;
+            let dispatch_span = crate::telemetry::tool_dispatch_span(name, dispatch, input_bytes);
+            metrics.record_tool_call(dispatch);
+
             if *dispatch == "client" {
+                // The server records the span for the client-dispatched block
+                // but does not execute it (no is_error/output.bytes); the client
+                // runs it and returns results on resume.
                 continue;
             }
-            let name = tu.name.as_str();
+            // Only server-owned dispatches have a server execution latency.
+            let dispatch_started = Instant::now();
 
             // Auto-mode sandbox tools: dispatched server-side against the
             // session's remote sandbox, mirroring the MCP round trip below —
@@ -491,9 +561,25 @@ pub async fn run_turn(
                     (Some(sb), Some(cmd)) => {
                         // Held across the driver await, like an MCP dispatch.
                         let handle = sb.lock().await;
-                        match sandbox_driver.exec(&handle, cmd).await {
+                        // `bae.sandbox.exec` grandchild span, parented to this
+                        // tool-dispatch span (contract §1.1).
+                        let exec_span = crate::telemetry::sandbox_exec_span(&dispatch_span, name);
+                        match tracing::Instrument::instrument(
+                            sandbox_driver.exec(&handle, cmd),
+                            exec_span.clone(),
+                        )
+                        .await
+                        {
                             Ok(r) => {
                                 let is_err = r.exit_code != 0;
+                                crate::telemetry::set_i64(
+                                    &exec_span,
+                                    crate::telemetry::ATTR_SANDBOX_EXIT_CODE,
+                                    r.exit_code as i64,
+                                );
+                                if is_err {
+                                    crate::telemetry::set_error(&exec_span, "non-zero exit code");
+                                }
                                 (
                                     json!({
                                         "sandbox_id": handle.id,
@@ -510,6 +596,11 @@ pub async fn run_turn(
                             }
                             Err(e) => {
                                 let msg = e.to_string();
+                                // Generic span status only — a sandbox driver
+                                // error string can carry forwarded command
+                                // output/secrets; never export it (telemetry
+                                // contract §4). Full text goes to the event log.
+                                crate::telemetry::set_error(&exec_span, "sandbox exec failed");
                                 // Lifecycle visibility is identical regardless
                                 // of dispatch mode: a failed exec also logs
                                 // session.sandbox.error alongside the
@@ -584,6 +675,14 @@ pub async fn run_turn(
                         "content": result_content,
                     }),
                 )?);
+                record_dispatch_outcome(
+                    metrics,
+                    &dispatch_span,
+                    dispatch,
+                    dispatch_started.elapsed(),
+                    is_error,
+                    &result_content,
+                );
                 server_tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
@@ -600,6 +699,10 @@ pub async fn run_turn(
                 let (result_content, is_error) = if name == subagent::REMOTE_STATUS_TOOL_NAME {
                     remote_status_result(&subagents, sid, &tu.input)
                 } else {
+                    // The subagent's own `bae.subagent` span is a separate root
+                    // opened in the detached task; it Links back to this
+                    // dispatch span. Capture the link target now (§2.1).
+                    let launch_link = crate::telemetry::span_context(&dispatch_span);
                     launch_remote_subagent(
                         store,
                         broadcaster,
@@ -614,6 +717,7 @@ pub async fn run_turn(
                         command_runner.clone(),
                         subagent_timeout,
                         max_subagents_per_session,
+                        launch_link,
                     )
                     .await
                 };
@@ -621,6 +725,14 @@ pub async fn run_turn(
                     store, broadcaster, sid, cid, EventType::ToolResult,
                     json!({ "tool_use_id": tu.id, "dispatch": "subagent", "is_error": is_error, "content": result_content }),
                 )?);
+                record_dispatch_outcome(
+                    metrics,
+                    &dispatch_span,
+                    dispatch,
+                    dispatch_started.elapsed(),
+                    is_error,
+                    &result_content,
+                );
                 server_tool_results.push(json!({
                     "type": "tool_result", "tool_use_id": tu.id,
                     "content": result_content, "is_error": is_error,
@@ -649,28 +761,45 @@ pub async fn run_turn(
             // content, is_error) triple. A failure is never fatal to the turn:
             // the model sees an error result and can adjust. No reconnect.
             let (response_payload, result_content, is_error) = match (&mcp, &server) {
-                (Some(m), Some(srv)) => match m.lock().await.call_tool(name, &tu.input).await {
-                    Ok(result) => {
-                        let is_err = result
-                            .get("isError")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let content = result.get("content").cloned().unwrap_or_else(|| json!([]));
-                        (
-                            json!({ "server_name": srv, "ok": !is_err, "result": result }),
-                            content,
-                            is_err,
-                        )
+                (Some(m), Some(srv)) => {
+                    // `bae.mcp.call` grandchild span around the `tools/call`
+                    // round trip, parented to this tool-dispatch span (§1.1).
+                    let mcp_span =
+                        crate::telemetry::mcp_call_span(&dispatch_span, Some(srv.as_str()), name);
+                    let call = async { m.lock().await.call_tool(name, &tu.input).await };
+                    match tracing::Instrument::instrument(call, mcp_span.clone()).await {
+                        Ok(result) => {
+                            let is_err = result
+                                .get("isError")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            if is_err {
+                                crate::telemetry::set_error(&mcp_span, "MCP tool returned isError");
+                            }
+                            let content =
+                                result.get("content").cloned().unwrap_or_else(|| json!([]));
+                            (
+                                json!({ "server_name": srv, "ok": !is_err, "result": result }),
+                                content,
+                                is_err,
+                            )
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            // Generic span status only — the MCP error string is
+                            // an MCP server's arbitrary `error.message` and may
+                            // echo forwarded input/secrets; never export it as a
+                            // span attribute/status (telemetry contract §4). The
+                            // full text still goes to the event log below.
+                            crate::telemetry::set_error(&mcp_span, "MCP call failed");
+                            (
+                                json!({ "server_name": srv, "ok": false, "error": msg }),
+                                mcp_error_content(&e.to_string()),
+                                true,
+                            )
+                        }
                     }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        (
-                            json!({ "server_name": srv, "ok": false, "error": msg }),
-                            mcp_error_content(&e.to_string()),
-                            true,
-                        )
-                    }
-                },
+                }
                 // No MCP server is configured for this tool: the profile
                 // referenced an unconfigured/typo'd server, or the model invoked
                 // a tool that was never advertised.
@@ -706,6 +835,14 @@ pub async fn run_turn(
                     "content": result_content,
                 }),
             )?);
+            record_dispatch_outcome(
+                metrics,
+                &dispatch_span,
+                dispatch,
+                dispatch_started.elapsed(),
+                is_error,
+                &result_content,
+            );
             server_tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
@@ -836,6 +973,7 @@ async fn launch_remote_subagent(
     runner: Arc<dyn CommandRunner>,
     default_timeout: std::time::Duration,
     max_subagents: usize,
+    launch_link: Option<opentelemetry::trace::SpanContext>,
 ) -> (Value, bool) {
     let (harness, model, prompt) = match (
         input.get("harness").and_then(Value::as_str),
@@ -958,8 +1096,26 @@ async fn launch_remote_subagent(
     // terminal ordering cannot race.
     let running_gate = Arc::new(tokio::sync::Notify::new());
     let background_running_gate = running_gate.clone();
+    // Construct the root span before spawning rather than inside the async
+    // task. A caller can issue `session.cancelSubagent` immediately after the
+    // launch response; if the scheduler has not polled the task yet, a guard
+    // created inside that future would not exist for `abort()` to drop. Moving
+    // construction here means every launched task owns a real guard from the
+    // instant its JoinHandle is stored, and aborting it always records the
+    // terminal `cancelled` outcome.
+    let subagent_span_guard = crate::telemetry::SubagentSpanGuard::new(
+        &session_id,
+        &task_id,
+        launch_link.as_ref(),
+    );
     let join = tokio::spawn(async move {
         background_running_gate.notified().await;
+        // The `bae.subagent` span is its OWN ROOT (never a child — the launching
+        // turn's span has already ended), Linked back to the launching
+        // tool-dispatch span (contract §2.1). Its guard was constructed before
+        // spawning, so an abort before this task's first poll still ends the
+        // span with `outcome="cancelled"`; normal paths below finish it with
+        // their natural terminal outcome.
         let outcome = tokio::time::timeout(
             timeout,
             runner.run_with_stdin(&program, &args, stdin.as_deref()),
@@ -1061,6 +1217,18 @@ async fn launch_remote_subagent(
         ) {
             tracing::error!("failed to log remote subagent terminal event: {e}");
         }
+        // End the subagent span with its terminal outcome (Error on failure).
+        // `finish` marks the guard finalized, so its `Drop` will not overwrite
+        // this with `cancelled`.
+        let completed = event_type == EventType::SubagentCompleted;
+        subagent_span_guard.finish(
+            if completed {
+                crate::telemetry::SUBAGENT_OUTCOME_COMPLETED
+            } else {
+                crate::telemetry::SUBAGENT_OUTCOME_FAILED
+            },
+            !completed,
+        );
     });
     if let Some(task) = subagents
         .lock()
@@ -1139,6 +1307,29 @@ fn annotate_dispatch(content: &Value, dispatch_by_id: &HashMap<String, &'static 
             })
             .collect(),
     )
+}
+
+/// Record a server-executed tool's result shape on its `bae.tool.dispatch`
+/// span: `is_error`, the output byte size (size metadata only — never the
+/// payload, per contract §4), and Error status when the result is an error.
+/// No-op when telemetry is disabled.
+fn record_dispatch_outcome(
+    metrics: &crate::telemetry::Metrics,
+    span: &tracing::Span,
+    dispatch: &'static str,
+    latency: std::time::Duration,
+    is_error: bool,
+    result_content: &Value,
+) {
+    metrics.record_tool_latency(dispatch, latency);
+    let output_bytes = serde_json::to_vec(result_content)
+        .map(|v| v.len())
+        .unwrap_or(0) as i64;
+    crate::telemetry::set_bool(span, crate::telemetry::ATTR_TOOL_IS_ERROR, is_error);
+    crate::telemetry::set_i64(span, crate::telemetry::ATTR_TOOL_OUTPUT_BYTES, output_bytes);
+    if is_error {
+        crate::telemetry::set_error(span, "tool result is_error");
+    }
 }
 
 /// Build the error-shaped `tool_result` content for a failed MCP dispatch, so
@@ -1377,6 +1568,7 @@ mod tests {
                 runner.clone(),
                 std::time::Duration::from_secs(60),
                 8,
+                None,
             ),
         )
         .await

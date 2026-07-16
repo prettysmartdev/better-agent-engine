@@ -55,6 +55,7 @@ Purpose: Stateful HTTP service owning all durable agent state.
 Description and Scope:
 - Rust binary exposing the versioned REST + JSON-RPC API; persists agents, sessions, events, and runs in SQLite; runs embedded, forward-only migrations at startup; connects to operator-configured MCP servers.
 - Scope: API surface, persistence, authentication/RBAC, run lifecycle, server-side MCP dispatch (see Principle 2 for the rationale). Out of scope: agent loop logic, prompting strategies, application tool implementations (those live in client harnesses).
+- **OpenTelemetry (work item 0013).** `baesrv` is the OTel SDK owner: when `[telemetry]` is enabled in `bae-config.toml` it brings up its own tracer/meter providers and OTLP exporter, instruments the session/turn/provider/tool-dispatch span hierarchy via a `tracing-opentelemetry` layer, and publishes platform-health metrics (open sessions, connected clients, events/hour, etc.) sourced from state the engine already maintains. Off (no spans, no metrics, no OTLP traffic) unless explicitly configured — a deployment that never touches `[telemetry]` sees zero behavior change. See [Configuration — `[telemetry]`](../../docs/reference/configuration.md#telemetry).
 
 ### Component 2:
 Name: bae-rs (client-rust/)
@@ -62,6 +63,7 @@ Purpose: Idiomatic Rust client library and harness.
 Description and Scope:
 - Typed HTTP client over /api/v1 plus a composable agent-loop harness; published to crates.io.
 - Scope: protocol types, transport, harness traits and default loop. Stateless by design.
+- **OpenTelemetry (work item 0013).** Depends on the `opentelemetry` API crate only (never `opentelemetry_sdk`/an exporter as a runtime dependency); calls it against whatever ambient/global `TracerProvider` the embedding application installed, injecting W3C `traceparent`/`tracestate` on every outbound request. With no host-installed OTel SDK, every call resolves to Rust's built-in no-op tracer — zero overhead, no header written, no BAE-specific client config surface.
 
 ### Component 3:
 Name: @prettysmartdev/bae-ts (client-typescript/)
@@ -69,6 +71,7 @@ Purpose: Idiomatic TypeScript client library and harness.
 Description and Scope:
 - Same surface as the Rust client, built on Node's fetch with zero runtime dependencies; published to npm.
 - Scope: mirrors client-rust feature-for-feature with idiomatic TypeScript naming.
+- **OpenTelemetry (work item 0013) — scoped exception to the zero-runtime-dependencies line above.** `@opentelemetry/api` becomes this package's **first-ever runtime dependency**. This is a deliberate, narrowly-scoped exception, not a precedent for adding further runtime deps: the `@opentelemetry/api` package is API-surface only (no exporter/SDK weight) and is a genuine no-op without a host application's own OTel SDK installed, so it preserves the "invisible unless configured" goal the zero-deps principle exists to protect. Future work items should not read this as license to add other runtime dependencies under the same reasoning.
 
 ### Component 4:
 Name: bae-py (client-python/)
@@ -76,6 +79,7 @@ Purpose: Idiomatic Python client library and harness.
 Description and Scope:
 - Same surface as the other clients, built on httpx/pydantic; published to PyPI.
 - Scope: mirrors the other clients feature-for-feature with idiomatic Python naming (sync and async variants).
+- **OpenTelemetry (work item 0013).** Depends on `opentelemetry-api` only (never `opentelemetry-sdk`, which stays a dev-only test dependency); calls it against the embedding application's ambient tracer, injecting `traceparent`/`tracestate` on every outbound request via `contextvars`-based propagation. No host SDK installed → the API's built-in no-op tracer → zero overhead, no header written.
 
 ### Component 5:
 Name: baectl (baectl/)
@@ -94,3 +98,4 @@ Description and Scope:
 - Scope: **pure API client — no direct DB access, no server-side state beyond its own credentials cache** (the admin key it resolves at startup, its lazily-provisioned per-profile observer client keys, and its own login secret). Everything MAX's dashboard can do is already possible via the documented admin/client APIs (per uxui/interface.md's "the UI is a pure API client" mandate) — `max/server` is a thin proxy plus a client-port observer bridge, never a second source of truth.
 - Out of scope: driving sessions. MAX's client-port usage is strictly `join` (REST) + `session.subscribe` (JSON-RPC) to observe — it never calls `session.registerDriver`/`session.sendMessage`, and holds no session-mutating capability at all.
 - **Distinguished from Components 2–4, same as baectl: max is not a published library.** It is not released to crates.io, npm, or PyPI — it ships only inside the `bae-max` Docker image variant, and its version tracks that image tag rather than an independent SemVer line (see devops/cicd.md's Publishing section).
+- **Out of scope (work item 0013): visualizing OpenTelemetry trace/metric data.** WI 0013 adds OTel spans and metrics throughout `baesrv` and the client SDKs, but rendering that trace/metric data in a UI is explicitly not part of this work item — MAX remains an event-log/session dashboard, not an OTel/traces backend. An operator viewing exported spans and metrics still needs their own observability stack (the collector `[telemetry].otlp_endpoint` points at). Flagged here rather than silently decided either way; folding trace/metric visualization into MAX is a candidate for a future work item.

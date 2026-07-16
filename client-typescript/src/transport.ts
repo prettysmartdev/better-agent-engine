@@ -1,4 +1,5 @@
 import { ApiError, TransportError } from "./errors.js";
+import { injectAmbientContext } from "./telemetry.js";
 import type { JsonRpcFrame, SessionEvent } from "./types.js";
 
 /** A single HTTP request against the client surface. */
@@ -34,16 +35,19 @@ export class FetchTransport implements Transport {
   constructor(private readonly baseUrl: string) {}
 
   async request(req: TransportRequest): Promise<TransportResponse> {
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${req.token}`,
+    };
+    if (req.body !== undefined) {
+      headers["content-type"] = "application/json";
+    }
+    injectAmbientContext(headers);
+
     let res: Response;
     try {
       res = await fetch(this.baseUrl + req.path, {
         method: req.method,
-        headers: {
-          authorization: `Bearer ${req.token}`,
-          ...(req.body !== undefined
-            ? { "content-type": "application/json" }
-            : {}),
-        },
+        headers,
         body: req.body !== undefined ? JSON.stringify(req.body) : undefined,
       });
     } catch (cause) {
@@ -73,16 +77,26 @@ export class FetchTransport implements Transport {
    * non-2xx status is a pre-stream RFC 7807 error ({@link ApiError}, e.g. auth)
    * raised before the first frame; the body itself is HTTP 200.
    */
-  async *stream(req: TransportRequest): AsyncIterable<JsonRpcFrame> {
+  stream(req: TransportRequest): AsyncIterable<JsonRpcFrame> {
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${req.token}`,
+      "content-type": "application/json",
+      accept: "application/x-ndjson",
+    };
+    injectAmbientContext(headers);
+
+    return this.streamWithHeaders(req, headers);
+  }
+
+  private async *streamWithHeaders(
+    req: TransportRequest,
+    headers: Record<string, string>,
+  ): AsyncIterable<JsonRpcFrame> {
     let res: Response;
     try {
       res = await fetch(this.baseUrl + req.path, {
         method: req.method,
-        headers: {
-          authorization: `Bearer ${req.token}`,
-          "content-type": "application/json",
-          accept: "application/x-ndjson",
-        },
+        headers,
         body: req.body !== undefined ? JSON.stringify(req.body) : undefined,
       });
     } catch (cause) {

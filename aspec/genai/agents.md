@@ -17,6 +17,7 @@ Description:
 Guidance:
 - Keep it minimal and readable: it is documentation first, product second. Every harness customization point should be exercised at least once across the example.
 - Provider credentials come from the developer's environment (e.g. ANTHROPIC_API_KEY); the example must fail with a clear message when they are missing.
+- **"Identical behavior across Rust, TypeScript, and Python" (work item 0013) now also covers OpenTelemetry span shape**: the same tracer scope name (`bae.client`), the same two span names (`bae.client.send`, `bae.client.tool`), and the same attribute keys (`bae.session.id`, `bae.rpc.method`, `bae.client.iteration`, `bae.tool.name`, `bae.tool.dispatch`) must appear in all three harnesses given the same scenario — not identical span ids, but identical names/keys/parentage. This is exercised by a dedicated client parity test alongside the existing behavioral parity tests.
 
 ## Agent 2:
 Name: harness-smoke

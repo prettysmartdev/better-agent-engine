@@ -13,7 +13,8 @@ build: ## Build sdist and wheel into dist/
 	uv build
 
 test: ## Run tests
-	uv run pytest
+	uv sync
+	uv run --no-sync pytest
 
 lint: ## Ruff checks and format check
 	uv run ruff check

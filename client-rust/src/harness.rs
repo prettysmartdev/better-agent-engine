@@ -27,6 +27,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use opentelemetry::trace::FutureExt as OtelFutureExt;
+use opentelemetry::Context as OtelContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -41,6 +43,7 @@ use crate::subagent::{
     LocalSubagentReport, SubagentFuture, SubagentRpc, SubagentSession, SubagentTool,
     SubagentToolDef,
 };
+use crate::telemetry;
 use crate::tool::Tool;
 use crate::types::{
     Content, ContentBlock, EventView, JsonRpcFrame, JsonRpcRequest, Message, Profile,
@@ -91,94 +94,169 @@ pub(crate) trait Transport {
     async fn close(&self) -> Result<(), Error>;
 }
 
+/// The result of one `run_iteration`: either the final (no-tool-use)
+/// assistant turn, or the next user turn (tool results) to send.
+enum LoopStep {
+    Final(Message),
+    Continue(Message),
+}
+
 /// Run the tool-dispatch loop to completion, returning the final (no-tool-use)
 /// assistant message. Generic over the transport so it is unit-testable.
+///
+/// Opens one `bae.client.send` span per loop iteration (one
+/// `session.sendMessage` round trip — see [`crate::telemetry`]) and awaits
+/// the whole iteration under it via
+/// [`opentelemetry::trace::FutureExt::with_context`], so both the transport
+/// call and any client-owned tool dispatch (and, transitively, any span a
+/// user's hook/tool-handler code opens against the same ambient OTel API)
+/// nest under it.
 pub(crate) async fn run_loop<T: Transport>(
     transport: &T,
+    session_id: &str,
     tools: &HashMap<String, Tool>,
     hooks: &mut Hooks,
     message: Message,
 ) -> Result<Message, Error> {
     let mut current = message;
+    let mut iteration: u64 = 0;
     loop {
-        hooks.run_before_send(&mut current).map_err(Error::Hook)?;
+        let send_cx = telemetry::start_send_span(session_id, iteration);
+        iteration += 1;
 
-        let outcome = transport
-            .send_message(&SendMessageParams { message: current })
-            .await?;
+        let step = run_iteration(transport, tools, hooks, current, &send_cx)
+            .with_context(send_cx.clone())
+            .await;
 
-        // Distribute the live notification stream to the observer hook, in
-        // arrival order, before surfacing the terminal turn.
-        for event in &outcome.notifications {
-            hooks.run_on_event(event).map_err(Error::Hook)?;
-        }
-
-        let mut assistant = outcome.result.message;
-
-        hooks
-            .run_after_receive(&mut assistant)
-            .map_err(Error::Hook)?;
-
-        let tool_uses = assistant.tool_uses();
-        if tool_uses.is_empty() {
-            // No tool calls: this is the final assistant turn. Loop ends.
-            return Ok(assistant);
-        }
-
-        let mut result_blocks = Vec::with_capacity(tool_uses.len());
-        for mut call in tool_uses {
-            // `dispatch` is authoritative whenever a current server supplies
-            // it: a client/MCP name collision must still go to the side the
-            // server selected. Older servers omit it, so retain the original
-            // registry-membership routing as the compatibility fallback.
-            let owned_by_client = match call.dispatch.as_deref() {
-                Some("client") => true,
-                Some(_) => false,
-                None => tools.contains_key(&call.name),
-            };
-            if !owned_by_client {
-                // The complete assistant message, including this call, was
-                // already exposed via `after_receive` for UI/observability.
-                // Server-owned calls must not run client hooks or handlers and
-                // must not receive a synthetic tool_result.
-                continue;
+        match step {
+            Ok(LoopStep::Final(assistant)) => {
+                telemetry::end_span(&send_cx);
+                return Ok(assistant);
             }
+            Ok(LoopStep::Continue(next)) => {
+                telemetry::end_span(&send_cx);
+                current = next;
+            }
+            Err(err) => {
+                telemetry::fail_span(&send_cx, "send failed");
+                return Err(err);
+            }
+        }
+    }
+}
 
-            hooks.run_before_tool_call(&mut call).map_err(Error::Hook)?;
+/// The body of one `run_loop` iteration: send `current`, distribute live
+/// notifications, and either return the final assistant turn or dispatch
+/// every client-owned tool call and return the next user turn.
+async fn run_iteration<T: Transport>(
+    transport: &T,
+    tools: &HashMap<String, Tool>,
+    hooks: &mut Hooks,
+    mut current: Message,
+    send_cx: &OtelContext,
+) -> Result<LoopStep, Error> {
+    hooks.run_before_send(&mut current).map_err(Error::Hook)?;
 
-            let tool = tools
-                .get(&call.name)
-                // This path is deliberately reachable only for client-owned
-                // calls: a dispatch:"client" request can reveal a stale local
-                // declaration/handler mismatch, while a server-owned request
-                // never becomes an UnknownTool error.
-                .ok_or_else(|| Error::UnknownTool(call.name.clone()))?;
-            let output = tool
-                .call(call.input.clone())
-                .await
-                .map_err(|source| Error::Tool {
-                    name: call.name.clone(),
-                    source,
-                })?;
+    let outcome = transport
+        .send_message(&SendMessageParams { message: current })
+        .await?;
 
-            let mut result = ToolResult {
-                tool_use_id: call.id.clone(),
-                name: call.name.clone(),
-                content: output,
-            };
-            hooks
-                .run_after_tool_call(&mut result)
-                .map_err(Error::Hook)?;
+    // Distribute the live notification stream to the observer hook, in
+    // arrival order, before surfacing the terminal turn.
+    for event in &outcome.notifications {
+        hooks.run_on_event(event).map_err(Error::Hook)?;
+    }
 
-            result_blocks.push(ContentBlock::ToolResult {
-                tool_use_id: result.tool_use_id,
-                content: result.content,
-            });
+    let mut assistant = outcome.result.message;
+
+    hooks
+        .run_after_receive(&mut assistant)
+        .map_err(Error::Hook)?;
+
+    let tool_uses = assistant.tool_uses();
+    if tool_uses.is_empty() {
+        // No tool calls: this is the final assistant turn. Loop ends.
+        return Ok(LoopStep::Final(assistant));
+    }
+
+    let mut result_blocks = Vec::with_capacity(tool_uses.len());
+    for call in tool_uses {
+        // `dispatch` is authoritative whenever a current server supplies
+        // it: a client/MCP name collision must still go to the side the
+        // server selected. Older servers omit it, so retain the original
+        // registry-membership routing as the compatibility fallback.
+        let owned_by_client = match call.dispatch.as_deref() {
+            Some("client") => true,
+            Some(_) => false,
+            None => tools.contains_key(&call.name),
+        };
+        if !owned_by_client {
+            // The complete assistant message, including this call, was
+            // already exposed via `after_receive` for UI/observability.
+            // Server-owned calls must not run client hooks or handlers and
+            // must not receive a synthetic tool_result.
+            continue;
         }
 
-        // Feed the tool results back as the next user turn and iterate.
-        current = Message::user(Content::Blocks(result_blocks));
+        let tool_cx = telemetry::start_tool_span(send_cx, &call.name);
+        let dispatched = dispatch_tool(tools, hooks, call)
+            .with_context(tool_cx.clone())
+            .await;
+        match dispatched {
+            Ok(block) => {
+                telemetry::end_span(&tool_cx);
+                result_blocks.push(block);
+            }
+            Err(err) => {
+                telemetry::fail_span(&tool_cx, "tool handler failed");
+                return Err(err);
+            }
+        }
     }
+
+    // Feed the tool results back as the next user turn and iterate.
+    Ok(LoopStep::Continue(Message::user(Content::Blocks(
+        result_blocks,
+    ))))
+}
+
+/// One client-owned tool dispatch: `before_tool_call` hook -> handler ->
+/// `after_tool_call` hook -> the resulting `tool_result` block.
+async fn dispatch_tool(
+    tools: &HashMap<String, Tool>,
+    hooks: &mut Hooks,
+    mut call: crate::types::ToolUse,
+) -> Result<ContentBlock, Error> {
+    hooks.run_before_tool_call(&mut call).map_err(Error::Hook)?;
+
+    let tool = tools
+        .get(&call.name)
+        // This path is deliberately reachable only for client-owned
+        // calls: a dispatch:"client" request can reveal a stale local
+        // declaration/handler mismatch, while a server-owned request
+        // never becomes an UnknownTool error.
+        .ok_or_else(|| Error::UnknownTool(call.name.clone()))?;
+    let output = tool
+        .call(call.input.clone())
+        .await
+        .map_err(|source| Error::Tool {
+            name: call.name.clone(),
+            source,
+        })?;
+
+    let mut result = ToolResult {
+        tool_use_id: call.id.clone(),
+        name: call.name.clone(),
+        content: output,
+    };
+    hooks
+        .run_after_tool_call(&mut result)
+        .map_err(Error::Hook)?;
+
+    Ok(ContentBlock::ToolResult {
+        tool_use_id: result.tool_use_id,
+        content: result.content,
+    })
 }
 
 /// HTTP transport against a real BAE server, authenticated with a session key.
@@ -207,13 +285,14 @@ impl HttpTransport {
     /// POST a JSON-RPC request to `…/rpc` and, on a `2xx`, hand back the NDJSON
     /// body reader. A non-2xx status is a pre-stream RFC 7807 error (e.g. `401`).
     async fn open_rpc<P: Serialize>(&self, req: &JsonRpcRequest<P>) -> Result<NdjsonReader, Error> {
-        let resp = self
-            .http
-            .post(self.rpc_url())
-            .bearer_auth(&self.session_key)
-            .json(req)
-            .send()
-            .await?;
+        let resp = telemetry::inject_traceparent(
+            self.http
+                .post(self.rpc_url())
+                .bearer_auth(&self.session_key),
+        )
+        .json(req)
+        .send()
+        .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -341,12 +420,13 @@ impl Transport for HttpTransport {
     }
 
     async fn close(&self) -> Result<(), Error> {
-        let resp = self
-            .http
-            .delete(self.session_url())
-            .bearer_auth(&self.session_key)
-            .send()
-            .await?;
+        let resp = telemetry::inject_traceparent(
+            self.http
+                .delete(self.session_url())
+                .bearer_auth(&self.session_key),
+        )
+        .send()
+        .await?;
 
         let status = resp.status();
         if status.is_success() {
@@ -858,9 +938,7 @@ impl Harness {
                 .collect(),
         };
 
-        let resp = http
-            .post(url)
-            .bearer_auth(&config.client_key)
+        let resp = telemetry::inject_traceparent(http.post(url).bearer_auth(&config.client_key))
             .json(&body)
             .send()
             .await?;
@@ -946,6 +1024,7 @@ impl Session {
     pub async fn send(&mut self, message: impl Into<Message>) -> Result<Message, Error> {
         run_loop(
             &*self.transport,
+            &self.session_id,
             &self.tools,
             &mut self.hooks,
             message.into(),
@@ -1223,9 +1302,15 @@ mod tests {
         let tools = registry(vec![]);
         let mut hooks = Hooks::default();
 
-        let out = run_loop(&transport, &tools, &mut hooks, Message::user("hi"))
-            .await
-            .unwrap();
+        let out = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("hi"),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.text(), "hello there");
         // Exactly one round-trip: the loop stopped as soon as no tool_use appeared.
@@ -1244,6 +1329,7 @@ mod tests {
 
         let out = run_loop(
             &transport,
+            "ses_test",
             &tools,
             &mut hooks,
             Message::user("what time is it"),
@@ -1304,9 +1390,15 @@ mod tests {
                 Ok(())
             });
 
-        run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap();
+        run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap();
 
         let seen = log.lock().unwrap().clone();
         assert_eq!(
@@ -1336,9 +1428,15 @@ mod tests {
             Ok(())
         });
 
-        run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap();
+        run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap();
 
         let sent = transport.sent.borrow();
         match &sent[1].message.content {
@@ -1358,9 +1456,15 @@ mod tests {
         let tools = registry(vec![]);
         let mut hooks = Hooks::default().before_send(|_m| Err("boom".into()));
 
-        let err = run_loop(&transport, &tools, &mut hooks, Message::user("hi"))
-            .await
-            .unwrap_err();
+        let err = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("hi"),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, Error::Hook(_)));
         // Aborted before any request went out.
@@ -1378,9 +1482,15 @@ mod tests {
         let tools = registry(vec![time_tool()]); // "mystery" not registered
         let mut hooks = Hooks::default();
 
-        let err = run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap_err();
+        let err = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap_err();
 
         match err {
             Error::UnknownTool(name) => assert_eq!(name, "mystery"),
@@ -1414,9 +1524,15 @@ mod tests {
         let tools = registry(vec![time_tool()]);
         let mut hooks = Hooks::default();
 
-        run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap();
+        run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap();
 
         let sent = transport.sent.borrow();
         let Content::Blocks(blocks) = &sent[1].message.content else {
@@ -1450,9 +1566,15 @@ mod tests {
         let tools = registry(vec![time_tool()]);
         let mut hooks = Hooks::default();
 
-        run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap();
+        run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap();
 
         let sent = transport.sent.borrow();
         let Content::Blocks(blocks) = &sent[1].message.content else {
@@ -1491,9 +1613,15 @@ mod tests {
             Ok(())
         });
 
-        let out = run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap();
+        let out = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.text(), "done");
 
         let sent = transport.sent.borrow();
@@ -1530,9 +1658,15 @@ mod tests {
         let tools = registry(vec![failing]);
         let mut hooks = Hooks::default();
 
-        let err = run_loop(&transport, &tools, &mut hooks, Message::user("go"))
-            .await
-            .unwrap_err();
+        let err = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("go"),
+        )
+        .await
+        .unwrap_err();
 
         match err {
             Error::Tool { name, source } => {
@@ -1549,9 +1683,15 @@ mod tests {
         let tools = registry(vec![]);
         let mut hooks = Hooks::default();
 
-        let err = run_loop(&transport, &tools, &mut hooks, Message::user("hi"))
-            .await
-            .unwrap_err();
+        let err = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("hi"),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, Error::ProvidersFailed { .. }));
     }
@@ -1664,6 +1804,7 @@ mod tests {
         // MCP tools are dispatched server-side, so the loop ends after one turn.
         let out = run_loop(
             &transport,
+            "ses_test",
             &tools,
             &mut hooks,
             Message::user("search please"),
@@ -1818,6 +1959,7 @@ mod tests {
         });
         run_loop(
             &transport,
+            "ses_test",
             &registry(vec![]),
             &mut hooks,
             Message::user("go"),
@@ -1971,9 +2113,15 @@ mod tests {
 
         // Auto sandbox tools are dispatched server-side, so the loop ends after
         // one turn — never pausing, never reaching the client.
-        let out = run_loop(&transport, &tools, &mut hooks, Message::user("run it"))
-            .await
-            .unwrap();
+        let out = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("run it"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.text(), "ran it");
         assert_eq!(
             transport.sent.borrow().len(),
@@ -2086,9 +2234,15 @@ mod tests {
             Ok(())
         });
 
-        let out = run_loop(&transport, &tools, &mut hooks, Message::user("list files"))
-            .await
-            .unwrap();
+        let out = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("list files"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.text(), "done");
         // Manual dispatch pauses: two turns (tool_use, then tool_result).
         assert_eq!(transport.sent.borrow().len(), 2);
@@ -2352,6 +2506,7 @@ mod tests {
         // First send(): launch, then poll while still running.
         let out1 = run_loop(
             &transport,
+            "ses_test",
             &tools,
             &mut hooks,
             Message::user("please launch a subagent"),
@@ -2365,9 +2520,15 @@ mod tests {
         terminal_notify.notified().await;
 
         // Second send(): poll again, now completed.
-        let out2 = run_loop(&transport, &tools, &mut hooks, Message::user("check again"))
-            .await
-            .unwrap();
+        let out2 = run_loop(
+            &transport,
+            "ses_test",
+            &tools,
+            &mut hooks,
+            Message::user("check again"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out2.text(), "done");
 
         let guard = observed.lock().unwrap();
@@ -2422,5 +2583,498 @@ mod tests {
         assert!(!updates[1]
             .iter()
             .any(|t| t["name"] == json!("local_subagent_status")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenTelemetry client-span + `traceparent`-propagation tests (WI 0013 Part D/E).
+//
+// These exercise the two client spans (`bae.client.send` / `bae.client.tool`)
+// and the wire-level W3C `traceparent` injection against a real in-memory OTel
+// SDK (dev-dependency `opentelemetry_sdk` with the `testing` feature), matching
+// the telemetry contract §1.2, §6, §7, and the canonical parity fixture §9.
+//
+// The OTel global `TracerProvider`/`TextMapPropagator` are process-global, so
+// every test here serializes on `TELEMETRY_LOCK` and installs exactly the
+// global state it needs at the start — the "no SDK installed" test installs the
+// built-in no-op provider+propagator (reproducing a fresh process), the rest
+// install the SDK provider + `TraceContextPropagator`. This keeps the tests
+// order-independent despite the shared globals.
+//
+// One subtlety: the *other* 49 harness tests also drive `run_loop`, and so also
+// mint `bae.client.*` spans through the same `global::tracer("bae.client")`.
+// While a with-SDK test here has a real provider installed, those concurrently
+// running tests' spans would land in this test's in-memory exporter too. Each
+// span-shape test therefore runs its loop under a known app-root context and
+// filters the exported spans down to that root's trace id, so a concurrent
+// test's spans (a different trace) are never miscounted.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use opentelemetry::global;
+    use opentelemetry::trace::noop::{NoopTextMapPropagator, NoopTracerProvider};
+    use opentelemetry::trace::{Span, TraceContextExt, Tracer};
+    use opentelemetry::Context as OtelContext;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::{
+        InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor, SpanData,
+    };
+    use serde_json::json;
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    /// Serializes all telemetry tests, which mutate the process-global OTel
+    /// `TracerProvider`/`TextMapPropagator`. A `tokio::sync::Mutex` (not
+    /// `std::sync`) so the guard can be held across the `.await`s in each test
+    /// without tripping `clippy::await_holding_lock`.
+    static TELEMETRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A scripted transport: returns queued outcomes in order and records the
+    /// requests it saw. It performs no HTTP, so it does not itself exercise the
+    /// `traceparent` header (that is tested directly against
+    /// [`telemetry::inject_traceparent`] below); it drives the span hierarchy.
+    struct MockTransport {
+        responses: RefCell<Vec<Result<SendOutcome, Error>>>,
+    }
+
+    impl MockTransport {
+        fn new(responses: Vec<Result<SendOutcome, Error>>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        async fn send_message(&self, _params: &SendMessageParams) -> Result<SendOutcome, Error> {
+            self.responses.borrow_mut().remove(0)
+        }
+        async fn register_driver(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn subscribe(
+            &self,
+            _params: &SubscribeParams,
+            _on_event: &mut dyn FnMut(&EventView) -> bool,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn unsubscribe(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn assistant_text(text: &str) -> SendOutcome {
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }]),
+                events: vec![],
+            },
+            notifications: vec![],
+        }
+    }
+
+    fn tool_use(id: &str, name: &str, dispatch: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({}),
+            dispatch: Some(dispatch.to_string()),
+        }
+    }
+
+    /// The canonical parity fixture's first turn (contract §9): one
+    /// `dispatch:"client"` tool_use and one `dispatch:"mcp"` tool_use.
+    fn client_and_mcp_turn() -> SendOutcome {
+        SendOutcome {
+            result: SendMessageResult {
+                message: Message::assistant(vec![
+                    tool_use("tu_client", "get_current_time", "client"),
+                    tool_use("tu_mcp", "remote_search", "mcp"),
+                ]),
+                events: vec![],
+            },
+            notifications: vec![],
+        }
+    }
+
+    fn time_tool() -> Tool {
+        Tool::new(
+            "get_current_time",
+            "current time",
+            json!({}),
+            |_input| async move { Ok(json!("2026-07-06T00:00:00Z")) },
+        )
+    }
+
+    fn registry(tools: Vec<Tool>) -> HashMap<String, Tool> {
+        tools.into_iter().map(|t| (t.name.clone(), t)).collect()
+    }
+
+    /// Install a fresh SDK tracer provider (with an in-memory exporter) and the
+    /// W3C `TraceContextPropagator` as the process globals — modelling an
+    /// embedding application that has an OTel SDK installed. Returns the
+    /// exporter so the test can read the finished spans.
+    fn install_sdk() -> (SdkTracerProvider, InMemorySpanExporter) {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+            .build();
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        (provider, exporter)
+    }
+
+    /// Reset the process globals to the built-in no-op provider/propagator —
+    /// exactly the state of a process where the embedding app installed no OTel
+    /// SDK at all.
+    fn install_noop() {
+        global::set_tracer_provider(NoopTracerProvider::new());
+        global::set_text_map_propagator(NoopTextMapPropagator::new());
+    }
+
+    fn span_named<'a>(spans: &'a [SpanData], name: &str) -> Vec<&'a SpanData> {
+        spans.iter().filter(|s| s.name == name).collect()
+    }
+
+    /// Keep only the spans belonging to `trace_id` — the loop-under-test's own
+    /// trace — filtering out any `bae.client.*` spans a concurrently running
+    /// harness test happened to emit into the shared exporter.
+    fn only_trace(spans: Vec<SpanData>, trace_id: opentelemetry::trace::TraceId) -> Vec<SpanData> {
+        spans
+            .into_iter()
+            .filter(|s| s.span_context.trace_id() == trace_id)
+            .collect()
+    }
+
+    fn attr(span: &SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    fn attr_keys(span: &SpanData) -> BTreeSet<String> {
+        span.attributes
+            .iter()
+            .map(|kv| kv.key.as_str().to_string())
+            .collect()
+    }
+
+    /// The three outbound request builders the crate actually constructs, each
+    /// through the single `telemetry::inject_traceparent` choke point: the
+    /// session-open POST, the `/rpc` POST (every JSON-RPC method), and the
+    /// session-close DELETE. Returns whether each carries a `traceparent`.
+    fn traceparent_on_each_request() -> Vec<bool> {
+        let http = reqwest::Client::new();
+        let base = "http://server.test";
+        let builders = [
+            http.post(format!("{base}/api/v1/sessions"))
+                .bearer_auth("bae_client_key"),
+            http.post(format!("{base}/api/v1/sessions/ses_1/rpc"))
+                .bearer_auth("bae_ses_key"),
+            http.delete(format!("{base}/api/v1/sessions/ses_1"))
+                .bearer_auth("bae_ses_key"),
+        ];
+        builders
+            .into_iter()
+            .map(|b| {
+                let req = telemetry::inject_traceparent(b).build().unwrap();
+                req.headers().contains_key("traceparent")
+            })
+            .collect()
+    }
+
+    // -- 1. Disabled-by-default regression guard: no SDK => no `traceparent`. --
+    #[tokio::test]
+    async fn no_sdk_installed_injects_no_traceparent_on_any_request() {
+        let _guard = TELEMETRY_LOCK.lock().await;
+        install_noop();
+
+        // Session open, RPC turn call, and session close: none carry the header
+        // when the embedding app installed no OTel SDK (the no-op propagator
+        // injects nothing) — assert the header's *absence*, per contract §6.
+        let present = traceparent_on_each_request();
+        assert_eq!(
+            present,
+            vec![false, false, false],
+            "no traceparent on any outbound request without an OTel SDK"
+        );
+
+        // The harness loop still runs cleanly with no telemetry backend.
+        let transport = MockTransport::new(vec![Ok(assistant_text("hi"))]);
+        let tools = registry(vec![]);
+        let mut hooks = Hooks::default();
+        let out = run_loop(&transport, "ses_1", &tools, &mut hooks, Message::user("go"))
+            .await
+            .unwrap();
+        assert_eq!(out.text(), "hi");
+    }
+
+    // -- 1b. Wire allowlist: a custom/leaky global propagator cannot smuggle --
+    //        non-trace-context headers (baggage, vendor headers) onto BAE      --
+    //        requests. Only `traceparent`/`tracestate` are ever injected       --
+    //        (contract §6).                                                     --
+    #[derive(Debug)]
+    struct LeakyPropagator;
+    impl opentelemetry::propagation::TextMapPropagator for LeakyPropagator {
+        fn inject_context(
+            &self,
+            _cx: &OtelContext,
+            injector: &mut dyn opentelemetry::propagation::Injector,
+        ) {
+            // A well-formed trace-context header (allowed) alongside baggage and
+            // a vendor header (both must be dropped by the injector allowlist).
+            injector.set(
+                "traceparent",
+                "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
+            );
+            injector.set("baggage", "api_token=fixture-secret".to_string());
+            injector.set("x-vendor-trace", "leak".to_string());
+        }
+        fn extract_with_context(
+            &self,
+            cx: &OtelContext,
+            _extractor: &dyn opentelemetry::propagation::Extractor,
+        ) -> OtelContext {
+            cx.clone()
+        }
+        fn fields(&self) -> opentelemetry::propagation::text_map_propagator::FieldIter<'_> {
+            opentelemetry::propagation::text_map_propagator::FieldIter::new(&[])
+        }
+    }
+
+    #[tokio::test]
+    async fn leaky_propagator_headers_are_filtered_to_the_wire_allowlist() {
+        let _guard = TELEMETRY_LOCK.lock().await;
+        global::set_text_map_propagator(LeakyPropagator);
+
+        let http = reqwest::Client::new();
+        let req = telemetry::inject_traceparent(
+            http.post("http://server.test/api/v1/sessions/ses_1/rpc")
+                .bearer_auth("bae_ses_key"),
+        )
+        .build()
+        .unwrap();
+
+        // The allowed trace-context header is present…
+        assert!(req.headers().contains_key("traceparent"));
+        // …but the non-allowlisted headers the propagator tried to inject are not.
+        assert!(
+            !req.headers().contains_key("baggage"),
+            "baggage must never be injected onto a BAE request"
+        );
+        assert!(!req.headers().contains_key("x-vendor-trace"));
+
+        install_noop();
+    }
+
+    // -- 2a. With an SDK installed: `traceparent` on EVERY outbound request. --
+    #[tokio::test]
+    async fn traceparent_present_on_every_request_with_sdk() {
+        let _guard = TELEMETRY_LOCK.lock().await;
+        let (provider, _exporter) = install_sdk();
+
+        // An embedding-app span is active (the app's own root span); every
+        // outbound request must then carry `traceparent`.
+        let tracer = global::tracer("app");
+        let cx = OtelContext::current_with_span(tracer.start("app-root"));
+        let present = {
+            let _attached = cx.attach();
+            traceparent_on_each_request()
+        };
+        assert_eq!(
+            present,
+            vec![true, true, true],
+            "session open, RPC turn call, and session close all carry traceparent"
+        );
+        provider.shutdown().ok();
+        install_noop();
+    }
+
+    // -- 2b + 4. Span hierarchy for the canonical mixed client+mcp turn, and --
+    //            the cross-SDK parity shape (names + attribute keys) per §9.   --
+    #[tokio::test]
+    async fn span_shape_matches_canonical_parity_fixture() {
+        let _guard = TELEMETRY_LOCK.lock().await;
+        let (provider, exporter) = install_sdk();
+
+        let transport =
+            MockTransport::new(vec![Ok(client_and_mcp_turn()), Ok(assistant_text("done"))]);
+        let tools = registry(vec![time_tool()]);
+        let mut hooks = Hooks::default();
+
+        // Run under a known app-root context so every span shares its trace id
+        // (see the module note on filtering out concurrent tests' spans).
+        let app_span = global::tracer("app").start("app-root");
+        let app_trace_id = app_span.span_context().trace_id();
+        let app_cx = OtelContext::current_with_span(app_span);
+        run_loop(&transport, "ses_1", &tools, &mut hooks, Message::user("go"))
+            .with_context(app_cx)
+            .await
+            .unwrap();
+        provider.force_flush().unwrap();
+        let spans = only_trace(exporter.get_finished_spans().unwrap(), app_trace_id);
+
+        // Exactly two `bae.client.send` (iteration 0 and 1) and exactly one
+        // `bae.client.tool` (the mcp block gets no client span). Contract §9.
+        let sends = span_named(&spans, "bae.client.send");
+        let tools_spans = span_named(&spans, "bae.client.tool");
+        assert_eq!(sends.len(), 2, "one send span per round trip");
+        assert_eq!(
+            tools_spans.len(),
+            1,
+            "a client span only for the dispatch:client block, none for mcp"
+        );
+
+        // `bae.client.send` attribute KEYS + literal values (contract §1.2),
+        // plus SpanKind and the instrumentation scope name+version — the
+        // cross-SDK parity dimensions (contract §0.2). These must match the
+        // TypeScript/Python parity assertions exactly.
+        for s in &sends {
+            assert_eq!(
+                attr_keys(s),
+                BTreeSet::from([
+                    "bae.session.id".to_string(),
+                    "bae.rpc.method".to_string(),
+                    "bae.client.iteration".to_string(),
+                ])
+            );
+            assert_eq!(attr(s, "bae.session.id").as_deref(), Some("ses_1"));
+            assert_eq!(
+                attr(s, "bae.rpc.method").as_deref(),
+                Some("session.sendMessage")
+            );
+            assert_eq!(
+                s.span_kind,
+                opentelemetry::trace::SpanKind::Client,
+                "bae.client.send must be SpanKind::Client"
+            );
+            assert_eq!(s.instrumentation_scope.name(), "bae.client");
+            assert_eq!(
+                s.instrumentation_scope.version(),
+                Some(env!("CARGO_PKG_VERSION")),
+                "scope version must be the SDK package version"
+            );
+        }
+        let iterations: BTreeSet<String> = sends
+            .iter()
+            .filter_map(|s| attr(s, "bae.client.iteration"))
+            .collect();
+        assert_eq!(
+            iterations,
+            BTreeSet::from(["0".to_string(), "1".to_string()])
+        );
+
+        // `bae.client.tool` attribute KEYS + literal values.
+        let tool_span = tools_spans[0];
+        assert_eq!(
+            attr_keys(tool_span),
+            BTreeSet::from(["bae.tool.name".to_string(), "bae.tool.dispatch".to_string()])
+        );
+        assert_eq!(
+            attr(tool_span, "bae.tool.name").as_deref(),
+            Some("get_current_time")
+        );
+        assert_eq!(
+            attr(tool_span, "bae.tool.dispatch").as_deref(),
+            Some("client")
+        );
+        assert_eq!(
+            tool_span.span_kind,
+            opentelemetry::trace::SpanKind::Internal,
+            "bae.client.tool must be SpanKind::Internal"
+        );
+        assert_eq!(tool_span.instrumentation_scope.name(), "bae.client");
+        assert_eq!(
+            tool_span.instrumentation_scope.version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        // Parentage: the tool span is a child of the iteration-0 send span.
+        let send0 = sends
+            .iter()
+            .find(|s| attr(s, "bae.client.iteration").as_deref() == Some("0"))
+            .unwrap();
+        assert_eq!(
+            tool_span.parent_span_id,
+            send0.span_context.span_id(),
+            "bae.client.tool nests under the iteration-0 bae.client.send"
+        );
+        provider.shutdown().ok();
+        install_noop();
+    }
+
+    // -- 3. Ambient context survives the async boundary into hook + handler. --
+    #[tokio::test]
+    async fn ambient_context_survives_into_hook_and_tool_handler() {
+        let _guard = TELEMETRY_LOCK.lock().await;
+        let (provider, exporter) = install_sdk();
+
+        // A tool handler that opens its own span *after* a real poll boundary
+        // (`yield_now().await`) — the case that only works if the harness keeps
+        // its `bae.client.tool` span current across `.await` (contract §7).
+        let handler_tool = Tool::new(
+            "probe",
+            "opens a user span",
+            json!({}),
+            |_input| async move {
+                tokio::task::yield_now().await;
+                let mut span = global::tracer("user.code").start("user.handler.span");
+                span.end();
+                Ok(json!("ok"))
+            },
+        );
+        // A `before_tool_call` hook that opens its own span (sync closure, but
+        // it runs while the harness's tool span is current).
+        let mut hooks = Hooks::default().before_tool_call(|_call| {
+            let mut span = global::tracer("user.code").start("user.hook.span");
+            span.end();
+            Ok(())
+        });
+
+        let transport = MockTransport::new(vec![
+            Ok(SendOutcome {
+                result: SendMessageResult {
+                    message: Message::assistant(vec![tool_use("tu_1", "probe", "client")]),
+                    events: vec![],
+                },
+                notifications: vec![],
+            }),
+            Ok(assistant_text("done")),
+        ]);
+        let tools = registry(vec![handler_tool]);
+
+        let app_span = global::tracer("app").start("app-root");
+        let app_trace_id = app_span.span_context().trace_id();
+        let app_cx = OtelContext::current_with_span(app_span);
+        run_loop(&transport, "ses_1", &tools, &mut hooks, Message::user("go"))
+            .with_context(app_cx)
+            .await
+            .unwrap();
+        provider.force_flush().unwrap();
+        let spans = only_trace(exporter.get_finished_spans().unwrap(), app_trace_id);
+
+        let tool_span = span_named(&spans, "bae.client.tool")[0];
+        let tool_id = tool_span.span_context.span_id();
+        let hook_span = span_named(&spans, "user.hook.span")[0];
+        let handler_span = span_named(&spans, "user.handler.span")[0];
+
+        assert_eq!(
+            hook_span.parent_span_id, tool_id,
+            "the before_tool_call hook's span nests under bae.client.tool"
+        );
+        assert_eq!(
+            handler_span.parent_span_id, tool_id,
+            "the tool handler's span nests under bae.client.tool across the await"
+        );
+        provider.shutdown().ok();
+        install_noop();
     }
 }

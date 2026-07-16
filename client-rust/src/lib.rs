@@ -53,6 +53,7 @@ mod harness;
 mod hooks;
 pub mod sandbox;
 pub mod subagent;
+mod telemetry;
 mod tool;
 mod types;
 
