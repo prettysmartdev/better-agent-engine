@@ -37,6 +37,17 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # (JSON-RPC session loop). Already in the dependency graph via reqwest/axum, so
 # no extra download; only `stream::unfold` + the `Stream` trait are used.
 futures-util = { version = "0.3", default-features = false }
+# URL parsing for startup validation of the configured OTLP endpoint.
+url = "2"
+# OpenTelemetry SDK bring-up for the optional `[telemetry]` export path. The SDK
+# is owned by the server (clients are API-only guests). Spans are authored with
+# the `tracing` crate and bridged to OTel via `tracing-opentelemetry`, exported
+# over OTLP/gRPC (tonic) to the configured collector. Inert unless
+# `[telemetry].enabled = true` — no exporter/provider is built when disabled.
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics", "tls-ring", "tls-webpki-roots"] }
+tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
 # Integration tests boot the real routers on ephemeral ports and drive them over
@@ -53,3 +64,14 @@ serde_json = "1"
 # so the test build stays offline with no extra downloads.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# In-memory span exporter (`InMemorySpanExporter`) for the telemetry integration
+# tests, so a driven turn's exported span tree can be asserted without a real
+# collector. The `testing` feature is dev-only; production never pulls it in.
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
+# Process-level telemetry E2E coverage runs the real server binary and a Rust
+# harness against an in-test OTLP/gRPC receiver.  These protocol/server types
+# are test-only; production continues to use the exporter supplied above.
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "gen-tonic-messages", "trace"] }
+tonic = { version = "0.14", features = ["transport"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+bae-rs = { path = "../client-rust" }

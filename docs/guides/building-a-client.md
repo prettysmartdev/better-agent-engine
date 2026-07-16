@@ -269,6 +269,129 @@ in TS/Python, throwing an error does the same.
 
 ---
 
+## OpenTelemetry: traces and custom spans
+
+All three SDKs instrument themselves automatically — with no configuration
+and no BAE-specific tracing API to learn. This is a client-side complement to
+`baesrv`'s own `[telemetry]`-driven server export (see
+[Configuration — `[telemetry]`](../reference/configuration.md#telemetry)): the
+two are deliberately different mechanisms, because a harness is a library
+embedded in *your* application, not a standalone deployed service with its own
+SDK bring-up.
+
+### Zero-config, zero-overhead by default
+
+Each SDK depends only on its language's OpenTelemetry **API** package
+(`opentelemetry` for Rust, `@opentelemetry/api` for TypeScript,
+`opentelemetry-api` for Python) — never the SDK or an exporter. Every span the
+harness creates goes through that ambient/global API:
+
+- If your application hasn't installed an OpenTelemetry SDK, every one of
+  these calls resolves to your language's built-in no-op tracer. No spans are
+  created, no `traceparent` header is ever sent, and there is no measurable
+  overhead. This is the default, and it requires no opt-out — there is no
+  BAE client config flag for telemetry at all.
+- If your application *has* installed and configured an OpenTelemetry SDK
+  (the same way you'd instrument any other library), the harness's spans
+  appear automatically, using your app's exporters, sampling, and resource
+  attributes — configured entirely through your language's normal OTel
+  environment variables / SDK setup, not through BAE.
+
+### What the harness instruments automatically
+
+Exactly two span names, scope `bae.client`, identical across all three SDKs:
+
+| Span | Covers | Key attributes |
+|---|---|---|
+| `bae.client.send` | One `session.send()` round trip: `before_send` → the `session.sendMessage` request → `on_event`/`after_receive` → dispatch of that response's client-owned tools | `bae.session.id`, `bae.rpc.method` (`"session.sendMessage"`), `bae.client.iteration` |
+| `bae.client.tool` | One client-owned (`dispatch:"client"`) tool dispatch: `before_tool_call` → handler → `after_tool_call` | `bae.tool.name`, `bae.tool.dispatch` (`"client"`) |
+
+A paused/resumed turn is two sibling `bae.client.send` spans, not one
+continuous span — the client genuinely sees two separate round trips, so the
+harness doesn't fake continuity it can't observe. No span is created for
+server-owned (`mcp`/`sandbox`/`subagent`) tool blocks — only the ones this
+harness actually executes.
+
+Every outbound request (session open, `join`, `sendMessage`, `close`,
+driver/subscription calls) injects the current ambient trace context as a W3C
+`traceparent` (+ `tracestate`) header using your OTel SDK's own propagator —
+this is what lets the harness's span become the parent of `baesrv`'s
+server-side spans for that same request, joining client and server work into
+one trace. See [Wire Protocol — Trace context propagation](../reference/wire-protocol.md#trace-context-propagation)
+for the header contract.
+
+### Adding your own spans — no BAE API needed
+
+This is the point: a hook function or a tool's handler is just your code
+running while one of the harness's spans above is the active span. Call your
+language's **standard** OpenTelemetry API from inside it, and it nests
+automatically — there is no BAE-specific span-creation call and no "current
+span" object threaded through hook arguments.
+
+**Rust** — inside a tool handler or hook closure, use the raw `opentelemetry`
+API directly:
+
+```rust
+handler: Box::new(|input| {
+    let tracer = opentelemetry::global::tracer("my-agent");
+    let mut span = tracer.start("validate_input");
+    // ... your logic ...
+    span.end();
+    Ok("done".into())
+}),
+```
+
+This is the guaranteed-supported pattern in the Rust client specifically
+because `client-rust` uses the raw `opentelemetry` API crate (not `tracing`)
+for its own spans — a span created with `tracing::info_span!` instead only
+nests correctly if your application's own `tracing-opentelemetry` layer is
+set up to bridge into the ambient OTel context, which is your app's
+responsibility, not something the harness configures for you.
+
+**TypeScript** — use `@opentelemetry/api`'s active-span API:
+
+```typescript
+import { trace } from "@opentelemetry/api";
+
+harness.registerTool({
+  name: "validate_input",
+  handler: async (input) => {
+    return trace.getTracer("my-agent").startActiveSpan("validate", (span) => {
+      // ... your logic ...
+      span.end();
+      return "done";
+    });
+  },
+});
+```
+
+This nests correctly across `await` boundaries as long as your application's
+OTel SDK registered an `AsyncLocalStorage`-based context manager — Node SDK's
+default setup does this for you; the harness itself never registers a global
+context manager, provider, or propagator.
+
+**Python** — use `opentelemetry-api`'s context-manager form:
+
+```python
+from opentelemetry import trace
+
+def validate_input(inp: dict) -> str:
+    with trace.get_tracer("my-agent").start_as_current_span("validate"):
+        ...
+    return "done"
+```
+
+Python's `contextvars`-based propagation carries the active span across
+`await` natively within the same `asyncio` task, so this nests correctly with
+no extra wiring even inside `async` tool handlers.
+
+In all three languages, the span you create this way becomes a child of the
+harness's `bae.client.tool` span (or `bae.client.send`, for a hook that isn't
+inside a tool dispatch) — exactly as if it were any other library's span
+nested under yours, because it is.
+
+---
+
 ## Error types
 
 | Scenario | SDK error type |

@@ -41,10 +41,19 @@ use axum::{Json, Router};
 use reqwest::Method;
 use serde_json::{json, Value};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
+
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 
 use baesrv::api::AppState;
 use baesrv::config_file::{BaeConfigFile, McpServerConfig};
 use baesrv::store::{generate_id, Store};
+
+/// Installed alongside the test log subscriber by `log_capture`.
+static TELEMETRY_EXPORTER: OnceLock<InMemorySpanExporter> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Mock provider (Anthropic Messages-shaped, no real keys)
@@ -2636,18 +2645,285 @@ fn log_capture() -> Arc<Mutex<Vec<u8>>> {
     let buf = BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone();
     INIT.call_once(|| {
         let writer = CaptureWriter(buf.clone());
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("baesrv=error"))
+        // This is the OTel equivalent of CaptureWriter: a dev-only, in-memory
+        // exporter shared by this integration-test binary. Keeping it beside
+        // the log capture means the real router is exercised under the same
+        // tracing subscriber it uses in production, without an OTLP collector.
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer(baesrv::telemetry::SCOPE_NAME);
+        // The layer owns the tracer, but the provider must outlive every test.
+        // Test binaries exit immediately after the suite, so intentionally
+        // retaining it is safer than shutting it down under concurrent tests.
+        let _ = Box::leak(Box::new(provider));
+        let _ = TELEMETRY_EXPORTER.set(exporter);
+        // Filter only the formatting layer. Applying `EnvFilter` to the
+        // subscriber as a whole disables our info-level span constructors
+        // before the OTel layer can observe them.
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(writer)
             .with_ansi(false)
             .without_time()
-            .try_init();
+            .with_filter(tracing_subscriber::EnvFilter::new("baesrv=error"));
+        tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(tracer)
+                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                        metadata.is_span()
+                    })),
+            )
+            .with(fmt_layer)
+            .try_init()
+            .expect("install test tracing + OpenTelemetry subscriber");
+        // Other integration tests can create the same `info_span!` callsites
+        // before this once-only subscriber is installed. Rebuild tracing's
+        // global interest cache so those callsites are not permanently left at
+        // the pre-subscriber disabled decision.
+        tracing::callsite::rebuild_interest_cache();
+        baesrv::telemetry::mark_active(true);
     });
     buf
 }
 
 fn captured_text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
     String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
+}
+
+/// Return a stable snapshot of ended spans. All telemetry integration tests
+/// first call `log_capture`, which installs this exporter exactly once.
+fn captured_spans() -> Vec<opentelemetry_sdk::trace::SpanData> {
+    log_capture();
+    TELEMETRY_EXPORTER
+        .get()
+        .expect("telemetry exporter initialized")
+        .get_finished_spans()
+        .expect("read captured spans")
+}
+
+// The tracing subscriber and in-memory OTel exporter are process-global. Keep
+// only the capture-dependent assertions serial so each test observes a stable
+// snapshot after it has deliberately ended its session anchor span.
+fn telemetry_capture_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn span_attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == key)
+        .map(|attribute| attribute.value.to_string())
+}
+
+fn span_has_link(
+    span: &opentelemetry_sdk::trace::SpanData,
+    kind: &str,
+    target: opentelemetry::trace::SpanId,
+) -> bool {
+    span.links.links.iter().any(|link| {
+        link.span_context.span_id() == target
+            && link.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "bae.link.kind"
+                    && attribute.value.to_string() == kind
+            })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// WI 0013 — OpenTelemetry server integration coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn telemetry_mixed_turn_exports_the_contract_span_tree() {
+    let _capture = telemetry_capture_lock().lock().await;
+    // Installs the real tracing→OTel bridge with the in-memory exporter before
+    // the router is built. The driving fixture is intentionally the same mixed
+    // MCP/client pause scenario used by WI 0009.
+    log_capture();
+    let (ts, _state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("mixed", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let tools = json!([{
+        "name": "get_current_time",
+        "description": "Return the current time",
+        "input_schema": { "type": "object", "properties": {} },
+    }]);
+    let (session_id, session_key, _) = ts.open_session(&client_key, tools).await;
+    let (status, _first, raw) = ts
+        .send_message(&session_id, &session_key, json!({ "content": "mixed please" }))
+        .await;
+    assert_eq!(status, 200, "mixed turn: {raw}");
+    let (status, _, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{session_id}"), Some(&session_key))
+        .await;
+    assert_eq!(status, 200, "close telemetry session: {raw}");
+
+    let spans = captured_spans();
+    let session = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.session"
+                && span_attribute(span, baesrv::telemetry::ATTR_SESSION_ID).as_deref()
+                    == Some(session_id.as_str())
+        })
+        .expect("session anchor span");
+    let turn = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.turn"
+                && span_attribute(span, baesrv::telemetry::ATTR_SESSION_ID).as_deref()
+                    == Some(session_id.as_str())
+                && span_attribute(span, baesrv::telemetry::ATTR_TURN_OUTCOME).as_deref()
+                    == Some("paused")
+        })
+        .expect("paused turn span");
+    assert!(span_has_link(
+        turn,
+        baesrv::telemetry::LINK_SESSION,
+        session.span_context.span_id()
+    ));
+
+    let provider = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.provider.attempt"
+                && span.parent_span_id == turn.span_context.span_id()
+        })
+        .expect("provider attempt below turn");
+    assert_eq!(
+        span_attribute(provider, baesrv::telemetry::ATTR_PROVIDER_KIND).as_deref(),
+        Some("anthropic")
+    );
+
+    let dispatches: Vec<_> = spans
+        .iter()
+        .filter(|span| {
+            span.name.as_ref() == "bae.tool.dispatch"
+                && span.parent_span_id == turn.span_context.span_id()
+        })
+        .collect();
+    assert!(dispatches.iter().any(|span| {
+        span_attribute(span, baesrv::telemetry::ATTR_TOOL_DISPATCH).as_deref() == Some("mcp")
+    }));
+    assert!(dispatches.iter().any(|span| {
+        span_attribute(span, baesrv::telemetry::ATTR_TOOL_DISPATCH).as_deref()
+            == Some("client")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn telemetry_paused_turn_resume_is_a_linked_continuation() {
+    let _capture = telemetry_capture_lock().lock().await;
+    log_capture();
+    let (ts, _state) = start_server_with_registry_capture(HashMap::new()).await;
+    let profile_id = ts
+        .create_profile("mixed", json!([]), json!(["get_current_time"]))
+        .await;
+    let client_key = ts.create_key(&profile_id).await;
+    let tools = json!([{ "name": "get_current_time", "input_schema": { "type": "object" } }]);
+    let (session_id, session_key, _) = ts.open_session(&client_key, tools).await;
+    let (status, _, raw) = ts
+        .send_message(&session_id, &session_key, json!({ "content": "mixed please" }))
+        .await;
+    assert_eq!(status, 200, "pause: {raw}");
+    let (status, _, raw) = ts
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tu_client_mix",
+                "content": "12:00 UTC"
+            }] }),
+        )
+        .await;
+    assert_eq!(status, 200, "resume: {raw}");
+    let (status, _, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{session_id}"), Some(&session_key))
+        .await;
+    assert_eq!(status, 200, "close resumed telemetry session: {raw}");
+
+    let spans = captured_spans();
+    let paused = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.turn"
+                && span_attribute(span, baesrv::telemetry::ATTR_SESSION_ID).as_deref()
+                    == Some(session_id.as_str())
+                && span_attribute(span, baesrv::telemetry::ATTR_TURN_OUTCOME).as_deref()
+                    == Some("paused")
+        })
+        .expect("paused turn");
+    let resumed = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.turn"
+                && span_attribute(span, baesrv::telemetry::ATTR_SESSION_ID).as_deref()
+                    == Some(session_id.as_str())
+                && span_attribute(span, baesrv::telemetry::ATTR_TURN_RESUMED).as_deref()
+                    == Some("true")
+        })
+        .expect("resumed turn");
+    assert_ne!(resumed.parent_span_id, paused.span_context.span_id());
+    assert!(span_has_link(
+        resumed,
+        baesrv::telemetry::LINK_RESUME,
+        paused.span_context.span_id()
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn telemetry_never_exports_session_client_or_provider_secrets() {
+    let _capture = telemetry_capture_lock().lock().await;
+    log_capture();
+    const PROVIDER_TOKEN: &str = "wi0013-provider-secret";
+    const PROVIDER_ENV: &str = "BAE_WI0013_PROVIDER_TOKEN";
+    // A distinctive marker embedded in the user message content: message /
+    // content-block text is on the telemetry denylist (contract §4), so it must
+    // never appear as a span attribute, span event, or status — spans carry only
+    // size metadata (`bae.tool.input.bytes` etc.).
+    const MESSAGE_SECRET: &str = "wi0013-message-body-secret-marker";
+    // The resolver is deliberately exercised: the config retains this token
+    // unresolved until the provider call, just as production does.
+    std::env::set_var(PROVIDER_ENV, PROVIDER_TOKEN);
+    let mock = start_mock().await;
+    let providers = provider_registry_from_toml(&format!(
+        "[[providers.entries]]\nname = \"private\"\nprovider = \"anthropic\"\nbase_url = \"{mock}/text\"\nmodel = \"claude-mock-1\"\nauth_token = \"${{{PROVIDER_ENV}}}\"\n"
+    ));
+    let ts = boot_server(HashMap::new(), providers, None).await;
+    let profile_id = ts.create_profile("private", json!([]), json!([])).await;
+    let client_key = ts.create_key(&profile_id).await;
+    let (session_id, session_key, _) = ts.open_session(&client_key, json!([])).await;
+    let (status, _, raw) = ts
+        .send_message(
+            &session_id,
+            &session_key,
+            json!({ "content": format!("private turn carrying {MESSAGE_SECRET}") }),
+        )
+        .await;
+    assert_eq!(status, 200, "private turn: {raw}");
+
+    // The `{:#?}` render of each captured span includes its attributes, events,
+    // links, AND status — so a leak into any of those surfaces (e.g. a reflected
+    // error string in a status description) would show up here.
+    let payload = format!("{:#?}", captured_spans());
+    for secret in [
+        client_key.as_str(),
+        session_key.as_str(),
+        PROVIDER_TOKEN,
+        MESSAGE_SECRET,
+    ] {
+        assert!(
+            !payload.contains(secret),
+            "secret was exported in a span payload: {secret:?}"
+        );
+    }
+    std::env::remove_var(PROVIDER_ENV);
 }
 
 // ---------------------------------------------------------------------------
@@ -5546,6 +5822,8 @@ fn subagent_event_sequence(events: &[Value]) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_subagent_dispatch_is_non_blocking_and_completes_in_background() {
+    let _capture = telemetry_capture_lock().lock().await;
+    log_capture();
     let output = command_output(0, b"done".to_vec(), Vec::new());
     let runner = MockCommandRunner::new(vec![RunnerScript::Wait(output)]);
     let driver = MockSandboxDriver::new();
@@ -5630,6 +5908,50 @@ async fn remote_subagent_dispatch_is_non_blocking_and_completes_in_background() 
             "session.subagent.completed"
         ]
     );
+
+    // End the session anchor before reading the in-memory exporter: long-lived
+    // spans export on close, not merely when the launching turn completes.
+    let (status, _, raw) = ts
+        .client_delete(&format!("/api/v1/sessions/{sid}"), Some(&skey))
+        .await;
+    assert_eq!(status, 200, "close telemetry subagent session: {raw}");
+
+    let spans = captured_spans();
+    let turn = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.turn"
+                && span_attribute(span, baesrv::telemetry::ATTR_SESSION_ID).as_deref()
+                    == Some(sid.as_str())
+        })
+        .expect("launching turn span");
+    let dispatch = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.tool.dispatch"
+                && span.parent_span_id == turn.span_context.span_id()
+                && span_attribute(span, baesrv::telemetry::ATTR_TOOL_DISPATCH).as_deref()
+                    == Some("subagent")
+        })
+        .expect("launching subagent dispatch span");
+    let subagent = spans
+        .iter()
+        .find(|span| {
+            span.name.as_ref() == "bae.subagent"
+                && span_attribute(span, baesrv::telemetry::ATTR_SESSION_ID).as_deref()
+                    == Some(sid.as_str())
+        })
+        .expect("background subagent span");
+    assert_eq!(
+        subagent.parent_span_id,
+        opentelemetry::trace::SpanId::INVALID,
+        "subagent must be a distinct root, not a child of an ended turn"
+    );
+    assert!(span_has_link(
+        subagent,
+        baesrv::telemetry::LINK_SUBAGENT,
+        dispatch.span_context.span_id()
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -20,7 +20,7 @@
 //! `--rotate-admin-key` together with `--dangerously-disable-admin-auth` is a
 //! usage error (exit 2), caught here at parse time before anything is opened.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -243,7 +243,59 @@ fn run_serve(config_flag: Option<PathBuf>, admin_flags: AdminFlags) -> ExitCode 
         Ok(c) => c,
         Err(code) => return code,
     };
-    init_tracing(&config.log);
+
+    // Build the async runtime up front. Two things need it before the server
+    // loop starts: the OTLP/gRPC (tonic) telemetry exporter must be constructed
+    // within a Tokio runtime, and its `tracing` layer must be composed into the
+    // subscriber *at* init_tracing time (the subscriber is set once, globally).
+    // The same runtime serves the request loop below.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("baesrv: failed to start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Parse bae-config.toml once (via --config or BAE_CONFIG). A missing file is
+    // not an error; a malformed file — or an invalid `[telemetry]` section — is
+    // a usage error (exit 2). Telemetry is validated first so its export layer
+    // can be composed when tracing is initialised.
+    let bae_config = match load_bae_config(config_flag) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    let telemetry_config = match bae_config.telemetry_config() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("baesrv: configuration error: {e}");
+            return ExitCode::from(e.exit_code() as u8);
+        }
+    };
+
+    // Bring up the OTel SDK inside the runtime, then compose its trace layer
+    // into the global subscriber. When telemetry is disabled this yields no
+    // layer and init_tracing behaves exactly as before (fmt to stderr only).
+    let telemetry = match runtime.block_on(crate::telemetry::init(&telemetry_config)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("baesrv: {e}");
+            // Startup usage error, same posture as an unresolvable provider secret.
+            return ExitCode::from(2);
+        }
+    };
+    let telemetry_guard = telemetry.guard;
+    init_tracing(&config.log, telemetry.layer);
+
+    // Build the MCP server + provider registries from the same parse. Their
+    // info logs land now that the subscriber (with any telemetry layer) is set.
+    let (mcp_registry, provider_registry) = match build_registries(&bae_config) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
 
     // Resolve the admin-auth settings (flag > env > default). Re-check the
     // rotate/disable contradiction here too, since `disabled` may come from the
@@ -258,14 +310,6 @@ fn run_serve(config_flag: Option<PathBuf>, admin_flags: AdminFlags) -> ExitCode 
         );
         return ExitCode::from(2);
     }
-
-    // Load the optional MCP server + provider registries from bae-config.toml
-    // (via --config or BAE_CONFIG). A missing file is not an error; a
-    // malformed one is.
-    let (mcp_registry, provider_registry) = match load_registries(config_flag) {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
 
     // Fail fast on database problems before binding any port.
     let store = match crate::open_store(&config) {
@@ -297,24 +341,17 @@ fn run_serve(config_flag: Option<PathBuf>, admin_flags: AdminFlags) -> ExitCode 
         Err(code) => return code,
     };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!("failed to start async runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
+    // Reuse the runtime built at the top of this function (the one the telemetry
+    // exporter was constructed on) for the server loop itself.
     match runtime.block_on(crate::serve(
         config,
         store,
         mcp_registry,
         provider_registry,
+        telemetry_config,
         admin_auth_enabled,
         sandbox_driver,
+        telemetry_guard,
     )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -380,40 +417,45 @@ fn build_sandbox_driver(
     }
 }
 
-/// The `(mcp, providers)` registry pair parsed from one `bae-config.toml`.
+/// The `(mcp, providers)` registries parsed from one `bae-config.toml`.
 type Registries = (
     std::collections::HashMap<String, crate::config_file::McpServerConfig>,
     std::collections::HashMap<String, crate::engine::provider::ProviderConfig>,
 );
 
-/// Resolve `--config`/`BAE_CONFIG`, load and validate the MCP server and
-/// provider registries. A missing file (or neither source set) yields empty
-/// registries with no error; a malformed file or a structural error (duplicate
-/// name, unsupported transport/provider kind) is a usage error (exit 2).
-/// Tracing is already initialised here, so authoring errors are also echoed to
-/// stderr like other config errors.
-fn load_registries(config_flag: Option<PathBuf>) -> Result<Registries, ExitCode> {
+/// Resolve `--config`/`BAE_CONFIG` and parse `bae-config.toml` once. A missing
+/// file (or neither source set) yields an empty config with no error; a
+/// malformed file is a usage error (exit 2). Callers pull the telemetry config
+/// (before tracing init) and the MCP/provider registries (after) off the same
+/// parse, so the file is read exactly once. Errors are echoed to stderr since
+/// tracing may not be initialised yet.
+fn load_bae_config(
+    config_flag: Option<PathBuf>,
+) -> Result<crate::config_file::BaeConfig, ExitCode> {
     let path = resolve_config_path(config_flag);
-    load_registries_from(path.as_deref()).map_err(|e| {
+    BaeConfigFile::load(path.as_deref()).map_err(|e| {
         eprintln!("baesrv: configuration error: {e}");
         ExitCode::from(e.exit_code() as u8)
     })
 }
 
-/// Path-driven half of [`load_registries`], split out for testability. The
-/// file is loaded once and both registries are built from the same parse.
-fn load_registries_from(
-    path: Option<&Path>,
-) -> Result<Registries, crate::config_file::ConfigFileError> {
-    let file = BaeConfigFile::load(path)?;
-    let mcp = file.mcp_registry()?;
+/// Build and validate the MCP server + provider registries from an
+/// already-parsed config file. A structural validation error is a usage error
+/// (exit 2). Tracing is initialised by the time this runs, so the "loaded …"
+/// info lines land.
+fn build_registries(file: &crate::config_file::BaeConfig) -> Result<Registries, ExitCode> {
+    let to_code = |e: crate::config_file::ConfigFileError| {
+        eprintln!("baesrv: configuration error: {e}");
+        ExitCode::from(e.exit_code() as u8)
+    };
+    let mcp = file.mcp_registry().map_err(to_code)?;
     if !mcp.is_empty() {
         tracing::info!(
             count = mcp.len(),
             "loaded MCP server registry from bae-config.toml"
         );
     }
-    let providers = file.provider_registry()?;
+    let providers = file.provider_registry().map_err(to_code)?;
     if !providers.is_empty() {
         tracing::info!(
             count = providers.len(),
@@ -428,7 +470,8 @@ fn run_migrate() -> ExitCode {
         Ok(c) => c,
         Err(code) => return code,
     };
-    init_tracing(&config.log);
+    // `migrate` has no server loop and needs no telemetry export.
+    init_tracing(&config.log, None);
 
     match crate::open_store(&config) {
         Ok(_store) => {
@@ -452,14 +495,46 @@ fn load_config() -> Result<Config, ExitCode> {
     })
 }
 
-/// Initialise tracing to stderr using the `BAE_LOG` filter. Idempotent-safe:
-/// a second call is ignored rather than panicking.
-fn init_tracing(filter: &str) {
-    let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+/// Initialise tracing to stderr using the `BAE_LOG` filter, composing the
+/// optional OpenTelemetry trace layer alongside the fmt layer. When
+/// `otel_layer` is `None` (telemetry disabled, or the `migrate` path) this is
+/// exactly the previous fmt-only behaviour and no spans are emitted.
+/// Idempotent-safe: a second call is ignored rather than panicking.
+fn init_tracing(filter: &str, otel_layer: Option<crate::telemetry::BoxTraceLayer>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let fmt_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    // Trace export must NOT be gated by the stderr log threshold (`BAE_LOG`):
+    // an operator running with the ordinary production setting
+    // `BAE_LOG=baesrv=warn` must still get the info-level BAE spans exported,
+    // otherwise every span constructor (all `info_span!`) is filtered out and
+    // the collector receives nothing. Export volume is controlled by the OTel
+    // sampler (`sample_ratio`), never by the log level. The OTel layer therefore
+    // carries its own filter, taken from `BAE_OTEL_LOG` when set and defaulting
+    // to `info` so every span BAE opens is captured regardless of `BAE_LOG`.
+    let otel_filter = std::env::var("BAE_OTEL_LOG")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+    let composed = otel_layer.is_some();
+
+    // Order matters: the OTel layer is added first so its subscriber type is the
+    // bare `Registry`, keeping the composed type nameable; the fmt layer wraps
+    // around it. The fmt layer keeps its `BAE_LOG` filter (stderr output is
+    // unchanged); the OTel layer uses its own, decoupled filter (above).
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .try_init();
+        .with_filter(fmt_filter);
+    let initialized = tracing_subscriber::registry()
+        .with(otel_layer.with_filter(otel_filter))
+        .with(fmt_layer)
+        .try_init()
+        .is_ok();
+
+    // The span constructors gate on this: real spans only when the layer is live.
+    crate::telemetry::mark_active(composed && initialized);
 }
 
 fn print_version() {
@@ -566,12 +641,16 @@ mod tests {
     #[test]
     fn missing_registry_file_is_empty_no_error() {
         let path = std::env::temp_dir().join("baesrv-cli-absent.toml");
-        let (mcp, providers) = load_registries_from(Some(&path)).unwrap();
+        let file = BaeConfigFile::load(Some(&path)).unwrap();
+        let (mcp, providers) = build_registries(&file).unwrap();
         assert!(mcp.is_empty());
         assert!(providers.is_empty());
+        assert!(!file.telemetry_config().unwrap().enabled);
         // Neither source set → None → empty.
-        let (mcp, providers) = load_registries_from(None).unwrap();
+        let file = BaeConfigFile::load(None).unwrap();
+        let (mcp, providers) = build_registries(&file).unwrap();
         assert!(mcp.is_empty());
         assert!(providers.is_empty());
+        assert!(!file.telemetry_config().unwrap().enabled);
     }
 }

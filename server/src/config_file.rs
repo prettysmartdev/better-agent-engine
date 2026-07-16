@@ -13,7 +13,7 @@
 //!
 //! MCP servers and LLM providers are **not** top-level entries; they live
 //! under top-level `[mcp]` / `[providers]` tables so further sections (e.g.
-//! `[logging]`, `[limits]`) can be added without restructuring:
+//! `[logging]`, `[limits]`, `[telemetry]`) can be added without restructuring:
 //!
 //! ```toml
 //! [mcp]
@@ -62,8 +62,8 @@ use crate::engine::provider::ProviderConfig;
 
 /// The parsed contents of a `bae-config.toml`.
 ///
-/// The top-level struct deliberately has room for sibling sections later; only
-/// `mcp` exists today. Unknown top-level sections are ignored (not rejected) so
+/// The top-level struct deliberately has room for sibling sections. Unknown
+/// top-level sections are ignored (not rejected) so
 /// a newer config on an older binary stays forward-compatible; typo protection
 /// applies within the known sections via `deny_unknown_fields` there. A
 /// document root with no known sections deserializes to all-`None`, i.e.
@@ -76,7 +76,116 @@ pub struct BaeConfig {
     /// The optional LLM provider section. Absent → no configured providers.
     #[serde(default)]
     pub providers: Option<ProvidersConfig>,
+    /// The optional OpenTelemetry export section. Absent → telemetry is off.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
 }
+
+/// The `[telemetry]` section. The section is intentionally optional so an
+/// omitted section keeps telemetry fully disabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Master switch. All other settings are inert while this is `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/gRPC endpoint. Required only when telemetry is enabled.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Additional OTLP headers. `${ENV_VAR}` tokens remain unresolved here.
+    #[serde(default)]
+    pub otlp_headers: Option<HashMap<String, String>>,
+    /// Fraction of root traces to sample.
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    /// OTel `service.name`; `None` means the default name `baesrv`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Trace-specific settings.
+    #[serde(default)]
+    pub traces: TracesConfig,
+    /// Metric-specific settings.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            otlp_endpoint: None,
+            otlp_headers: None,
+            sample_ratio: default_sample_ratio(),
+            service_name: None,
+            traces: TracesConfig::default(),
+            metrics: MetricsConfig::default(),
+        }
+    }
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
+/// Trace-specific telemetry settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracesConfig {
+    /// Whether server traces are exported.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TracesConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Metric-specific telemetry settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Whether server metrics are exported.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Instrument names to omit from registration.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The complete closed set of metric names accepted by
+/// [`MetricsConfig::disabled`].
+pub const TELEMETRY_METRIC_NAMES: &[&str] = &[
+    "bae.sessions.open",
+    "bae.sessions.total",
+    "bae.events.total",
+    "bae.profiles.count",
+    "bae.keys.count",
+    "bae.mcp.sessions.live",
+    "bae.turns.pending",
+    "bae.sandboxes.live",
+    "bae.subagents.active",
+    "bae.drivers.registered",
+    "bae.turns.completed",
+    "bae.provider.requests",
+    "bae.provider.latency",
+    "bae.tool.calls",
+    "bae.tool.latency",
+];
 
 /// The `[mcp]` section: a list of configured MCP servers.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -201,6 +310,14 @@ pub enum ConfigFileError {
         transport: &'static str,
         field: &'static str,
     },
+    /// Telemetry is enabled without an OTLP endpoint.
+    MissingTelemetryEndpoint,
+    /// The configured telemetry endpoint is not an HTTP(S) URL.
+    InvalidTelemetryEndpoint(String),
+    /// The configured trace sample ratio is outside the inclusive [0, 1] range.
+    InvalidTelemetrySampleRatio(f64),
+    /// A metric name in `metrics.disabled` is not part of the telemetry schema.
+    UnknownTelemetryMetric(String),
 }
 
 impl ConfigFileError {
@@ -238,6 +355,22 @@ impl std::fmt::Display for ConfigFileError {
             } => write!(
                 f,
                 "MCP server {server:?} uses transport {transport:?} but is missing required field {field:?}"
+            ),
+            ConfigFileError::MissingTelemetryEndpoint => write!(
+                f,
+                "[telemetry] enabled = true requires a non-empty otlp_endpoint"
+            ),
+            ConfigFileError::InvalidTelemetryEndpoint(endpoint) => write!(
+                f,
+                "[telemetry] otlp_endpoint {endpoint:?} must be a valid http:// or https:// URL"
+            ),
+            ConfigFileError::InvalidTelemetrySampleRatio(ratio) => write!(
+                f,
+                "[telemetry] sample_ratio {ratio} must be between 0.0 and 1.0"
+            ),
+            ConfigFileError::UnknownTelemetryMetric(name) => write!(
+                f,
+                "[telemetry.metrics] disabled contains unknown metric {name:?}"
             ),
         }
     }
@@ -358,6 +491,49 @@ impl BaeConfig {
             }
         }
         Ok(registry)
+    }
+
+    /// Return the validated telemetry settings.
+    ///
+    /// An absent `[telemetry]` section is equivalent to the default disabled
+    /// configuration, so callers never need to match on an `Option`. Semantic
+    /// validation is intentionally skipped while the master switch is off;
+    /// this permits an operator to park a complete but currently inactive
+    /// configuration. Header token values remain raw and are resolved later by
+    /// the shared provider token resolver at exporter initialization.
+    pub fn telemetry_config(&self) -> Result<TelemetryConfig, ConfigFileError> {
+        let config = self.telemetry.clone().unwrap_or_default();
+        if !config.enabled {
+            return Ok(config);
+        }
+
+        let Some(endpoint) = config.otlp_endpoint.as_deref() else {
+            return Err(ConfigFileError::MissingTelemetryEndpoint);
+        };
+        if endpoint.trim().is_empty() {
+            return Err(ConfigFileError::MissingTelemetryEndpoint);
+        }
+        let parsed = url::Url::parse(endpoint)
+            .map_err(|_| ConfigFileError::InvalidTelemetryEndpoint(endpoint.to_owned()))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(ConfigFileError::InvalidTelemetryEndpoint(
+                endpoint.to_owned(),
+            ));
+        }
+
+        if !config.sample_ratio.is_finite() || !(0.0..=1.0).contains(&config.sample_ratio) {
+            return Err(ConfigFileError::InvalidTelemetrySampleRatio(
+                config.sample_ratio,
+            ));
+        }
+
+        for name in &config.metrics.disabled {
+            if !TELEMETRY_METRIC_NAMES.contains(&name.as_str()) {
+                return Err(ConfigFileError::UnknownTelemetryMetric(name.clone()));
+            }
+        }
+
+        Ok(config)
     }
 }
 
@@ -670,6 +846,153 @@ mod tests {
         let cfg: BaeConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.mcp_registry().unwrap().contains_key("shared"));
         assert!(cfg.provider_registry().unwrap().contains_key("shared"));
+    }
+
+    // -- [telemetry] ---------------------------------------------------------
+
+    fn telemetry_from(toml_str: &str) -> Result<TelemetryConfig, ConfigFileError> {
+        let cfg: BaeConfig = toml::from_str(toml_str).unwrap();
+        cfg.telemetry_config()
+    }
+
+    #[test]
+    fn absent_telemetry_section_is_default_disabled_config() {
+        let cfg: BaeConfig = toml::from_str("").unwrap();
+        assert!(cfg.telemetry.is_none());
+
+        let telemetry = cfg.telemetry_config().unwrap();
+        assert!(!telemetry.enabled);
+        assert_eq!(telemetry.otlp_endpoint, None);
+        assert_eq!(telemetry.sample_ratio, 1.0);
+        assert_eq!(telemetry.service_name, None);
+        assert!(telemetry.traces.enabled);
+        assert!(telemetry.metrics.enabled);
+        assert!(telemetry.metrics.disabled.is_empty());
+    }
+
+    #[test]
+    fn telemetry_round_trips_all_fields_and_preserves_header_tokens() {
+        let telemetry = telemetry_from(
+            r#"
+            [telemetry]
+            enabled = true
+            otlp_endpoint = "https://otel.example.test:4317"
+            otlp_headers = { Authorization = "Bearer ${OTEL_TOKEN}" }
+            sample_ratio = 0.25
+            service_name = "baesrv-prod-1"
+
+            [telemetry.traces]
+            enabled = false
+
+            [telemetry.metrics]
+            enabled = true
+            disabled = ["bae.events.total", "bae.tool.latency"]
+            "#,
+        )
+        .unwrap();
+
+        assert!(telemetry.enabled);
+        assert_eq!(
+            telemetry.otlp_endpoint.as_deref(),
+            Some("https://otel.example.test:4317")
+        );
+        assert_eq!(
+            telemetry
+                .otlp_headers
+                .as_ref()
+                .and_then(|headers| headers.get("Authorization"))
+                .map(String::as_str),
+            Some("Bearer ${OTEL_TOKEN}")
+        );
+        assert_eq!(telemetry.sample_ratio, 0.25);
+        assert_eq!(telemetry.service_name.as_deref(), Some("baesrv-prod-1"));
+        assert!(!telemetry.traces.enabled);
+        assert_eq!(
+            telemetry.metrics.disabled,
+            vec![
+                "bae.events.total".to_string(),
+                "bae.tool.latency".to_string()
+            ]
+        );
+
+        // Serialization is also accepted by the same schema, which protects
+        // the field names/default shape from drifting in future edits.
+        let serialized = toml::to_string(&telemetry).unwrap();
+        let reparsed: TelemetryConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.otlp_endpoint, telemetry.otlp_endpoint);
+        assert_eq!(reparsed.otlp_headers, telemetry.otlp_headers);
+        assert_eq!(reparsed.sample_ratio, telemetry.sample_ratio);
+        assert_eq!(reparsed.service_name, telemetry.service_name);
+        assert_eq!(reparsed.traces.enabled, telemetry.traces.enabled);
+        assert_eq!(reparsed.metrics.disabled, telemetry.metrics.disabled);
+    }
+
+    #[test]
+    fn enabled_telemetry_requires_endpoint() {
+        let err = telemetry_from("[telemetry]\nenabled = true\n").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(err, ConfigFileError::MissingTelemetryEndpoint));
+    }
+
+    #[test]
+    fn enabled_telemetry_rejects_empty_or_malformed_endpoint() {
+        for endpoint in ["", "not a URL", "ftp://otel.example.test:4317"] {
+            let input = format!("[telemetry]\nenabled = true\notlp_endpoint = {endpoint:?}\n");
+            let err = telemetry_from(&input).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(matches!(
+                err,
+                ConfigFileError::MissingTelemetryEndpoint
+                    | ConfigFileError::InvalidTelemetryEndpoint(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn enabled_telemetry_rejects_sample_ratio_outside_range() {
+        for ratio in ["-0.01", "1.01"] {
+            let input = format!(
+                "[telemetry]\nenabled = true\notlp_endpoint = \"http://localhost:4317\"\nsample_ratio = {ratio}\n"
+            );
+            let err = telemetry_from(&input).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(matches!(
+                err,
+                ConfigFileError::InvalidTelemetrySampleRatio(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn disabled_telemetry_does_not_validate_parked_values() {
+        let telemetry = telemetry_from(
+            r#"
+            [telemetry]
+            enabled = false
+            otlp_endpoint = "not a URL"
+            sample_ratio = 2.0
+            "#,
+        )
+        .unwrap();
+        assert!(!telemetry.enabled);
+        assert_eq!(telemetry.otlp_endpoint.as_deref(), Some("not a URL"));
+        assert_eq!(telemetry.sample_ratio, 2.0);
+    }
+
+    #[test]
+    fn telemetry_rejects_unknown_disabled_metric() {
+        let err = telemetry_from(
+            r#"
+            [telemetry]
+            enabled = true
+            otlp_endpoint = "http://localhost:4317"
+            [telemetry.metrics]
+            disabled = ["bae.typo"]
+            "#,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(err, ConfigFileError::UnknownTelemetryMetric(name) if name == "bae.typo"));
     }
 
     #[test]

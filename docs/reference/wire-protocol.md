@@ -125,6 +125,45 @@ stream (see error codes below), not as HTTP errors.
 
 ---
 
+## Trace context propagation
+
+Every request a client SDK sends — REST (session open/join/close/getEvents)
+and JSON-RPC (`/rpc`) alike — **may** carry the standard [W3C Trace
+Context](https://www.w3.org/TR/trace-context/) headers, `traceparent` and
+`tracestate`, exactly as a client tagged with `dispatch` in
+[Client API — tool call response](client-api.md#sessionsendmessage) tags each
+`tool_use` block: it's a convention on the wire, not a new envelope field.
+
+- A client SDK writes these headers only when the embedding application has
+  installed an OpenTelemetry SDK of its own (see
+  [Building a Client — OpenTelemetry](../guides/building-a-client.md#opentelemetry-traces-and-custom-spans)).
+  With no host SDK installed, the language's built-in no-op OTel API writes
+  **no header at all** — this is the default, and it is not an error or a
+  degraded mode, just the steady state for a client that hasn't opted into
+  tracing.
+- **Absence is always valid, never an error.** `baesrv` accepts every request
+  with no `traceparent` header exactly as it always has — it simply opens a
+  fresh root trace server-side (subject to `[telemetry]` being enabled at
+  all; see [Configuration — `[telemetry]`](configuration.md#telemetry)). A
+  malformed `traceparent` value is treated identically to an absent one (per
+  the W3C spec) — never rejected, never surfaced as a request error, logged
+  at most at `DEBUG`.
+- When present and valid, the server extracts the trace context and parents
+  its own top-level request span on it — this is the join point that lets a
+  client-side trace and `baesrv`'s session/turn/tool spans appear as one
+  connected trace in an operator's observability backend. See
+  [Configuration — `[telemetry]`](configuration.md#telemetry) for the
+  server-side sampling behavior (`sample_ratio` only applies when `baesrv` is
+  itself the trace root; an incoming sampled/unsampled decision is always
+  respected).
+- The server never requires, echoes back, or validates these headers on any
+  response — they are purely an inbound propagation mechanism.
+- Out of scope for this convention: `baesrv` does not forward/re-inject
+  `traceparent` into its own outbound calls to LLM providers or MCP servers —
+  those remain outside the joined trace in this work item.
+
+---
+
 ## Error codes
 
 Errors on `POST /api/v1/sessions/{id}/rpc` are JSON-RPC error objects:

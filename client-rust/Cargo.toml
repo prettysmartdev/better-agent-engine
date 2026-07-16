@@ -31,11 +31,24 @@ getrandom = "0.2"
 # the one place the library spawns background tasks (with a kill-on-timeout and
 # a `kill_on_drop` child), rather than only awaiting subprocesses it starts.
 tokio = { version = "1", default-features = false, features = ["process", "io-util", "sync", "rt", "time"] }
+# OpenTelemetry **API** surface only ([`telemetry`]): harness spans
+# (`bae.client.send`/`bae.client.tool`) and `traceparent`/`tracestate`
+# injection at the transport choke point, both resolved against whatever
+# ambient/global `TracerProvider`/`TextMapPropagator` the embedding
+# application installed. The `trace` feature alone pulls in no SDK/exporter
+# code (`opentelemetry_sdk` is a dev-dependency only, for tests) — with no
+# OTel SDK installed by the app, every call here is the crate's built-in
+# no-op implementation: zero cost, zero `traceparent` header.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 
 [dev-dependencies]
 # Async runtime for the examples and the async unit tests. Not needed by the
 # library itself (it only ever awaits, never spawns), so it stays a dev-dep.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# An in-process OTel SDK + in-memory span exporter, so this crate's own tests
+# can install a real `TracerProvider`/propagator and assert on the spans
+# `telemetry` produces, without ever depending on the SDK at runtime.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
 
 # The reference-assistant example lives in a subdirectory so it can grow extra
 # files without polluting the examples/ root; declare it explicitly since Cargo

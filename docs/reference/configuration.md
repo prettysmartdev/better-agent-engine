@@ -20,8 +20,9 @@ Flag-beats-env-var precedence: when `--config` and `BAE_CONFIG` are both set,
 | `BAE_ADDR` | `0.0.0.0:8080` | Client-facing listen address (plain HTTP). |
 | `BAE_ADMIN_ADDR` | `127.0.0.1:8081` | Admin-only listen address. Must be a loopback address; the server refuses to start otherwise. |
 | `BAE_DB_PATH` | `/var/lib/bae/bae.db` | SQLite database file path. Mount a volume here to persist data. |
-| `BAE_LOG` | `info` | Tracing filter string, e.g. `baesrv=debug,tower=warn`. |
-| `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain in-flight requests on SIGTERM. |
+| `BAE_LOG` | `info` | Tracing filter string for **stderr logs**, e.g. `baesrv=debug,tower=warn`. Does **not** gate OpenTelemetry trace export — spans are exported regardless of this threshold (export volume is controlled by `[telemetry].sample_ratio`, never the log level). |
+| `BAE_OTEL_LOG` | `info` | Tracing filter applied to the OpenTelemetry export layer only (independent of `BAE_LOG`). BAE opens its spans at `info`, so the default captures them all; raise or lower this only to change which span *events* (bridged log lines) are exported. Has no effect when `[telemetry]` is disabled. |
+| `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds for the **whole** graceful shutdown — draining in-flight requests *and* flushing/closing the telemetry exporters — bounded by this single budget. |
 | `BAE_CONFIG` | _(none)_ | Path to a `bae-config.toml` file. Overridden by `--config`. Absence is not an error. |
 | `BAE_TURN_TIMEOUT` | `120` | Seconds a paused turn's owner has to return with its continuation before the turn is considered abandoned and the FIFO gate is released to the next queued driver. See [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration). |
 | `BAE_ADMIN_KEY_FILE` | `/var/lib/bae/admin-key.pem` | Plaintext admin-key file. Written by the server only when it self-generates a key (first boot or `--rotate-admin-key`); read by `baectl`. Overridden by `--admin-key-file`. |
@@ -86,9 +87,9 @@ lifecycle these flags control.
 ## `bae-config.toml` schema
 
 `bae-config.toml` is a TOML file pointed to via `--config` or `BAE_CONFIG`. It
-holds the MCP server registry and the LLM provider registry; the top-level
-table is designed to accommodate future sections (e.g. `[logging]`) without
-restructuring either.
+holds the MCP server registry, the LLM provider registry, and the OpenTelemetry
+export section; the top-level table is designed to accommodate further
+sections (e.g. `[logging]`) without restructuring any of them.
 
 ### Top-level layout
 
@@ -98,10 +99,14 @@ restructuring either.
 
 [providers]
 # ...
+
+[telemetry]
+# ...
 ```
 
-A file with no `[mcp]` table, no `[providers]` table, or neither is valid —
-each absent table yields an empty registry with no error. Unknown top-level
+A file with no `[mcp]` table, no `[providers]` table, no `[telemetry]` table,
+or none of the three is valid — each absent table yields an empty registry (or,
+for `[telemetry]`, fully-disabled export) with no error. Unknown top-level
 keys are ignored (forward-compatibility).
 
 ### `[[mcp.servers]]` entries
@@ -275,6 +280,113 @@ one asymmetry versus `[mcp]`/`mcp_servers`:
 See [Profiles — Fatal primary / non-fatal fallback](../profiles.md#fatal-primary--non-fatal-fallback)
 for the full behavior and [Admin API](admin-api.md#post-adminv1profiles--create) for
 the profile request/response shape.
+
+---
+
+## `[telemetry]`
+
+`[telemetry]` configures OpenTelemetry trace and metric export from `baesrv`
+itself. It is **off unless explicitly enabled** — an absent section, or a
+present section with `enabled = false` (the default), means zero tracing
+overhead and no outbound OTLP traffic. There is no equivalent client-side
+config surface: the three client SDKs never read `bae-config.toml` and
+instrument themselves against whatever ambient OpenTelemetry SDK the embedding
+application has installed, using each language's own standard OTel
+auto-configuration (see [Building a Client — OpenTelemetry](../guides/building-a-client.md#opentelemetry-traces-and-custom-spans)).
+
+### Example
+
+```toml
+[telemetry]
+enabled = true
+otlp_endpoint = "http://otel-collector:4317"
+otlp_headers = { Authorization = "Bearer ${OTEL_COLLECTOR_TOKEN}" }
+sample_ratio = 0.25
+service_name = "baesrv-prod-1"
+
+[telemetry.traces]
+enabled = true
+
+[telemetry.metrics]
+enabled = true
+disabled = ["bae.events.total"]
+```
+
+### Field reference
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `enabled` | no | `false` | Master switch. Every other field in `[telemetry]` is inert while this is `false`. |
+| `otlp_endpoint` | yes if `enabled = true` | _(none)_ | OTLP/gRPC collector endpoint, e.g. `http://otel-collector:4317`. Must be a non-empty `http`/`https` URL. |
+| `otlp_headers` | no | _(none)_ | Extra headers (e.g. a bearer token for a hosted collector) sent with every OTLP export. Values may contain `${ENV_VAR}` tokens using the same convention as `[providers]`/`[mcp]` — see [`${ENV_VAR}` substitution](#env_var-substitution-in-headers) — resolved only at exporter-init time, never persisted resolved. |
+| `sample_ratio` | no | `1.0` | Fraction of root traces sampled, in `[0.0, 1.0]`. Feeds a `ParentBased(TraceIdRatioBased)` sampler: an incoming client `traceparent`'s sampled decision is always respected — sampled **or** unsampled — so this ratio only applies when `baesrv` itself is the trace root (a request with no incoming `traceparent` at all). Metrics are never sampled. |
+| `service_name` | no | `"baesrv"` | The OTel `service.name` resource attribute — lets an operator running multiple `baesrv` instances tell them apart in their backend. |
+| `traces.enabled` | no | `true` | Whether spans are exported. `false` disables tracing while leaving metrics unaffected (unless `[telemetry].enabled` is itself `false`, which disables both). |
+| `metrics.enabled` | no | `true` | Whether metrics are exported. `false` disables all metrics while leaving traces unaffected. |
+| `metrics.disabled` | no | `[]` | List of specific metric instrument names to suppress (e.g. `["bae.events.total"]`) without disabling the rest of `[telemetry.metrics]`. Each name must be one of the closed instrument set below. |
+
+The complete, closed set of instrument names `metrics.disabled` may reference:
+
+`bae.sessions.open`, `bae.sessions.total`, `bae.events.total`,
+`bae.profiles.count`, `bae.keys.count`, `bae.mcp.sessions.live`,
+`bae.turns.pending`, `bae.sandboxes.live`, `bae.subagents.active`,
+`bae.drivers.registered`, `bae.turns.completed`, `bae.provider.requests`,
+`bae.provider.latency`, `bae.tool.calls`, `bae.tool.latency`.
+
+### Startup validation errors
+
+The following are fatal startup errors (exit code 2), evaluated only when
+`enabled = true` — a fully parked `[telemetry]` table with `enabled = false`
+skips all of this validation, so an operator may leave a complete
+configuration in place while telemetry is off:
+
+- `otlp_endpoint` is absent, empty, or not a valid `http`/`https` URL.
+- `sample_ratio` is outside the inclusive `[0.0, 1.0]` range.
+- A `metrics.disabled` entry is not one of the closed instrument names above
+  (typo protection, consistent with `deny_unknown_fields` elsewhere in this
+  file).
+- The TOML is malformed, or `[telemetry]` contains an unrecognized field
+  (`deny_unknown_fields`).
+- An `otlp_headers` value contains a `${ENV_VAR}` token that is **unset** in
+  the environment at startup. Unlike a missing `[mcp]` header variable (which
+  degrades to a non-fatal connect-time failure), an unresolved telemetry header
+  token is fatal at startup — the same posture as an unresolved provider
+  `auth_token` — so a misconfigured collector credential never silently ships
+  export traffic with a broken auth header.
+- An `otlp_headers` entry has a header **name** that is not a valid HTTP header
+  name, or a (resolved) header **value** that is not a valid HTTP header value.
+
+### No hot reload
+
+Like every other section of `bae-config.toml`, `[telemetry]` is read once at
+server startup. **There is no hot-reload anywhere in the codebase** — flipping
+`enabled`, changing `sample_ratio`, or editing `metrics.disabled` all require
+restarting `baesrv` to take effect. This is not a new limitation specific to
+telemetry; it is the same posture `[mcp]` and `[providers]` already have.
+
+### Secrets
+
+`otlp_headers` values follow the exact `${ENV_VAR}` convention MCP `headers`
+and provider `auth_token` already use: the raw, unresolved token string is
+what's held in the parsed config, and resolution happens only immediately
+before the OTLP exporter is initialized. A collector bearer token is never
+held resolved for longer than a provider or MCP secret is, and is never
+logged, persisted, or exported as a span/metric attribute — see
+[Security](../../aspec/architecture/security.md).
+
+### Collector unreachable
+
+OTLP export is fire-and-forget from the request path's perspective: an
+unreachable or misconfigured collector never adds latency to, or fails, a
+client-facing request. A sustained export failure is logged once via the
+existing `tracing::warn!` machinery (rate-limited), not once per span.
+
+### Graceful shutdown
+
+On graceful shutdown, buffered spans and metrics are flushed
+(`force_flush()`/`shutdown()`) within the existing `BAE_SHUTDOWN_TIMEOUT`
+window, so the last spans of a session are not silently lost on a normal
+restart or deploy.
 
 ---
 

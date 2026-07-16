@@ -5,9 +5,13 @@ the tool-call round-trip loop (api-contract §6).
 from __future__ import annotations
 
 import inspect
+from importlib import metadata as _metadata
 from typing import Any
 
 from typing import Awaitable, Callable, Union
+
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from ..config import Config
 from ..errors import (
@@ -36,6 +40,7 @@ from ..types import (
     SendMessageResult,
     SessionEvent,
     ToolResultBlock,
+    ToolUseBlock,
     to_message,
 )
 from .transport import HttpxTransport, Transport, TransportResponse
@@ -45,6 +50,18 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+try:
+    _TRACER_VERSION = _metadata.version("bae-py")
+except _metadata.PackageNotFoundError:  # pragma: no cover - always installed in practice
+    _TRACER_VERSION = "0.0.0"
+
+# Instrumentation scope "bae.client" is identical across all three BAE SDKs
+# (parity requirement — see the telemetry contract). Resolves to a no-op
+# tracer, and thus zero overhead, whenever the embedding app hasn't installed
+# an OTel SDK of its own.
+_tracer = trace.get_tracer("bae.client", _TRACER_VERSION)
 
 
 class Harness:
@@ -278,38 +295,80 @@ class Session:
         returned. Server-owned blocks remain visible through ``after_receive``.
         """
         current = to_message(message)
+        iteration = 0
         while True:
-            await self._run_hook("before_send", self._hooks.before_send, current)
+            # One span per sendMessage round trip (not per logical server
+            # turn — a paused/resumed turn is two round trips from here).
+            # The active span at RPC-send time is what the transport's
+            # traceparent injection joins to the server's trace.
+            with _tracer.start_as_current_span(
+                "bae.client.send",
+                kind=SpanKind.CLIENT,
+                attributes={
+                    "bae.session.id": self.session_id,
+                    "bae.rpc.method": "session.sendMessage",
+                    "bae.client.iteration": iteration,
+                },
+            ) as span:
+                try:
+                    await self._run_hook("before_send", self._hooks.before_send, current)
 
-            result, notifications = await self._send_message(current)
-            for event in notifications:
-                await self._run_hook("on_event", self._hooks.on_event, event)
+                    result, notifications = await self._send_message(current)
+                    for event in notifications:
+                        await self._run_hook("on_event", self._hooks.on_event, event)
 
-            self.last_events = result.events
-            assistant = result.message
-            await self._run_hook("after_receive", self._hooks.after_receive, assistant)
+                    self.last_events = result.events
+                    assistant = result.message
+                    await self._run_hook("after_receive", self._hooks.after_receive, assistant)
 
-            tool_uses = assistant.tool_uses()
-            if not tool_uses:
-                return assistant
+                    tool_uses = assistant.tool_uses()
+                    if not tool_uses:
+                        return assistant
 
-            results: list[Any] = []
-            for tu in tool_uses:
-                # A current server's dispatch tag is authoritative, including
-                # when a server-owned tool happens to share a local name. Older
-                # servers omit it, so retain registry-membership routing as the
-                # compatibility fallback.
-                owned_by_client = (
-                    tu.dispatch == "client"
-                    if tu.dispatch is not None
-                    else tu.name in self._registry
-                )
-                if not owned_by_client:
-                    # The complete assistant message was already exposed via
-                    # after_receive for informational/UI handling. Server-owned
-                    # calls must not run client hooks or receive a result.
-                    continue
+                    results: list[Any] = []
+                    for tu in tool_uses:
+                        # A current server's dispatch tag is authoritative, including
+                        # when a server-owned tool happens to share a local name. Older
+                        # servers omit it, so retain registry-membership routing as the
+                        # compatibility fallback.
+                        owned_by_client = (
+                            tu.dispatch == "client"
+                            if tu.dispatch is not None
+                            else tu.name in self._registry
+                        )
+                        if not owned_by_client:
+                            # The complete assistant message was already exposed via
+                            # after_receive for informational/UI handling. Server-owned
+                            # calls must not run client hooks or receive a result.
+                            continue
 
+                        results.append(await self._dispatch_client_tool(tu))
+
+                    current = Message(role="user", content=results)
+                except Exception:
+                    # Fixed, category-only status — the raw exception text is
+                    # deliberately NOT exported (no record_exception, no message
+                    # string): a transport/hook/handler error can carry
+                    # provider-forwarded secrets, tokens, or prompt fragments,
+                    # and the telemetry contract (§4) forbids untrusted payload
+                    # text — including error text — anywhere in telemetry. The
+                    # exception still propagates to the caller unchanged.
+                    span.set_status(Status(StatusCode.ERROR, "send failed"))
+                    raise
+            iteration += 1
+
+    async def _dispatch_client_tool(self, tu: ToolUseBlock) -> ToolResultBlock:
+        """Dispatch one client-owned ``tool_use`` block: ``before_tool_call``
+        hook -> handler -> ``after_tool_call`` hook, inside its own
+        ``bae.client.tool`` child span (child of the enclosing
+        ``bae.client.send`` span via the ambient context).
+        """
+        with _tracer.start_as_current_span(
+            "bae.client.tool",
+            kind=SpanKind.INTERNAL,
+            attributes={"bae.tool.name": tu.name, "bae.tool.dispatch": "client"},
+        ) as span:
+            try:
                 await self._run_hook("before_tool_call", self._hooks.before_tool_call, tu)
                 tool = self._registry.get(tu.name)
                 if tool is None:
@@ -323,9 +382,13 @@ class Session:
                     raise ToolError(tu.name, exc) from exc
                 result_block = ToolResultBlock(tool_use_id=tu.id, content=output)
                 await self._run_hook("after_tool_call", self._hooks.after_tool_call, result_block)
-                results.append(result_block)
-
-            current = Message(role="user", content=results)
+                return result_block
+            except Exception:
+                # Fixed, category-only status — never the raw exception text,
+                # which may carry secrets/prompt fragments (telemetry contract
+                # §4). The exception still propagates to the caller unchanged.
+                span.set_status(Status(StatusCode.ERROR, "tool handler failed"))
+                raise
 
     def sandbox_session(self) -> SandboxSession:
         """A handle to this session's sandbox capability, for building sandbox

@@ -37,16 +37,46 @@ use crate::store::Store;
 /// method, path, response status, and latency. `/healthz` is logged at DEBUG —
 /// load balancers and container health checks hit it every few seconds, which
 /// would drown an INFO-level log; everything else logs at INFO.
+///
+/// This is also the telemetry join point: the top-level `http.request` server
+/// span is opened here (the one middleware both routers share), seeded with the
+/// W3C parent context extracted from the incoming `traceparent`/`tracestate`
+/// (absent/malformed → a fresh root, never an error). Every server span for the
+/// request nests under it, so a client's per-request span becomes the parent of
+/// `baesrv`'s work. `/healthz` is not spanned at all (matches its DEBUG-log
+/// carve-out). All of this is inert — no span created — when telemetry is off.
 pub async fn log_requests(request: Request, next: Next) -> Response {
+    use tracing::Instrument;
+
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let started = Instant::now();
+    let is_health = path == "/healthz";
 
-    let response = next.run(request).await;
+    // The templated route (no embedded ids) for the span display name, and the
+    // incoming trace context — read before `request` is moved into `next.run`.
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned());
+    let span = if is_health {
+        tracing::Span::none()
+    } else {
+        let span = crate::telemetry::http_request_span(&method, route.as_deref(), &path);
+        let parent = crate::telemetry::extract_context(request.headers());
+        crate::telemetry::set_parent(&span, parent);
+        span
+    };
+
+    let started = Instant::now();
+    let response = next.run(request).instrument(span.clone()).await;
 
     let status = response.status().as_u16();
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    if path == "/healthz" {
+    crate::telemetry::set_i64(&span, crate::telemetry::ATTR_HTTP_STATUS, status as i64);
+    if status >= 500 {
+        crate::telemetry::set_error(&span, format!("HTTP {status}"));
+    }
+    if is_health {
         tracing::debug!(%method, path, status, elapsed_ms, "http request");
     } else {
         tracing::info!(%method, path, status, elapsed_ms, "http request");
@@ -80,6 +110,13 @@ type SandboxStatusMap = Arc<Mutex<HashMap<String, HashMap<String, SandboxImageSt
 /// Remote subagent tasks, scoped first by session and then by subagent id.
 type Subagents = Arc<Mutex<HashMap<String, HashMap<String, SubagentTask>>>>;
 
+/// Live `bae.session` telemetry anchor spans, keyed by session id. Same
+/// in-memory lifecycle as [`McpSessions`]: an entry is inserted at session
+/// creation (only when telemetry is enabled) and dropped — ending the span — at
+/// session close/error teardown or during shutdown flush. A server restart
+/// loses open session spans (in-memory only), matching every other map here.
+type SessionSpans = Arc<Mutex<HashMap<String, crate::telemetry::SessionSpanHandle>>>;
+
 /// A paused turn whose FIFO-gate guard is parked between HTTP requests.
 ///
 /// Created when a `session.sendMessage` turn ends [`Paused`]
@@ -108,6 +145,14 @@ pub struct PendingTurn {
     /// preserving a replayable provider transcript. See
     /// `crate::engine::session::Turn::pending_tool_results`.
     pub server_tool_results: Vec<serde_json::Value>,
+    /// The paused `bae.turn` span's own context, captured when the turn parked.
+    /// On resume a new `bae.turn` span opens Linked back to this
+    /// (`bae.link.kind="resume"`) — two linked spans is the deliberate topology
+    /// for a turn spanning two HTTP requests (contract §2.2), never one span
+    /// idle for up to `BAE_TURN_TIMEOUT`. `None` when telemetry is disabled;
+    /// dropped with the guard on abandonment/timeout. Held in-memory only
+    /// (PendingTurn never persists), so no serialization.
+    pub span_context: Option<opentelemetry::trace::SpanContext>,
 }
 
 /// Shared state handed to both routers. Cloneable and cheap (the [`Store`] is an
@@ -166,6 +211,12 @@ pub struct AppState {
     pub sandbox_status: SandboxStatusMap,
     /// Tracked remote subagents, keyed session id then subagent id.
     pub subagents: Subagents,
+    /// Live `bae.session` telemetry anchor spans, keyed by session id. Empty
+    /// when telemetry is disabled. See [`SessionSpans`].
+    pub session_spans: SessionSpans,
+    /// Server-owned OTel metric handles. Disabled instruments are startup-time
+    /// no-ops, avoiding configuration checks where points are recorded.
+    pub telemetry_metrics: crate::telemetry::Metrics,
     /// Shared injectable subprocess seam for remote `exec -i` subagents.
     pub command_runner: Arc<dyn CommandRunner>,
     /// Default remote subagent timeout.
@@ -209,6 +260,8 @@ impl AppState {
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             sandbox_status: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
+            session_spans: Arc::new(Mutex::new(HashMap::new())),
+            telemetry_metrics: crate::telemetry::Metrics::noop(),
             command_runner: Arc::new(TokioCommandRunner),
             subagent_timeout: Duration::from_secs(crate::config::DEFAULT_SUBAGENT_TIMEOUT_SECS),
             max_subagents_per_session: crate::config::DEFAULT_MAX_SUBAGENTS_PER_SESSION,
@@ -360,6 +413,61 @@ impl AppState {
             .entry(session_id.to_owned())
             .or_default()
             .clone()
+    }
+
+    /// Retain the `bae.session` telemetry span for a session. Called at session
+    /// creation, only when telemetry is enabled (the handle is `None`
+    /// otherwise). Held until close/error teardown, when the span ends.
+    pub fn insert_session_span(
+        &self,
+        session_id: &str,
+        handle: crate::telemetry::SessionSpanHandle,
+    ) {
+        self.session_spans
+            .lock()
+            .expect("session_spans mutex poisoned")
+            .insert(session_id.to_owned(), handle);
+    }
+
+    /// The `SpanContext` of a session's live anchor span, for a turn's session
+    /// Link. `None` when telemetry is off or the session predates a restart.
+    pub fn session_span_context(
+        &self,
+        session_id: &str,
+    ) -> Option<opentelemetry::trace::SpanContext> {
+        self.session_spans
+            .lock()
+            .expect("session_spans mutex poisoned")
+            .get(session_id)
+            .map(|h| h.context().clone())
+    }
+
+    /// End a session's anchor span (marking it Error when `error` is set),
+    /// removing it from the map. Idempotent — a no-op if already ended or never
+    /// stored (telemetry disabled).
+    pub fn end_session_span(&self, session_id: &str, error: Option<&str>) {
+        let handle = self
+            .session_spans
+            .lock()
+            .expect("session_spans mutex poisoned")
+            .remove(session_id);
+        if let Some(handle) = handle {
+            handle.end(error);
+        }
+    }
+
+    /// End every still-open session span (drops them, ending the spans). Called
+    /// during shutdown flush so buffered session spans are exported.
+    pub fn end_all_session_spans(&self) {
+        let spans: Vec<_> = self
+            .session_spans
+            .lock()
+            .expect("session_spans mutex poisoned")
+            .drain()
+            .collect();
+        for (_id, handle) in spans {
+            handle.end(None);
+        }
     }
 
     /// Tear down a session's in-memory multi-client state — its driver

@@ -393,6 +393,18 @@ pub async fn create(
     })?;
     state.broadcaster.publish(&open_event);
 
+    // Open the long-lived `bae.session` telemetry anchor span — a contextual
+    // child of this creating request's `http.request` span — and retain it on
+    // AppState until session close/error. Every `bae.turn` links to it. No-op
+    // (nothing stored) when telemetry is disabled.
+    if let Some(handle) = crate::telemetry::SessionSpanHandle::new(crate::telemetry::session_span(
+        &session.id,
+        &profile_id,
+        &client_key.id,
+    )) {
+        state.insert_session_span(&session.id, handle);
+    }
+
     // Resolve the profile's configured MCP servers against the startup registry
     // and connect to each. Resolution is deliberately at session-creation time
     // (not profile-create time): the registry is server-config-driven and may
@@ -1001,6 +1013,9 @@ pub async fn close(
         mcp.lock().await.shutdown().await;
     }
     state.remove_session_runtime(&session.id);
+    // End the session's telemetry anchor span (no-op when telemetry is off or
+    // the session already ended in error and its span was closed then).
+    state.end_session_span(&session.id, None);
 
     if !closed {
         return Err(ApiError::conflict(
