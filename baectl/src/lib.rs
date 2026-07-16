@@ -14,6 +14,12 @@
 //! - [`output`] — human-readable vs `--json` rendering.
 //! - [`error`] — maps RFC 7807 error bodies and transport failures to exit
 //!   codes (0 success / 1 runtime / 2 usage).
+//! - [`setup`] — the `baectl setup` quickstart wizard: interactive Q&A that
+//!   scaffolds `docker-compose.yml`/`bae-setup.sh` + `.env` + `bae-config.toml`
+//!   locally, then optionally launches and creates a first profile/key. Unlike
+//!   every other command it reads interactive stdin and never links
+//!   [`admin_client`] against the host (the admin port is loopback-only inside
+//!   the container — profile/key creation shells out via `docker exec`).
 //!
 //! `baectl` deliberately does **not** depend on `client-rust`/`bae-rs`: that
 //! crate is the client-port session harness (tool dispatch, hooks, the agent
@@ -25,3 +31,4 @@ pub mod cli;
 pub mod error;
 pub mod keygen;
 pub mod output;
+pub mod setup;

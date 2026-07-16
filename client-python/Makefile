@@ -14,7 +14,13 @@ build: ## Build sdist and wheel into dist/
 
 test: ## Run tests
 	uv sync
-	uv run --no-sync pytest
+	# Invoke pytest as a module rather than the `bin/pytest` console script:
+	# `uv sync` treats an already-populated .venv as satisfied and does not
+	# rewrite console-script shebangs, so a venv relocated from another path
+	# (e.g. a worktree carrying a prebuilt .venv) has a stale `bin/pytest`
+	# interpreter line that fails to spawn. `python -m pytest` execs the venv
+	# interpreter directly and honors the same pyproject.toml config.
+	uv run --no-sync python -m pytest
 
 lint: ## Ruff checks and format check
 	uv run ruff check

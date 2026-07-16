@@ -12,6 +12,45 @@ Get a BAE server running and send your first message in five steps.
 
 ---
 
+## Fastest path: `baectl setup`
+
+The quickest way to get a running server, a profile, and a client key is the
+interactive setup wizard. `baectl setup` runs **on your host**, where your
+container engine lives — it generates a launcher and then drives
+`docker`/`container` on your machine to start the server. (It is *not* run
+inside the image: the production image's entrypoint is `baesrv` and it carries
+no `docker` client, so it can't launch a sibling container from within.)
+
+`baectl` ships as a self-contained static binary inside the published image;
+copy it out once and run it on the host:
+
+```sh
+# Extract the static `baectl` binary from the published image, then run it.
+cid=$(docker create ghcr.io/prettysmartdev/better-agent-engine:latest)
+docker cp "$cid":/usr/local/bin/baectl ./baectl
+docker rm "$cid" >/dev/null
+
+./baectl setup
+```
+
+(If you built from source, use the `baectl` your `make build`/`cargo build`
+produced instead of extracting it.)
+
+It asks a short series of defaulted questions (image variant, provider(s),
+MCP server(s), other `BAE_*` overrides) — hit enter through all of them for a
+working default setup — then writes a `docker-compose.yml`, `.env`, and
+`bae-config.toml` into the current directory and offers to launch
+immediately, creating a first `default` profile and client key for you. See
+the [`baectl setup` reference](../reference/baectl.md#baectl-setup) for the
+exact question list, flags (`--dev`, `--apple` for Apple's `container` CLI,
+`--dir`), and generated-file shapes.
+
+This is a convenience wrapper around the same manual steps below, not a
+replacement for them — read on if you want to understand (or hand-assemble)
+each piece yourself, or if you're scripting a non-interactive deployment.
+
+---
+
 ## 1. Start the server
 
 ### Production image (recommended)

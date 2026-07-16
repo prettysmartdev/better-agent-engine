@@ -32,3 +32,16 @@ thiserror = "2"
 # by the server with no shared code (standard PHC Argon2id on both sides).
 argon2 = "0.5"
 rand = "0.8"
+# `baectl setup` reads back an existing `bae-config.toml`/`.env` on the
+# idempotent Edit path (and to summarize a saved configuration). The generated
+# `bae-config.toml` is *written* by hand-building the string field-by-field (see
+# `setup.rs`'s module doc) — `toml` is used only for reading. Pinned to the same
+# `0.8` line the `server` crate uses so the workspace carries a single TOML
+# implementation (pure-Rust; preserves the static-musl binary requirement).
+toml = "0.8"
+
+[dev-dependencies]
+# `setup` hand-builds TOML to keep the shipping CLI independent of the server.
+# Its tests intentionally parse generated files with the server's actual schema
+# so a schema change cannot silently make wizard output invalid.
+baesrv = { path = "../server" }
