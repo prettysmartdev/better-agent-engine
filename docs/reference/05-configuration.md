@@ -24,11 +24,11 @@ Flag-beats-env-var precedence: when `--config` and `BAE_CONFIG` are both set,
 | `BAE_OTEL_LOG` | `info` | Tracing filter applied to the OpenTelemetry export layer only (independent of `BAE_LOG`). BAE opens its spans at `info`, so the default captures them all; raise or lower this only to change which span *events* (bridged log lines) are exported. Has no effect when `[telemetry]` is disabled. |
 | `BAE_SHUTDOWN_TIMEOUT` | `30` | Seconds for the **whole** graceful shutdown — draining in-flight requests *and* flushing/closing the telemetry exporters — bounded by this single budget. |
 | `BAE_CONFIG` | _(none)_ | Path to a `bae-config.toml` file. Overridden by `--config`. Absence is not an error. |
-| `BAE_TURN_TIMEOUT` | `120` | Seconds a paused turn's owner has to return with its continuation before the turn is considered abandoned and the FIFO gate is released to the next queued driver. See [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration). |
+| `BAE_TURN_TIMEOUT` | `120` | Seconds a paused turn's owner has to return with its continuation before the turn is considered abandoned and the FIFO gate is released to the next queued driver. See [Wire Protocol — FIFO turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration). |
 | `BAE_ADMIN_KEY_FILE` | `/var/lib/bae/admin-key.pem` | Plaintext admin-key file. Written by the server only when it self-generates a key (first boot or `--rotate-admin-key`); read by `baectl`. Overridden by `--admin-key-file`. |
 | `BAE_ADMIN_KEY_HASH_FILE` | `/var/lib/bae/admin-key-hash.pem` | Pre-provisioned Argon2id admin-key hash file (read-only input — the server never writes it). Used for the multi-replica pre-provisioning flow. Overridden by `--admin-key-hash-file`. |
-| `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH` | _(unset)_ | Truthy (`1` or case-insensitive `true`) disables admin-port authentication entirely — the pre-this-feature zero-auth behavior. Also settable via `--dangerously-disable-admin-auth`. **Do not use in production**; see [Admin authentication](../guides/admin-authentication.md#disabling-admin-auth). |
-| `BAE_SANDBOX_DRIVER` | `docker` | Which `SandboxDriver` implementation the server uses to launch sandboxes for [`session.startRemoteSandbox`](client-api.md#sessionstartremotesandbox): `docker` or `apple-container`. Any other value is a startup usage error (exit code 2, `ConfigError::InvalidSandboxDriver`). One driver is chosen server-wide, not per-profile — it reflects what container engine is actually installed on *this host*; `available_sandboxes` (see [Profiles — Available sandboxes](../profiles.md#available-sandboxes)) is the per-profile *image allowlist* layered on top of it. See [Sandboxes](../guides/sandboxes.md). |
+| `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH` | _(unset)_ | Truthy (`1` or case-insensitive `true`) disables admin-port authentication entirely — the pre-this-feature zero-auth behavior. Also settable via `--dangerously-disable-admin-auth`. **Do not use in production**; see [Admin authentication](../guides/09-admin-authentication.md#disabling-admin-auth). |
+| `BAE_SANDBOX_DRIVER` | `docker` | Which `SandboxDriver` implementation the server uses to launch sandboxes for [`session.startRemoteSandbox`](00-client-api.md#sessionstartremotesandbox): `docker` or `apple-container`. Any other value is a startup usage error (exit code 2, `ConfigError::InvalidSandboxDriver`). One driver is chosen server-wide, not per-profile — it reflects what container engine is actually installed on *this host*; `available_sandboxes` (see [Profiles — Available sandboxes](../profiles.md#available-sandboxes)) is the per-profile *image allowlist* layered on top of it. See [Sandboxes](../guides/03-sandboxes.md). |
 
 Provider credentials (e.g. `ANTHROPIC_API_KEY`) are not BAE variables — they
 are referenced from `[providers]` registry entries in `bae-config.toml` using
@@ -37,7 +37,7 @@ are referenced from `[providers]` registry entries in `bae-config.toml` using
 
 ### `baectl` environment variables
 
-`baectl` is a separate binary (see [baectl reference](baectl.md)) with its
+`baectl` is a separate binary (see [baectl reference](03-baectl.md)) with its
 own, client-side, environment variables:
 
 | Variable | Default | Description |
@@ -46,7 +46,7 @@ own, client-side, environment variables:
 | `BAE_ADMIN_TOKEN` | _(unset)_ | Admin bearer token, sent verbatim. Highest-precedence auth source. Overridden by `--admin-token`. |
 | `BAE_ADMIN_KEY_FILE` | `/var/lib/bae/admin-key.pem` | Path `baectl` reads the plaintext admin key from, if `BAE_ADMIN_TOKEN`/`--admin-token` is not set. Same variable name and default path as the server's own `BAE_ADMIN_KEY_FILE` — `baectl` reads the exact file the server wrote. Overridden by `--admin-key-file`. |
 
-See [baectl reference → Auto-configuration](baectl.md#auto-configuration)
+See [baectl reference → Auto-configuration](03-baectl.md#auto-configuration)
 for the full precedence order on both the address and the token.
 
 ---
@@ -79,7 +79,7 @@ vars persist in compose/Kubernetes manifests across restarts), which is the
 opposite of the one-shot action a rotation should be. Passing
 `--rotate-admin-key` together with `--dangerously-disable-admin-auth` (flag
 or env) is a usage error (exit `2`). See
-[Admin authentication](../guides/admin-authentication.md) for the full
+[Admin authentication](../guides/09-admin-authentication.md) for the full
 lifecycle these flags control.
 
 ---
@@ -278,7 +278,7 @@ one asymmetry versus `[mcp]`/`mcp_servers`:
   an unresolvable `mcp_servers` name.
 
 See [Profiles — Fatal primary / non-fatal fallback](../profiles.md#fatal-primary--non-fatal-fallback)
-for the full behavior and [Admin API](admin-api.md#post-adminv1profiles--create) for
+for the full behavior and [Admin API](02-admin-api.md#post-adminv1profiles--create) for
 the profile request/response shape.
 
 ---
@@ -292,7 +292,7 @@ overhead and no outbound OTLP traffic. There is no equivalent client-side
 config surface: the three client SDKs never read `bae-config.toml` and
 instrument themselves against whatever ambient OpenTelemetry SDK the embedding
 application has installed, using each language's own standard OTel
-auto-configuration (see [Building a Client — OpenTelemetry](../guides/building-a-client.md#opentelemetry-traces-and-custom-spans)).
+auto-configuration (see [Building a Client — OpenTelemetry](../guides/01-building-a-client.md#opentelemetry-traces-and-custom-spans)).
 
 ### Example
 
@@ -394,7 +394,7 @@ restart or deploy.
 
 `BAE_SANDBOX_DRIVER` selects which `SandboxDriver` implementation the server
 uses to launch containers for `session.startRemoteSandbox` — see
-[Sandboxes](../guides/sandboxes.md) for the full feature and
+[Sandboxes](../guides/03-sandboxes.md) for the full feature and
 [Profiles — Available sandboxes](../profiles.md#available-sandboxes) for the
 per-profile image allowlist layered on top of it.
 
@@ -454,9 +454,9 @@ Ready-to-run examples are in [`examples/bae-config/`](../../examples/bae-config/
 | [`providers.toml`](../../examples/bae-config/providers.toml) | `[providers]` registry: an Anthropic entry, an OpenAI entry, and an Anthropic-wire-format entry at a self-hosted `base_url`. |
 
 For a hands-on walkthrough using the MCP examples see
-[MCP Servers](../guides/mcp-servers.md); for a multi-driver session walkthrough
+[MCP Servers](../guides/02-mcp-servers.md); for a multi-driver session walkthrough
 that opens a session against a `[providers]`-backed profile see
-[Multi-Client Sessions](../guides/multi-client-sessions.md).
+[Multi-Client Sessions](../guides/07-multi-client-sessions.md).
 
 ---
 
@@ -480,7 +480,7 @@ curl http://127.0.0.1:8081/admin/v1/mcp-servers -H "Authorization: Bearer $ADMIN
 ```
 
 Items are sorted by name. Secrets (`command`, `args`, `url`, `headers`) are
-never returned. See [Admin API](admin-api.md#get-adminv1mcp-servers).
+never returned. See [Admin API](02-admin-api.md#get-adminv1mcp-servers).
 
 ---
 
@@ -505,7 +505,7 @@ curl http://127.0.0.1:8081/admin/v1/providers
 Items are sorted by name. `base_url` is always the **effective** value
 (resolved default when the entry omitted it, or the explicit value
 otherwise) — never `auth_token`. See
-[Admin API](admin-api.md#get-adminv1providers).
+[Admin API](02-admin-api.md#get-adminv1providers).
 
 ---
 
@@ -567,7 +567,7 @@ secret. This endpoint reflects the **same startup snapshot** as the
 `[mcp]`/`[providers]`/`[telemetry]` sections on this page — parsed once at
 boot, with [no hot reload](#no-hot-reload): editing `bae-config.toml` and
 calling this endpoint again returns the old values until `baesrv` is
-restarted. See [Admin API — Config](admin-api.md#config) for the full
+restarted. See [Admin API — Config](02-admin-api.md#config) for the full
 response shape and the redaction convention.
 
 ---
@@ -597,9 +597,9 @@ curl http://127.0.0.1:8081/admin/v1/sandbox-status
 ```
 
 One item **per profile** — never a flat, cross-profile image list, the same
-per-profile scoping [`session.sandbox.available`](message-types.md#sessionsandboxavailable)
+per-profile scoping [`session.sandbox.available`](04-message-types.md#sessionsandboxavailable)
 and `session.startRemoteSandbox` enforce (see
-[Sandboxes — The profile-scoping guarantee](../guides/sandboxes.md#the-profile-scoping-guarantee)).
+[Sandboxes — The profile-scoping guarantee](../guides/03-sandboxes.md#the-profile-scoping-guarantee)).
 Items are sorted by `profile_id`, then by image name within each profile.
 `status` is one of `pending`/`available`/`error`; `detail` is present only on
 `error`. Rebuilt from a fresh `pending` state for every declared image at

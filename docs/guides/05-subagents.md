@@ -259,5 +259,5 @@ provide status or reconcile those tasks. This is an accepted gap; durable
 remote subagent recovery is outside this work item.
 
 For exact parameter, result, error, and event payloads, see the
-[Client API reference](../reference/client-api.md#subagents) and
-[Message Types](../reference/message-types.md#sessionsubagentstart).
+[Client API reference](../reference/00-client-api.md#subagents) and
+[Message Types](../reference/04-message-types.md#sessionsubagentstart).

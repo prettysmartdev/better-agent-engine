@@ -1,6 +1,6 @@
 //! A minimal `fetch`-based wrapper over baesrv's admin port (`/admin/v1/*`).
 //!
-//! Request bodies mirror the shapes documented in `docs/reference/admin-api.md`
+//! Request bodies mirror the shapes documented in `docs/reference/02-admin-api.md`
 //! field-for-field. The request-*building* seam ({@link buildAdminRequest}) is
 //! pure and unit-testable in isolation from the network; {@link AdminClient}
 //! executes those requests with the admin bearer token attached. The browser

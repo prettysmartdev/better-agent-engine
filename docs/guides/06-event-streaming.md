@@ -4,8 +4,8 @@ BAE delivers live events over the JSON-RPC session loop. This page explains how
 to consume them, when to use the subscription model, and how to reconnect
 without gaps.
 
-For the wire-level envelope format see [Wire Protocol](../reference/wire-protocol.md).
-For the event payload catalog see [Message Types](../reference/message-types.md).
+For the wire-level envelope format see [Wire Protocol](../reference/01-wire-protocol.md).
+For the event payload catalog see [Message Types](../reference/04-message-types.md).
 
 ---
 
@@ -85,7 +85,7 @@ stays open indefinitely, emitting `session.event` notifications, until:
 - The client disconnects.
 - `session.unsubscribe` is called (see below).
 - The broadcast channel is overrun (the server emits a `"lagged"` error, see
-  [Wire Protocol](../reference/wire-protocol.md#lagged-subscriber)).
+  [Wire Protocol](../reference/01-wire-protocol.md#lagged-subscriber)).
 
 ### `session.unsubscribe`
 

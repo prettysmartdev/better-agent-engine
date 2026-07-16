@@ -1,7 +1,7 @@
 //! A small `reqwest`-based wrapper over the admin API (`/admin/v1/*`).
 //!
 //! Typed request bodies mirror the JSON shapes documented in
-//! `docs/reference/admin-api.md` and implemented in
+//! `docs/reference/02-admin-api.md` and implemented in
 //! `server/src/api/admin/{profiles,keys}.rs`. Responses are returned as
 //! `serde_json::Value` so `--json` can echo the exact document the server sent
 //! while human rendering ([`crate::output`]) reads the fields it needs — this

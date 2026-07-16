@@ -4,16 +4,39 @@ The canonical BAE example agent, implemented once per client SDK with identical
 behavior across Rust, TypeScript, and Python. It doubles as the parity check
 between the three harnesses (see `aspec/genai/agents.md`).
 
-It registers a single client-side tool, `get_current_time`, opens a session,
-drives the tool-call loop, prints the assistant's final text to **stdout**, and
-logs every hook invocation to **stderr**.
+## What it does
+
+1. Registers one client-side tool, `get_current_time`.
+2. Opens a session against a profile whose `allowed_tools` includes
+   `get_current_time`.
+3. Sends a user turn and drives the harness loop: when the model calls the
+   tool, the handler runs and the result is sent back, repeating until a plain
+   text answer arrives.
+4. Prints the final assistant text to **stdout**; hook and event logs go to
+   **stderr**.
+5. Exercises all five hook points (`before_send`, `after_receive`,
+   `before_tool_call`, `after_tool_call`, `on_event`) — each logs a `[hook …]`
+   line when it fires.
 
 ## Prerequisites
 
-1. A running BAE server (see `docs/quickstart.md`).
-2. A profile whose `allowed_tools` includes `get_current_time`, and whose
-   provider config references your provider key (e.g. `${ANTHROPIC_API_KEY}`).
-3. A client key for that profile (`POST /admin/v1/keys`).
+A running BAE server, a profile that allows `get_current_time`, and a client
+key for that profile. See
+[`docs/guides/00-quickstart.md`](../../../docs/guides/00-quickstart.md) for the
+admin-side setup (create a profile, create a key).
+
+## Configuration (environment)
+
+| Variable               | Default                  | Meaning                              |
+|------------------------|--------------------------|--------------------------------------|
+| `BAE_SERVER_URL`       | `http://localhost:8080`  | Server base URL (client port).       |
+| `BAE_CLIENT_KEY`       | *(required)*             | The `bae_…` client key.              |
+| `BAE_PROVIDER_KEY_ENV` | `ANTHROPIC_API_KEY`      | Name of the provider-key env var the profile references. |
+
+The provider key itself is used **server-side** and never sent by the SDK, but
+the example fails fast with a clear message if it is unset locally, and reports
+the server's `all-providers-failed` outcome (surfaced as `ProvidersFailedError`,
+likely an unset/invalid key on the server) if it happens at runtime.
 
 ## Run
 
@@ -21,23 +44,10 @@ logs every hook invocation to **stderr**.
 cd client-typescript
 npm install
 
-export BAE_CLIENT_KEY=bae_...        # required
+export BAE_CLIENT_KEY=bae_...        # from POST /admin/v1/keys
 export ANTHROPIC_API_KEY=sk-ant-...  # the provider key your profile references
-# optional:
-export BAE_SERVER_URL=http://localhost:8080     # default
-export BAE_PROVIDER_KEY_ENV=ANTHROPIC_API_KEY   # default
 
 npm run example -- "What time is it?"
 ```
 
-## Behavior / failure modes
-
-- Exits `1` with a clear message if `BAE_CLIENT_KEY` or the provider key env var
-  (named by `BAE_PROVIDER_KEY_ENV`) is unset.
-- If the server cannot reach any provider, the `session.sendMessage` turn comes
-  back as a provider-unavailable result; the example catches
-  `ProvidersFailedError`, prints the session events, and exits `1` — the usual
-  cause is a missing/invalid provider key in the _server's_ environment.
-
-Every customization point is exercised: `before_send`, `after_receive`,
-`before_tool_call`, and `after_tool_call` all fire and log a `[hook …]` line.
+The prompt argument is optional (defaults to `"What time is it?"`).

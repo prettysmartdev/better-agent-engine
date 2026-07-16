@@ -84,7 +84,7 @@ make run            # runs baesrv in the dev container (port $PORT)
 The server is entirely environment-driven — no config files are required to
 run, and credentials are never stored in the database. Key variables (see
 [`aspec/devops/operations.md`](aspec/devops/operations.md) and
-[`docs/reference/configuration.md`](docs/reference/configuration.md) for the
+[`docs/reference/05-configuration.md`](docs/reference/05-configuration.md) for the
 complete list):
 
 - `BAE_ADDR` — client-port bind address.

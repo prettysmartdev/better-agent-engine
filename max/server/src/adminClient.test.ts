@@ -24,7 +24,7 @@ describe("buildAdminRequest", () => {
     expect(req.url).toBe("http://127.0.0.1:8081/admin/v1/profiles");
     expect(req.headers.authorization).toBe("Bearer tok");
     expect(req.headers["content-type"]).toBe("application/json");
-    // Field-for-field the admin-api.md shape (order and keys).
+    // Field-for-field the 02-admin-api.md shape (order and keys).
     expect(JSON.parse(req.body!)).toEqual({
       name: "main",
       primary_provider: "anthropic-sonnet",

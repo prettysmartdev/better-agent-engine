@@ -1,6 +1,6 @@
 # @prettysmartdev/bae-ts (TypeScript)
 
-TypeScript client library and customizable agent harness for the
+TypeScript client library and customizable **agent harness** for the
 [Better Agent Engine](../README.md). Thin and stateless by design:
 durable agent state lives on the [server](../server/), and this package gives
 Node.js/TypeScript programs an idiomatic way to drive it. Feature-parity is
@@ -47,22 +47,40 @@ console.log(messageText(reply));
 await session.close();
 ```
 
-### Surface
+## Surface
 
 - **`Config`** — `serverUrl`, `clientKey`, optional `clientVersion`.
 - **`ToolDefinition`** — `{ name, description, input_schema, handler }`; the
   handler receives the `tool_use.input` and returns the result content.
-- **`Harness`** — `registerTool()`, `setHooks()`, `connect() → Session`.
-- **`Session`** — `send(message) → Message` (drives the loop), `close()`.
+- **`Harness`** — register tools and hooks, then `connect()` opens a new session
+  or `join(sessionId)` attaches to an existing one as a second driver; both
+  return a `Session`.
+- **`Session`** — `send(message)` drives the loop to a final assistant turn,
+  `close()` ends the session, and `subscribe()` / `unsubscribe()` tap the live
+  event stream out of band.
+- **`Hooks`** — `before_send`, `after_receive`, `before_tool_call`,
+  `after_tool_call`, and `on_event` (the live event stream); throwing from any
+  hook aborts the loop.
+- **Built-in tools** (opt-in) — `read_file` / `write_file` / `explore_files`
+  (scoped file access), `run_shell_command` / `run_shell_named` (local or
+  server-side sandboxes), and `launch_subagent` (delegate to a CLI); attach them
+  with `registerSandboxTool()` / `registerSubagentTool()`.
 - **Errors** — `ApiError` (RFC 7807 slug in `.type`), `ProvidersFailedError`
-  (a `502`, carrying the session `events`), `UnknownToolError`, `ToolError`,
-  `HookError`, `TransportError`.
-- **Events** — `SessionEvent` is a discriminated union over all 12 event types;
+  (a `502`, carrying the session `events`), `RpcError`, `UnknownToolError`,
+  `ToolError`, `HookError`, `TransportError`.
+- **Events** — `SessionEvent` is a discriminated union over all 27 event types;
   `describeEvent()` demonstrates the exhaustive match.
 
+## Example
+
 A runnable `reference-assistant` agent lives in
-[`examples/reference-assistant/`](./examples/reference-assistant/); run it with
-`npm run example -- "What time is it?"`.
+[`examples/reference-assistant/`](./examples/reference-assistant/): it registers
+`get_current_time`, opens a session, drives the loop, prints the reply, and
+exercises every hook point. Run it with:
+
+```sh
+npm run example -- "What time is it?"
+```
 
 ## Develop
 

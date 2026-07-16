@@ -3,8 +3,8 @@
 Precise schema for `bae-schedules.toml`, `bae-api.toml`/`bae-app.toml`, every
 new `BAE_*` env var the three launcher base images read, and `baeapi`'s fixed
 routes — at the same precision level as
-[Configuration](configuration.md). For a walkthrough see
-[Harness Launchers](../guides/harness-launchers.md).
+[Configuration](05-configuration.md). For a walkthrough see
+[Harness Launchers](../guides/11-harness-launchers.md).
 
 Launchers are **base images** (`FROM`-extended by your own Dockerfile, never
 run standalone) that package one or more of your own agent harnesses and

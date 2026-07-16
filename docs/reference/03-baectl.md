@@ -1,6 +1,6 @@
 # baectl Reference
 
-`baectl` is a command-line HTTP client for the [admin API](admin-api.md)
+`baectl` is a command-line HTTP client for the [admin API](02-admin-api.md)
 (`/admin/v1/*`). It ships as a static binary at `/usr/local/bin/baectl` inside
 both the dev and production images, alongside `baesrv`. Run it with
 `docker exec`/`container exec` against a running container — it needs no Rust
@@ -16,7 +16,7 @@ command, [`baectl setup`](#baectl-setup), that generates a runnable
 deployment (compose file/script, `.env`, `bae-config.toml`) before a server
 exists to talk to. It does not open sessions or send messages — those hit the
 client port (8080) with a client/session key and are documented in the
-[Client API](client-api.md) and the [guides](../guides/quickstart.md).
+[Client API](00-client-api.md) and the [guides](../guides/00-quickstart.md).
 
 ---
 
@@ -59,7 +59,7 @@ Precedence, highest to lowest:
 `--admin-token`, `--admin-key-file`, and `--admin-addr` are global flags —
 valid before or after the subcommand, on every command.
 
-See [Admin authentication](../guides/admin-authentication.md) for how the
+See [Admin authentication](../guides/09-admin-authentication.md) for how the
 server-side key file is created and rotated.
 
 ---
@@ -98,7 +98,7 @@ baectl create profile <name> <primary_provider> [flags]
 | Positional | Description |
 |---|---|
 | `name` | Unique profile name. |
-| `primary_provider` | The **name** of a `[providers]` entry declared in `bae-config.toml` (e.g. `anthropic-sonnet`) — not a provider id or model. See [Configuration — `[providers]`](configuration.md#providers). |
+| `primary_provider` | The **name** of a `[providers]` entry declared in `bae-config.toml` (e.g. `anthropic-sonnet`) — not a provider id or model. See [Configuration — `[providers]`](05-configuration.md#providers). |
 
 **Flags (optional):**
 
@@ -113,7 +113,7 @@ baectl create profile <name> <primary_provider> [flags]
 names against the live MCP/provider registries — both registries are
 config-file-driven and can differ across restarts. A typo'd MCP server name
 is caught non-fatally at session-creation time (see
-[MCP Servers](../guides/mcp-servers.md#non-fatal-skips)); an unresolvable
+[MCP Servers](../guides/02-mcp-servers.md#non-fatal-skips)); an unresolvable
 `primary_provider` is **fatal** at session-creation time (see
 [Profiles — Fatal primary / non-fatal fallback](../profiles.md#fatal-primary--non-fatal-fallback)).
 `baectl` never builds or sends provider config (URL, auth token, max
@@ -298,7 +298,7 @@ baectl delete key <id>
 ```
 
 Revokes the client key (cascades to its session keys and open sessions — see
-[Admin API → Client Keys](admin-api.md#client-keys)). No flags.
+[Admin API → Client Keys](02-admin-api.md#client-keys)). No flags.
 
 **Output:** `revoked key <id>` on stdout.
 
@@ -313,7 +313,7 @@ baectl auth create key [--name <NAME>] [--out-dir <DIR>]
 **This command never calls the admin API.** It is a local key-generation
 utility for pre-provisioning one shared admin credential across multiple
 independent server replicas. See
-[Admin authentication → multi-replica walkthrough](../guides/admin-authentication.md#multi-replica-pre-provisioning)
+[Admin authentication → multi-replica walkthrough](../guides/09-admin-authentication.md#multi-replica-pre-provisioning)
 for the full flow.
 
 | Flag | Description |
@@ -344,7 +344,7 @@ for the full flow.
 The token is generated with 192 bits of CSPRNG entropy (24 random bytes,
 hex-encoded) and hashed with Argon2id using the exact same parameters as the
 server (memory 64 MiB, iterations 3, parallelism 1, output 32 bytes) — see
-[Key security](admin-api.md#key-security). Because Argon2id's PHC string
+[Key security](02-admin-api.md#key-security). Because Argon2id's PHC string
 embeds its own salt and cost parameters, the hash `baectl` produces is
 independently verifiable by the server with no shared code between the two
 binaries.
@@ -378,10 +378,17 @@ server in the same invocation.
 container engine (`docker compose up -d` / `./bae-setup.sh`), so it must run
 where that engine is — not inside the production image, whose entrypoint is
 `baesrv` and which carries no `docker`/`container` client. `baectl` ships as a
-self-contained static binary inside the image; the
-[Quickstart](../guides/quickstart.md#fastest-path-baectl-setup) shows how to
-copy it out (`docker create` + `docker cp`) and run it, or use the `baectl` a
-source build produced.
+self-contained static binary inside the image; copy it out once and run it on
+the host:
+
+```sh
+cid=$(docker create ghcr.io/prettysmartdev/better-agent-engine:latest)
+docker cp "$cid":/usr/local/bin/baectl ./baectl
+docker rm "$cid" >/dev/null
+./baectl setup
+```
+
+(Or use the `baectl` a source build produced.)
 
 **Flags:**
 
@@ -567,7 +574,7 @@ auth_token = "${ANTHROPIC_API_KEY}"
 **`[telemetry]` is never emitted** — an absent section keeps telemetry
 disabled per `config_file.rs`'s contract. Add it by hand afterward if you
 want OpenTelemetry export (see
-[Configuration — `[telemetry]`](configuration.md#telemetry)).
+[Configuration — `[telemetry]`](05-configuration.md#telemetry)).
 
 **`.env`** (mode `0600`) — a provenance header, then secrets (provider auth
 vars in provider order, then MCP secret vars, then any remaining secret such
@@ -745,7 +752,7 @@ command results, so it stays scriptable.
 ## Errors
 
 Every non-2xx admin API response is an RFC 7807 problem document (see
-[Admin API → Errors](admin-api.md#errors)). `baectl` matches on the `type`
+[Admin API → Errors](02-admin-api.md#errors)). `baectl` matches on the `type`
 slug and maps it to a clean, actionable message (always exit `1`):
 
 | `type` | `baectl` message |
@@ -785,10 +792,10 @@ baectl: unexpected response from admin API — check that baectl and the server 
 
 ## See also
 
-- [Admin API reference](admin-api.md) — the underlying REST surface `baectl` wraps.
-- [Admin authentication guide](../guides/admin-authentication.md) — how the
+- [Admin API reference](02-admin-api.md) — the underlying REST surface `baectl` wraps.
+- [Admin authentication guide](../guides/09-admin-authentication.md) — how the
   bootstrap key is created, rotated, disabled, and pre-provisioned.
-- [Configuration reference](configuration.md) — every `BAE_*` env var,
+- [Configuration reference](05-configuration.md) — every `BAE_*` env var,
   including the ones `baectl` reads.
 - [`aspec/uxui/cli.md`](../../aspec/uxui/cli.md) — CLI design conventions
   shared by `baesrv` and `baectl`.

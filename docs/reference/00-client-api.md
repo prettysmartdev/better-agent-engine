@@ -2,7 +2,7 @@
 
 The client API is served on `BAE_ADDR` (default `0.0.0.0:8080`). This is the
 only port SDKs and agents communicate with; admin operations use the separate
-admin port (see [admin-api.md](admin-api.md)).
+admin port (see [02-admin-api.md](02-admin-api.md)).
 
 The client port is a **hybrid**:
 - **REST/HTTP** for management — session open/close, metadata, event replay.
@@ -11,7 +11,7 @@ The client port is a **hybrid**:
 
 All REST endpoints use `Content-Type: application/json` with `snake_case` field
 names. The `/rpc` endpoint uses `Content-Type: application/x-ndjson`. See
-[Wire Protocol](wire-protocol.md) for transport details.
+[Wire Protocol](01-wire-protocol.md) for transport details.
 
 ---
 
@@ -86,7 +86,7 @@ Every non-2xx response from REST endpoints follows RFC 7807:
 > a bad key returns `401` (RFC 7807). Once the stream is open, session-state
 > errors (session not open, profile deleted mid-session) are delivered as
 > JSON-RPC error objects inside the NDJSON stream — not as HTTP error codes.
-> See [Wire Protocol — Error codes](wire-protocol.md#error-codes).
+> See [Wire Protocol — Error codes](01-wire-protocol.md#error-codes).
 
 ---
 
@@ -157,7 +157,7 @@ Auth: **client key**.
   allowed. `description` and `input_schema` are optional per tool.
 - `sandbox_tools` — optional, default `[]`. **Auto-mode** sandbox tool
   declarations (see [Sandboxes guide — Auto vs. manual remote
-  dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)): the
+  dispatch](../guides/03-sandboxes.md#auto-vs-manual-remote-dispatch)): the
   server dispatches these directly against the session's remote sandbox
   inside `run_turn`, without ever pausing the loop or involving the client.
   Stored per-client, sibling to (never merged with) `tools`. **Not** validated
@@ -237,7 +237,7 @@ the session — that's the point of this endpoint.
 `tools` are validated against the **shared** profile's `allowed_tools`,
 exactly like `create`. A joining client declares its own, independent tool
 set — joining never merges with, replaces, or reads any other client's
-declared tools. See [Message Types — `session.join`](message-types.md#sessionjoin).
+declared tools. See [Message Types — `session.join`](04-message-types.md#sessionjoin).
 
 **Response `201 Created`:** identical shape to `create`:
 
@@ -277,8 +277,8 @@ infrastructure established once, at create.
    profile's `allowed_tools` (validated independently of what the creator or
    any other joiner declared).
 
-See [Multi-Client Sessions](../guides/multi-client-sessions.md) for a
-worked example and [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+See [Multi-Client Sessions](../guides/07-multi-client-sessions.md) for a
+worked example and [Wire Protocol — FIFO turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration)
 for what happens once both clients start sending messages.
 
 ---
@@ -334,7 +334,7 @@ GET /api/v1/sessions/ses_…/events?limit=100&cursor=
 }
 ```
 
-See [message-types.md](message-types.md) for the full `event_type` catalog and
+See [04-message-types.md](04-message-types.md) for the full `event_type` catalog and
 payload shapes.
 
 ---
@@ -371,7 +371,7 @@ JSON-RPC 2.0 request object and responds with an `application/x-ndjson` stream
 of JSON-RPC objects: zero or more `session.event` notifications, followed by a
 terminal response (or no terminal response for `session.subscribe` while active).
 
-See [Wire Protocol](wire-protocol.md) for the envelope format, framing rules,
+See [Wire Protocol](01-wire-protocol.md) for the envelope format, framing rules,
 and error codes.
 
 **Request:**
@@ -408,7 +408,7 @@ The eleven supported `method` values are `session.registerDriver`,
 `session.startRemoteSandbox`, `session.stopRemoteSandbox`,
 `session.execRemoteSandbox`, `session.reportLocalSandbox` (the last four are
 documented in [Sandboxes](#sandboxes) below; see the
-[Sandboxes guide](../guides/sandboxes.md) for a walkthrough),
+[Sandboxes guide](../guides/03-sandboxes.md) for a walkthrough),
 `session.reportLocalSubagent`, `session.cancelSubagent`, and
 `session.updateClientTools` (see [Subagents](#subagents)).
 
@@ -420,7 +420,7 @@ Register the calling connection's client key as a **driver** on this session
 — required once before that client key's first `session.sendMessage` call.
 SDK harnesses call this automatically as part of `connect()`/`join()`;
 application code normally never calls it directly. See
-[Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+[Wire Protocol — FIFO turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration)
 for the full driver/observer model.
 
 **Params:** `{}`
@@ -599,7 +599,7 @@ session moves to `error`, so its incomplete durable tool exchange can never be
 replayed upstream. A plain user message is instead an explicit abandonment:
 the server synthesizes error results for unanswered client ids, preserves the
 plain content, and keeps the session open. See [Wire Protocol — FIFO
-turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration)
 for how the pause/resume gate itself works.
 
 **Provider failure:**
@@ -627,7 +627,7 @@ session, this call **blocks** — its NDJSON response opens but stays silent
 abandoned. This is not an error: no bytes means "still queued," not "stuck."
 Apply your own client-side request timeout if you'd rather give up than wait
 indefinitely — the server itself never times out a queued (not yet started)
-message. See [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration)
+message. See [Wire Protocol — FIFO turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration)
 for the full ordering, ownership, and abandonment-timeout semantics.
 
 ---
@@ -659,7 +659,7 @@ response while the subscription is active.** The stream ends on:
 - Client disconnect.
 - A `session.unsubscribe` call from any connection.
 - A `"lagged"` error notification (broadcast channel overrun — see
-  [Wire Protocol](wire-protocol.md#lagged-subscriber)).
+  [Wire Protocol](01-wire-protocol.md#lagged-subscriber)).
 
 Live events follow the same filter rule as `sendMessage` notifications: only
 non-client-generated events are forwarded.
@@ -688,7 +688,7 @@ End all active `session.subscribe` streams for this session.
 
 The four methods below implement the remote-sandbox lifecycle and
 client-originated local-sandbox telemetry described in the
-[Sandboxes guide](../guides/sandboxes.md). All four require prior driver
+[Sandboxes guide](../guides/03-sandboxes.md). All four require prior driver
 registration (`session.registerDriver`), the same `-32001` gate
 `session.sendMessage` uses.
 
@@ -731,7 +731,7 @@ or `session.sandbox.error` (`{"image", "phase":"start", "detail", "dispatch":"re
 - `-32602` — missing or blank `image`.
 - `-32000` — session not open, the profile was deleted, or **a sandbox is
   already running for this session** (one sandbox per session — see
-  [Sandboxes guide — Session-wide, not per-driver](../guides/sandboxes.md#session-wide-not-per-driver)).
+  [Sandboxes guide — Session-wide, not per-driver](../guides/03-sandboxes.md#session-wide-not-per-driver)).
 - `-32011 sandbox_image_not_allowed` — `image` is not in **this session's
   own** profile's `available_sandboxes`, including an image declared only on
   a *different* profile. No container is started.
@@ -780,7 +780,7 @@ with `"reason": "session_close"` instead of `"explicit"`.
 Run one shell command in the session's already-started remote sandbox and
 return the raw result. This is a **manual-dispatch utility call**, not part
 of the turn loop — see [Sandboxes guide — Auto vs. manual remote
-dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch). The caller
+dispatch](../guides/03-sandboxes.md#auto-vs-manual-remote-dispatch). The caller
 (the client harness) builds its own `tool_result` from the response and
 sends it via an ordinary `session.sendMessage` continuation.
 
@@ -823,7 +823,7 @@ Report a lifecycle transition for a **local** sandbox — one the calling
 client harness started against its own Docker/Apple Containers engine,
 invisible to the server otherwise. Every SDK's builtin sandbox tools call
 this automatically; see [Sandboxes guide — Local sandboxes report their own
-lifecycle](../guides/sandboxes.md#local-sandboxes-report-their-own-lifecycle).
+lifecycle](../guides/03-sandboxes.md#local-sandboxes-report-their-own-lifecycle).
 
 **Params:**
 
@@ -870,7 +870,7 @@ to the caller's `client_key_id`.
 ## Subagents
 
 These methods support the native CLI-subagent tools described in the
-[Subagents guide](../guides/subagents.md). They use the same JSON-RPC/NDJSON
+[Subagents guide](../guides/05-subagents.md). They use the same JSON-RPC/NDJSON
 transport and driver-registration gate as the sandbox methods above. A
 subagent launch is asynchronous: the launch tool returns a `started`
 acknowledgment, while a status tool returns the eventual output.
@@ -1033,7 +1033,7 @@ blocks:
 The server passes these through to/from the provider verbatim, except that
 `dispatch` (and the reserved `caller` field) are stripped from `tool_use`
 blocks before the provider ever sees them — see [Message Types —
-`server.message.send`](message-types.md#servermessagesend).
+`server.message.send`](04-message-types.md#servermessagesend).
 
 A `tool_use` block in a `server.message.send` event carries `dispatch`, one of
 `"client"`, `"sandbox"`, `"mcp"`, or `"subagent"`, whenever the turn paused for at least one

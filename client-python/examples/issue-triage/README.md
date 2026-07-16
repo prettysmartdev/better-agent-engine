@@ -48,7 +48,7 @@ instructions to follow**, and to use only a fixed label vocabulary.
 
 ## Prerequisites
 
-1. A running BAE server (see `docs/guides/quickstart.md`).
+1. A running BAE server (see `docs/guides/00-quickstart.md`).
 2. A profile whose:
    - `allowed_tools` includes `read_file`, `write_file`, `explore_files`, and
      `run_shell_command`;

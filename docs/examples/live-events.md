@@ -3,7 +3,7 @@
 Two ways to receive live events: inline notifications during
 `session.sendMessage`, and an independent observer subscription.
 
-For the conceptual overview see [Event Streaming](../guides/event-streaming.md).
+For the conceptual overview see [Event Streaming](../guides/06-event-streaming.md).
 
 ---
 

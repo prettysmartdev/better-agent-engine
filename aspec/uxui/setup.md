@@ -4,14 +4,14 @@
 
 Download:
 - Operators: pull the published Docker image (`docker pull ghcr.io/prettysmartdev/better-agent-engine`) or build it from source with `make image`.
-- Operators who also want the MAX web dashboard: pull the `-max`-suffixed tag from the same repository instead (`docker pull ghcr.io/prettysmartdev/better-agent-engine:max`) or build it from source with `make image-max`. See [docs/guides/max-webapp.md](../../docs/guides/max-webapp.md).
+- Operators who also want the MAX web dashboard: pull the `-max`-suffixed tag from the same repository instead (`docker pull ghcr.io/prettysmartdev/better-agent-engine:max`) or build it from source with `make image-max`. See [docs/guides/10-max-webapp.md](../../docs/guides/10-max-webapp.md).
 - Agent developers: install a client library from its registry — `cargo add bae-rs`, `npm install @prettysmartdev/bae-ts`, or `uv add bae-py` — and point it at a running server.
 
 Initial configuration:
 - Start the server with a persistent volume: `docker run -p 8080:8080 -v bae-data:/var/lib/bae <image>`. First run creates the database, applies migrations, and generates the bootstrap admin API key — written to `BAE_ADMIN_KEY_FILE` on the data volume (default `/var/lib/bae/admin-key.pem`, `0600` permissions), **not** printed to stdout/logs (a log line can end up shipped to a log aggregator and can't be read programmatically the moment the container starts; a file on the data volume can be).
 - Set `BAE_ADDR`/`BAE_DB_PATH`/`BAE_LOG` via environment only if the defaults don't fit; verify liveness with `GET /healthz`.
-- Read the bootstrap admin key with `docker exec bae cat /var/lib/bae/admin-key.pem`, or use [`baectl`](../../docs/reference/baectl.md), which reads that same file automatically with zero configuration when run via `docker exec`/`container exec`. With the bootstrap admin key, create per-developer `agent` keys via `baectl create key`/the admin API; developers configure their client with the server URL and their key (typically `BAE_URL`/`BAE_API_KEY` in their own environment).
-- See [Admin authentication](../../docs/guides/admin-authentication.md) for the full bootstrap/rotation/multi-replica-provisioning walkthrough.
+- Read the bootstrap admin key with `docker exec bae cat /var/lib/bae/admin-key.pem`, or use [`baectl`](../../docs/reference/03-baectl.md), which reads that same file automatically with zero configuration when run via `docker exec`/`container exec`. With the bootstrap admin key, create per-developer `agent` keys via `baectl create key`/the admin API; developers configure their client with the server URL and their key (typically `BAE_URL`/`BAE_API_KEY` in their own environment).
+- See [Admin authentication](../../docs/guides/09-admin-authentication.md) for the full bootstrap/rotation/multi-replica-provisioning walkthrough.
 
 Superuser access:
 - The bootstrap admin key is the superuser credential: its plaintext exists only in `BAE_ADMIN_KEY_FILE` on the data volume (only an Argon2id hash is stored in the database); rotate it after initial setup with `baesrv --rotate-admin-key`, which revokes the old key and writes a fresh one to the same file. Because this volume now holds live credential material, restrict its access accordingly (see devops/infrastructure.md).

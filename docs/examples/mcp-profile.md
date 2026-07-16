@@ -3,7 +3,7 @@
 Configure an MCP server, create a profile that uses it, open a session, and
 trigger the tool. Shown in raw curl.
 
-For the full guided walkthrough see [MCP Servers](../guides/mcp-servers.md).
+For the full guided walkthrough see [MCP Servers](../guides/02-mcp-servers.md).
 
 ---
 
@@ -25,7 +25,7 @@ curl http://127.0.0.1:8081/admin/v1/mcp-servers -H "Authorization: Bearer $ADMIN
 ## Create a profile with `mcp_servers`
 
 Assumes `bae-config.toml` also declares an `anthropic-sonnet` `[providers]`
-entry (see [Configuration — `[providers]`](../reference/configuration.md#providers)).
+entry (see [Configuration — `[providers]`](../reference/05-configuration.md#providers)).
 
 ```sh
 PROFILE_ID=$(docker exec bae baectl create profile fs-assistant anthropic-sonnet \

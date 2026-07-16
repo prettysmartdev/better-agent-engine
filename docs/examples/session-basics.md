@@ -120,4 +120,4 @@ BAE_CLIENT_KEY=bae_… npm run example
 `session.send` streams notifications internally. Once it resolves, `reply` is
 the final `{role, content}` object. The SDK fires `on_event` for each
 notification if you set that hook — see
-[Building a Client](../guides/building-a-client.md) for the hook API.
+[Building a Client](../guides/01-building-a-client.md) for the hook API.

@@ -23,17 +23,33 @@
   tool call, and result is persisted server-side in SQLite. Restart a client,
   swap it for another, or reconnect after a crash — the full history is still
   there, and you can replay it from any point.
-- ** True multiplayer built in.** Multiple client harnesses and users can connect
-  to the same session simultaneously, each bringing their own set of local tools, 
-  and all able to drive prompts while recieving a live stream of the entire session.
+- **True multiplayer built in.** Multiple client harnesses and users can connect
+  to the same session simultaneously, each bringing their own set of local tools,
+  and all able to drive prompts while receiving a live stream of the entire session.
 - **A harness you actually control.** The agent loop, tool dispatch, and prompting
   strategy are code *you* compose and override — not a black box. The wire
   protocol is extremely simple, allowing client harnesses to remain extremely lightweight.
 - **Your language, your patterns.** First-class client libraries for **TypeScript,
   Python, and Rust**, at feature parity. Every capability exists in all three,
   designed for each language's own conventions.
-- **Batteries included.** Built-in sandboxes, file tools, and server-managed MCP
-  servers mean you're wiring together capabilities, not reimplementing them for every agent.
+- **Batteries included.** Built-in sandboxes, scoped file tools, server-managed
+  MCP servers, and native CLI subagents mean you're wiring together capabilities,
+  not reimplementing them for every agent.
+- **Any model, any endpoint — with a fallback.** Providers are declared by *wire
+  format* (Anthropic Messages API or OpenAI Chat Completions), not by vendor, so
+  any compatible endpoint works through its own `base_url`. Each profile names a
+  primary provider plus an ordered chain of fallbacks that are tried automatically
+  when one fails.
+- **Deploy it the way you run.** Ship agents as **cron jobs, HTTP APIs, or chat
+  web apps** with `harness launchers`, administer everything from the **MAX**
+  browser dashboard, or script it all with the **`baectl`** admin CLI.
+- **Observability included.** Live event streaming and read-only observers let you
+  watch any session as it runs, and OpenTelemetry is wired through both the client
+  SDKs (zero-config spans) and the server (OTLP trace and metric export).
+
+**→ Ready to try it? The [Quickstart](docs/guides/00-quickstart.md) takes you from a
+running server, through a client harness example in your language, to an agent
+you chat with in the browser.**
 
 
 ## The hybrid cloud/local model
@@ -154,19 +170,47 @@ do from any browser (desktop, tablet, or phone).
 Because MAX is a pure API client, everything it does is also possible via the `baesrv` admin API.
 
 
+## Ship agents as cron jobs, APIs, or web apps: harness launchers
+
+A finished harness still needs *something* to trigger it. The launcher base
+images give you three trigger models with none of the scheduling, HTTP-server,
+or process-supervision code you'd otherwise write yourself. You `FROM`-extend
+one base image, `COPY` in your harness (any language, with or without a BAE SDK)
+and a config file, and ship it.
+
+| Image | Triggered by | HTTP surface |
+|---|---|---|
+| `bae-launcher-schedule` | a cron schedule | none, by design |
+| `bae-launcher-api` | `POST /agents/{name}/trigger` | JSON in, NDJSON out |
+| `bae-launcher-webapp` | a built-in chat UI (which calls the same trigger API) | static SPA **plus** the trigger API |
+
+One image can bundle a whole family of related agents, incoming request bodies
+are validated against a per-agent JSON Schema, and secrets are injected as
+`${VAR}` at spawn time and never logged. Ready-to-run examples for all three
+live in [`examples/launchers/`](examples/launchers/); the full walkthrough is in
+the [Harness Launchers guide](docs/guides/11-harness-launchers.md).
+
+
 ## Quickstart
+
+The fastest path is the **`baectl setup`** wizard: extract the bundled `baectl`
+binary from the image and run it to scaffold `docker-compose.yml`, `.env`, and
+`bae-config.toml`, launch the server, and mint your first profile and client
+key. Prefer to start the server by hand?
 
 ```sh
 docker run -p 8080:8080 -v bae-data:/var/lib/bae ghcr.io/prettysmartdev/better-agent-engine:latest
 curl http://localhost:8080/healthz
 ```
 
-Then create a profile and client key, exchange the key for a session, and send a
-message. Full walkthrough: [`docs/guides/quickstart.md`](docs/guides/quickstart.md).
+Then create a profile and client key (with `baectl` or the admin API) and drive
+it. The full walkthrough takes you from the running server through a client
+harness example in the language of your choice to serving an agent in the
+browser with the webapp launcher: [`docs/guides/00-quickstart.md`](docs/guides/00-quickstart.md).
 
 Want the dashboard? Run the `bae-max` variant instead —
 `ghcr.io/prettysmartdev/better-agent-engine:max` — and open MAX in your browser.
-See the [MAX Webapp guide](docs/guides/max-webapp.md).
+See the [MAX Webapp guide](docs/guides/10-max-webapp.md).
 
 ## Project status
 
@@ -175,14 +219,23 @@ Early Beta. The project architecture is in place but libraries, APIs, and wire p
 ## Learn more
 
 - **[Documentation](docs/README.md)** — guides, API reference, and worked examples.
-- **[Quickstart](docs/guides/quickstart.md)** — your first session, end to end.
-- **[Multi-Client Sessions](docs/guides/multi-client-sessions.md)** — the
+- **[Quickstart](docs/guides/00-quickstart.md)** — your first session, end to end.
+- **[Multi-Client Sessions](docs/guides/07-multi-client-sessions.md)** — the
   multiplayer driver/observer model in practice.
-- **[Sandboxes](docs/guides/sandboxes.md)** and
-  **[File Tools](docs/guides/file-tools.md)** — safe, scoped execution.
-- **[MCP Servers](docs/guides/mcp-servers.md)** — attach real MCP tools to a profile.
-- **[Building a Client](docs/guides/building-a-client.md)** — the harness API in
+- **[Sandboxes](docs/guides/03-sandboxes.md)** and
+  **[File Tools](docs/guides/04-file-tools.md)** — safe, scoped execution.
+- **[Native CLI Subagents](docs/guides/05-subagents.md)** — delegate a task to an
+  external CLI such as `claude` or `codex`.
+- **[MCP Servers](docs/guides/02-mcp-servers.md)** — attach real MCP tools to a profile.
+- **[Profiles](docs/profiles.md)** — providers, fallback chains, tool allowlists,
+  and sandbox-image and MCP-server wiring.
+- **[Event Streaming](docs/guides/06-event-streaming.md)** — consume the live event
+  feed and subscribe as an observer.
+- **[Harness Launchers](docs/guides/11-harness-launchers.md)** — trigger your agents
+  by cron, HTTP, or a chat web app.
+- **[Building a Client](docs/guides/01-building-a-client.md)** — the harness API in
   Rust, TypeScript, and Python.
+- **[`baectl`](docs/reference/03-baectl.md)** — the admin CLI for profiles and keys.
 
 ## Contributing & development
 

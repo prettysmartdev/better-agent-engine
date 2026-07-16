@@ -20,7 +20,7 @@ All three SDKs expose the same conceptual surface:
    *second* client key (same profile) to a session another driver already
    opened (`POST /api/v1/sessions/{id}/join`); returns a `Session` object
    shaped identically to `connect()`'s. See
-   [Multi-Client Sessions](multi-client-sessions.md).
+   [Multi-Client Sessions](07-multi-client-sessions.md).
 6. **Send** — `session.send(message)` runs the full JSON-RPC turn loop until a
    final text response, dispatching tool calls as needed.
 7. **Subscribe** — `session.subscribe(callback, since_event_id?)` registers
@@ -37,7 +37,7 @@ This is required before `session.send()`: a `session.sendMessage` call from a
 client key that skipped registration is rejected with JSON-RPC `-32001`. The
 harness's automatic call means you'll only ever see `-32001` if you bypass
 the harness and drive the raw `/rpc` transport yourself. See
-[Client API — `session.registerDriver`](../reference/client-api.md#sessionregisterdriver).
+[Client API — `session.registerDriver`](../reference/00-client-api.md#sessionregisterdriver).
 
 ---
 
@@ -274,7 +274,7 @@ in TS/Python, throwing an error does the same.
 All three SDKs instrument themselves automatically — with no configuration
 and no BAE-specific tracing API to learn. This is a client-side complement to
 `baesrv`'s own `[telemetry]`-driven server export (see
-[Configuration — `[telemetry]`](../reference/configuration.md#telemetry)): the
+[Configuration — `[telemetry]`](../reference/05-configuration.md#telemetry)): the
 two are deliberately different mechanisms, because a harness is a library
 embedded in *your* application, not a standalone deployed service with its own
 SDK bring-up.
@@ -317,7 +317,7 @@ driver/subscription calls) injects the current ambient trace context as a W3C
 `traceparent` (+ `tracestate`) header using your OTel SDK's own propagator —
 this is what lets the harness's span become the parent of `baesrv`'s
 server-side spans for that same request, joining client and server work into
-one trace. See [Wire Protocol — Trace context propagation](../reference/wire-protocol.md#trace-context-propagation)
+one trace. See [Wire Protocol — Trace context propagation](../reference/01-wire-protocol.md#trace-context-propagation)
 for the header contract.
 
 ### Adding your own spans — no BAE API needed
@@ -417,4 +417,4 @@ terminal response.
 
 The SDK handles all NDJSON framing internally. You never interact with raw
 JSON-RPC objects unless you are building a custom transport. See
-[Wire Protocol](../reference/wire-protocol.md) for the full specification.
+[Wire Protocol](../reference/01-wire-protocol.md) for the full specification.

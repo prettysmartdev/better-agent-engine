@@ -74,7 +74,7 @@ def get_current_time(inp: dict) -> str:
 
 
 def build_hooks() -> tuple[Hooks, dict[str, int]]:
-    """Wire up all four hook points; each just logs to stderr and bumps a
+    """Wire up all five hook points; each just logs to stderr and bumps a
     counter so we can assert on exit that every point fired."""
     counts = {
         "before_send": 0,

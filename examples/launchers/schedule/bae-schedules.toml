@@ -19,7 +19,7 @@ schedule    = "*/30 * * * * *"   # 6-field cron (sec min hour day month day-of-w
 # A second, independently-scheduled agent in the SAME image/container — proves
 # the "N agents per image" shape even in this minimal example. It runs on its
 # own timer with its own overlap guard; a slow/hung `hello-cron` never delays
-# this one, and vice versa (see docs/guides/harness-launchers.md).
+# this one, and vice versa (see docs/guides/11-harness-launchers.md).
 [[agents]]
 name        = "hourly-check"
 command     = "/usr/local/bin/example-harness"

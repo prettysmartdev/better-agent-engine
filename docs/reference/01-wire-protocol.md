@@ -5,7 +5,7 @@ The client port (`BAE_ADDR`, default `0.0.0.0:8080`) is a **hybrid**:
 - **REST/HTTP** for management operations — session open/close, metadata,
   event history. These endpoints accept a single JSON body and return a single
   buffered JSON response, exactly as documented in the
-  [Client API](client-api.md).
+  [Client API](00-client-api.md).
 - **JSON-RPC 2.0 over NDJSON** for the session loop — one endpoint,
   `POST /api/v1/sessions/{id}/rpc`, carries all live-interaction methods.
 
@@ -13,7 +13,7 @@ The admin port (`BAE_ADMIN_ADDR`, default `127.0.0.1:8081`) is **REST/HTTP
 throughout** — no JSON-RPC anywhere on the admin port.
 
 This page documents the JSON-RPC transport mechanics. For method params and
-result shapes see [Client API — `/rpc` methods](client-api.md#post-apiv1sessionsidrpc--json-rpc-session-loop).
+result shapes see [Client API — `/rpc` methods](00-client-api.md#post-apiv1sessionsidrpc--json-rpc-session-loop).
 
 ---
 
@@ -37,7 +37,7 @@ Send a single JSON object:
 | `jsonrpc` | yes | must be the string `"2.0"` |
 | `id` | recommended | any JSON string or integer — echoed back on the terminal response. Omitting `id` makes the request a **notification**: the server performs the method's side effect but sends **no terminal response** (not even an error). Always send an `id` unless you deliberately want fire-and-forget. |
 | `method` | yes | one of `session.registerDriver`, `session.sendMessage`, `session.subscribe`, `session.unsubscribe` |
-| `params` | yes | method-specific object (see [Client API](client-api.md)) |
+| `params` | yes | method-specific object (see [Client API](00-client-api.md)) |
 
 ### Notification (server → client)
 
@@ -105,7 +105,7 @@ newline-terminated JSON objects written as the session progresses:
 - A client needs to branch only once: **does this object have an `id`?**
 
 Every other client-port endpoint returns a single buffered JSON body, as
-documented in [Client API](client-api.md). The NDJSON framing is specific to
+documented in [Client API](00-client-api.md). The NDJSON framing is specific to
 `/rpc`.
 
 ---
@@ -131,12 +131,12 @@ Every request a client SDK sends — REST (session open/join/close/getEvents)
 and JSON-RPC (`/rpc`) alike — **may** carry the standard [W3C Trace
 Context](https://www.w3.org/TR/trace-context/) headers, `traceparent` and
 `tracestate`, exactly as a client tagged with `dispatch` in
-[Client API — tool call response](client-api.md#sessionsendmessage) tags each
+[Client API — tool call response](00-client-api.md#sessionsendmessage) tags each
 `tool_use` block: it's a convention on the wire, not a new envelope field.
 
 - A client SDK writes these headers only when the embedding application has
   installed an OpenTelemetry SDK of its own (see
-  [Building a Client — OpenTelemetry](../guides/building-a-client.md#opentelemetry-traces-and-custom-spans)).
+  [Building a Client — OpenTelemetry](../guides/01-building-a-client.md#opentelemetry-traces-and-custom-spans)).
   With no host SDK installed, the language's built-in no-op OTel API writes
   **no header at all** — this is the default, and it is not an error or a
   degraded mode, just the steady state for a client that hasn't opted into
@@ -144,7 +144,7 @@ Context](https://www.w3.org/TR/trace-context/) headers, `traceparent` and
 - **Absence is always valid, never an error.** `baesrv` accepts every request
   with no `traceparent` header exactly as it always has — it simply opens a
   fresh root trace server-side (subject to `[telemetry]` being enabled at
-  all; see [Configuration — `[telemetry]`](configuration.md#telemetry)). A
+  all; see [Configuration — `[telemetry]`](05-configuration.md#telemetry)). A
   malformed `traceparent` value is treated identically to an absent one (per
   the W3C spec) — never rejected, never surfaced as a request error, logged
   at most at `DEBUG`.
@@ -152,7 +152,7 @@ Context](https://www.w3.org/TR/trace-context/) headers, `traceparent` and
   its own top-level request span on it — this is the join point that lets a
   client-side trace and `baesrv`'s session/turn/tool spans appear as one
   connected trace in an operator's observability backend. See
-  [Configuration — `[telemetry]`](configuration.md#telemetry) for the
+  [Configuration — `[telemetry]`](05-configuration.md#telemetry) for the
   server-side sampling behavior (`sample_ratio` only applies when `baesrv` is
   itself the trace root; an incoming sampled/unsampled decision is always
   respected).
@@ -241,7 +241,7 @@ for a client-side tool call (`Outcome::Paused` — the assistant response
 contains at least one `dispatch:"client"` `tool_use` block the harness must
 dispatch), the FIFO gate is not released. A paused turn may also carry
 `sandbox`/`mcp` `tool_use` blocks the server already dispatched and answered
-itself — see [Client API — tool call response](client-api.md#sessionsendmessage)
+itself — see [Client API — tool call response](00-client-api.md#sessionsendmessage)
 for the client contract and how the server merges both result sets back
 together on resume. The gate stays held by that turn's owner — the client key
 that sent the original message — until:
@@ -249,7 +249,7 @@ that sent the original message — until:
 - The **same** client key sends the `tool_result` continuation, or deliberately
   replaces it with a fresh plain message, reusing the held gate with no
   queuing, or
-- `BAE_TURN_TIMEOUT` (default 120s, see [Configuration](configuration.md))
+- `BAE_TURN_TIMEOUT` (default 120s, see [Configuration](05-configuration.md))
   elapses without that continuation arriving, at which point the turn is
   **abandoned**: the next arrival reclaims the gate, and a
   broadcast `session.error` event (`reason: "driver_turn_abandoned"`,

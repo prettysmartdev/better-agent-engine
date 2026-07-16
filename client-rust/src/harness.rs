@@ -3,7 +3,7 @@
 //! [`Harness`] holds the [`Config`], the tool registry, and the [`Hooks`]. Its
 //! async [`Harness::connect`] opens a session on the server and hands back a
 //! [`Session`], whose [`Session::send`] drives the full round-trip described in
-//! `docs/client-api.md`'s harness loop:
+//! `docs/reference/00-client-api.md`'s harness loop:
 //!
 //! 1. Send the user turn via the `session.sendMessage` JSON-RPC method.
 //! 2. If the assistant response has no `tool_use` block, it is final — return it.

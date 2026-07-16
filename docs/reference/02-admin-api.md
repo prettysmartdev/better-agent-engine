@@ -16,13 +16,13 @@ docker exec bae cat /var/lib/bae/admin-key.pem
 
 A request with a missing, malformed, or non-matching bearer token gets
 `401 unauthorized`. See the
-[Admin authentication guide](../guides/admin-authentication.md) for the full
+[Admin authentication guide](../guides/09-admin-authentication.md) for the full
 bootstrap/rotation/pre-provisioning lifecycle, and
-[Configuration](configuration.md) for the related env vars
+[Configuration](05-configuration.md) for the related env vars
 (`BAE_ADMIN_KEY_FILE`, `BAE_ADMIN_KEY_HASH_FILE`,
 `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH`).
 
-**[`baectl`](baectl.md) is the recommended way to exercise these endpoints.**
+**[`baectl`](03-baectl.md) is the recommended way to exercise these endpoints.**
 It auto-discovers the admin address and key with zero configuration when run
 inside the container (`docker exec bae baectl ...`). The examples below use
 raw `curl` to document the exact wire format; every one now includes the
@@ -287,10 +287,10 @@ existing open sessions return `401` on subsequent requests.
 ## Sessions
 
 Read-only. These two routes exist so admin-side tooling — chiefly
-[MAX](../guides/max-webapp.md) — can list and inspect sessions without ever
+[MAX](../guides/10-max-webapp.md) — can list and inspect sessions without ever
 holding a session key. That matters for a `closed`/`error` session in
 particular: `POST /api/v1/sessions/{id}/join` (see
-[Client API](client-api.md#post-apiv1sessionsidjoin--join-an-existing-session))
+[Client API](00-client-api.md#post-apiv1sessionsidjoin--join-an-existing-session))
 rejects a terminal session with `409 session_closed`, so these admin routes
 are the **only** way to read a terminal session's history if nothing was
 still connected to it while it was open.
@@ -338,7 +338,7 @@ GET /admin/v1/sessions/ses_…/events?limit=100&cursor=
 
 Same pagination, and the same **byte-for-byte** response shape, as the
 client-port
-[`GET /api/v1/sessions/{id}/events`](client-api.md#get-apiv1sessionsidevents--replay-events)
+[`GET /api/v1/sessions/{id}/events`](00-client-api.md#get-apiv1sessionsidevents--replay-events)
 — but admin-key-authenticated instead of session-key-authenticated, and it
 works against a `closed`/`error` session with no session key ever required.
 
@@ -360,7 +360,7 @@ works against a `closed`/`error` session with no session key ever required.
 }
 ```
 
-See [message-types.md](message-types.md) for the full `event_type` catalog
+See [04-message-types.md](04-message-types.md) for the full `event_type` catalog
 and payload shapes.
 
 **Errors:** `404 not_found` — no session with this id.
@@ -434,7 +434,7 @@ returned — `auth_token` is never exposed.
 The registry is rebuilt on restart; this endpoint reflects the current
 in-memory state. An empty `items` array means the server started without a
 config file, or the config file had no `[[providers.entries]]` entries. See
-[Configuration — `[providers]`](configuration.md#providers) for the full
+[Configuration — `[providers]`](05-configuration.md#providers) for the full
 schema and [Profiles — Provider config](../profiles.md#provider-config) for
 how profiles reference these entries by name.
 
@@ -511,7 +511,7 @@ curl http://127.0.0.1:8081/admin/v1/config \
 `/admin/v1/mcp-servers` and `/admin/v1/providers`. `providers.entries[].base_url`
 is the same **effective** value those two endpoints already use. `telemetry`
 is a single object, not a list — it mirrors the `[telemetry]` shape
-verbatim (see [Configuration — `[telemetry]`](configuration.md#telemetry)),
+verbatim (see [Configuration — `[telemetry]`](05-configuration.md#telemetry)),
 including when telemetry is disabled: an absent `[telemetry]` table renders
 as a present-but-disabled `{"enabled": false, …}` object, not an empty or
 missing section.
@@ -540,7 +540,7 @@ An empty or missing config file, or one with none of `[mcp]`, `[providers]`,
 `[telemetry]`, still returns `200 OK` — never an error — with
 `{"mcp": {"servers": []}, "providers": {"entries": []}, "telemetry":
 {"enabled": false, …}}`. See
-[Configuration — Admin endpoint: `GET /admin/v1/config`](configuration.md#admin-endpoint-get-adminv1config)
+[Configuration — Admin endpoint: `GET /admin/v1/config`](05-configuration.md#admin-endpoint-get-adminv1config)
 for the underlying config file schema each part of this response reflects.
 
 ---
@@ -578,5 +578,5 @@ keys) and are never returned by any admin-API response — they are only ever
 written to `BAE_ADMIN_KEY_FILE` on the server's local disk. A client or
 session key can never authenticate on the admin port, and an admin key
 cannot be used on the client port. See the
-[Admin authentication guide](../guides/admin-authentication.md) for how
+[Admin authentication guide](../guides/09-admin-authentication.md) for how
 admin keys are created, rotated, and pre-provisioned.

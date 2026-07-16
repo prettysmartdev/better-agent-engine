@@ -91,7 +91,7 @@ const ENV_FILE: &str = ".env";
 const CONFIG_FILE: &str = "bae-config.toml";
 
 /// The documented `BAE_*` questions of step 5 and their server defaults
-/// (`docs/reference/configuration.md`'s Environment Variables table). Only a
+/// (`docs/reference/05-configuration.md`'s Environment Variables table). Only a
 /// value the user actually changes from its default is written to `.env`.
 const BAE_ENV_DEFAULTS: &[(&str, &str)] = &[
     ("BAE_ADDR", "0.0.0.0:8080"),
@@ -1265,7 +1265,7 @@ fn collect_secret(
     }
     // NOTE (known limitation): the value is echoed to the terminal as typed —
     // there is no masking in this first cut (documented in the work item and
-    // docs/reference/baectl.md).
+    // docs/reference/03-baectl.md).
     let value = prompt.ask_line(&format!("  Value for {var}? (blank to skip)"), "");
     if value.is_empty() {
         if !unresolved.iter().any(|u| u == var) {
@@ -1597,7 +1597,7 @@ fn finish(
 /// The post-launch instruction for retrieving MAX's self-generated dashboard
 /// password — returned only when the variant is `max` and the user left the
 /// password blank (so `setup` set none itself). Mirrors the admin-key retrieval
-/// pattern (`docker exec … cat <path>`) from `docs/guides/max-webapp.md`.
+/// pattern (`docker exec … cat <path>`) from `docs/guides/10-max-webapp.md`.
 fn max_password_hint(config: &SetupConfig) -> Option<String> {
     if config.variant != Variant::Max || !config.max_password_blank {
         return None;
@@ -1974,7 +1974,7 @@ mod tests {
         // edits cannot silently move the wizard away from documented defaults.
         let reference = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../docs/reference/configuration.md"
+            "/../docs/reference/05-configuration.md"
         ))
         .expect("configuration reference exists");
         for (_, value) in BAE_ENV_DEFAULTS {

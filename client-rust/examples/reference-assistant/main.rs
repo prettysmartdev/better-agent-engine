@@ -77,7 +77,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let prompt = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "What time is it right now?".to_string());
+        .unwrap_or_else(|| "What time is it?".to_string());
 
     let config = Config::new(server_url, client_key).with_client_version(bae_rs::VERSION);
 

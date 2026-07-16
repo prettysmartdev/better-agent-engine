@@ -9,7 +9,7 @@ Events are returned in the `events` array on the terminal result of
 `session.sendMessage` (events appended during that call) and via
 `GET /api/v1/sessions/{id}/events` (full session history). They are also
 delivered as live `session.event` notifications on the `/rpc` NDJSON stream —
-see [Event Streaming](../guides/event-streaming.md).
+see [Event Streaming](../guides/06-event-streaming.md).
 
 **EventView shape** (all endpoints):
 
@@ -82,7 +82,7 @@ same value as that block's [`tool.call`](#toolcall) event below:
 The `sandbox`/`mcp`/remote-subagent blocks above have already been dispatched and answered by
 the server by the time this event is emitted; only the `client` block is left
 for the harness to execute. See [Client API — tool call
-response](client-api.md#sessionsendmessage) for the full client contract.
+response](00-client-api.md#sessionsendmessage) for the full client contract.
 `dispatch` (and any future `caller` field) is a baesrv-internal routing tag —
 `engine::provider::call` strips it from `tool_use` blocks before replaying
 history to the LLM, so it never reaches the provider (see
@@ -174,7 +174,7 @@ shape internally before handing it back to the turn loop. So `tool.call`,
 history are always canonical, regardless of which provider kind served the
 attempt — only `provider.response`'s `body` field preserves the raw,
 kind-specific wire shape. See
-[Configuration — `[providers]`](configuration.md#providers) for the
+[Configuration — `[providers]`](05-configuration.md#providers) for the
 `provider` field and [Profiles](../profiles.md#provider-config) for how a
 profile selects providers by name.
 
@@ -236,7 +236,7 @@ The server or harness is about to invoke a tool.
   tools handled server-side by a configured MCP server, and `"sandbox"` for
   Auto-mode sandbox tools declared in the session's `sandbox_tools` array and
   dispatched server-side against the session's remote sandbox — see
-  [Sandboxes — Auto vs. manual remote dispatch](../guides/sandboxes.md#auto-vs-manual-remote-dispatch).
+  [Sandboxes — Auto vs. manual remote dispatch](../guides/03-sandboxes.md#auto-vs-manual-remote-dispatch).
   `"subagent"` is used for server-dispatched remote subagents and their
   synthesized status tool. A local subagent launch is an ordinary `"client"`
   dispatch.
@@ -376,7 +376,7 @@ An Auto-dispatch sandbox tool call about to run — one per `tool_use`, in
 `run_turn`. Deliberately **unprefixed**, mirroring `mcp.request`/
 `mcp.response` (the `session.sandbox.*` prefix is reserved for lifecycle
 state transitions, not per-call dispatch — see
-[Sandboxes](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)).
+[Sandboxes](../guides/03-sandboxes.md#auto-vs-manual-remote-dispatch)).
 
 ```json
 {
@@ -546,8 +546,8 @@ Emitted when the session is created.
 - `client_version` is `null` if not provided at session creation.
 - `tools` is the list of tool names declared at open (client-side tools only).
 - `sandbox_tools` is the list of Auto-mode sandbox tool names declared at
-  open (see [Client API — `sandbox_tools`](client-api.md#post-apiv1sessions--open-a-session)
-  and [Sandboxes](../guides/sandboxes.md#auto-vs-manual-remote-dispatch)) —
+  open (see [Client API — `sandbox_tools`](00-client-api.md#post-apiv1sessions--open-a-session)
+  and [Sandboxes](../guides/03-sandboxes.md#auto-vs-manual-remote-dispatch)) —
   empty when none were registered.
 - `subagent_tools` is the list of remote-launch tool names declared at open;
   empty when none were registered. Local `launch_subagent` tools are listed
@@ -577,8 +577,8 @@ tool set" fact, just via the join path instead of create.
   lists — never merged with the creator's or any other joiner's.
 - The event's `client_key_id` column is the **joiner**, not the session's
   original creator.
-- See [Client API — `POST .../join`](client-api.md#post-apiv1sessionsidjoin--join-an-existing-session)
-  and [Multi-Client Sessions](../guides/multi-client-sessions.md).
+- See [Client API — `POST .../join`](00-client-api.md#post-apiv1sessionsidjoin--join-an-existing-session)
+  and [Multi-Client Sessions](../guides/07-multi-client-sessions.md).
 
 ---
 
@@ -596,8 +596,8 @@ it.
 - Empty payload — the actor is fully captured by the event's `client_key_id`
   column (mirroring how `session.open`/`session.join` also rely on that
   column, not the payload, to identify the acting client).
-- See [Client API — `session.registerDriver`](client-api.md#sessionregisterdriver)
-  and [Wire Protocol — FIFO turn ownership](wire-protocol.md#fifo-turn-ownership-and-driver-registration).
+- See [Client API — `session.registerDriver`](00-client-api.md#sessionregisterdriver)
+  and [Wire Protocol — FIFO turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration).
 
 ---
 
@@ -621,13 +621,13 @@ profile with an empty `available_sandboxes` emits no such event.
 - Built by iterating **this session's own profile's** `available_sandboxes`
   list only — never a flattened, cross-profile view, even though the
   server's image-status tracking internally covers every profile. See
-  [Sandboxes — The profile-scoping guarantee](../guides/sandboxes.md#the-profile-scoping-guarantee).
+  [Sandboxes — The profile-scoping guarantee](../guides/03-sandboxes.md#the-profile-scoping-guarantee).
 
 ---
 
 ### `session.sandbox.start` / `session.sandbox.running`
 
-Emitted by [`session.startRemoteSandbox`](client-api.md#sessionstartremotesandbox):
+Emitted by [`session.startRemoteSandbox`](00-client-api.md#sessionstartremotesandbox):
 `start` when the request is accepted and the image validated, `running` once
 the driver's `start` call actually succeeds.
 
@@ -650,7 +650,7 @@ the driver's `start` call actually succeeds.
 
 ### `session.sandbox.stop` / `session.sandbox.stopped`
 
-Emitted by [`session.stopRemoteSandbox`](client-api.md#sessionstopremotesandbox),
+Emitted by [`session.stopRemoteSandbox`](00-client-api.md#sessionstopremotesandbox),
 or automatically at session close for a still-running remote sandbox.
 
 ```json
@@ -702,7 +702,7 @@ since no handle was ever retained):
 > local container. Contrast with `"dispatch": "remote"`, which the server
 > itself authored by actually driving the underlying container lifecycle.
 > See [Sandboxes — Local sandboxes report their own
-> lifecycle](../guides/sandboxes.md#local-sandboxes-report-their-own-lifecycle)
+> lifecycle](../guides/03-sandboxes.md#local-sandboxes-report-their-own-lifecycle)
 > for the full trust-boundary discussion, including the accepted gap where a
 > crashed client leaves a local sandbox with no terminal `stopped`/`error`
 > event.
@@ -839,7 +839,7 @@ server.message.send    (final text)
 
 Note there is no second `tool.result` event for the `mcp` id on resume — it
 was already logged in call 1, and the merge does not re-log it. See [Client
-API — tool call response](client-api.md#sessionsendmessage) for the full
+API — tool call response](00-client-api.md#sessionsendmessage) for the full
 client contract on a mixed turn.
 
 **MCP tool call (single `session.sendMessage` call, server-side):**
@@ -876,7 +876,7 @@ server.message.send
 session.stopRemoteSandbox                           -- session.sandbox.stop, session.sandbox.stopped
 ```
 
-See [Sandboxes](../guides/sandboxes.md) for the full lifecycle, the
+See [Sandboxes](../guides/03-sandboxes.md) for the full lifecycle, the
 auto/manual dispatch distinction, and local-sandbox telemetry via
 `session.reportLocalSandbox`.
 
@@ -950,5 +950,5 @@ server.message.send             (client_key_id: key_B)
 
 `GET /api/v1/sessions/{id}/events` returns this exact sequence for either
 participant — every event is attributed to whichever client key actually
-produced it. See [Multi-Client Sessions](../guides/multi-client-sessions.md)
+produced it. See [Multi-Client Sessions](../guides/07-multi-client-sessions.md)
 for the full walkthrough.

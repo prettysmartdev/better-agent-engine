@@ -7,21 +7,14 @@ Rust programs an idiomatic way to drive it. Feature-parity is maintained with
 the [TypeScript](../client-typescript/) and [Python](../client-python/)
 clients.
 
-It is a harness, not a bare REST wrapper: you register tools and hooks, open a
-session, and `send()` drives the full model ↔ tool round-trip for you.
+Requires a stable Rust toolchain (2021 edition).
 
-## Surface
+## Usage
 
-1. **`Config`** — server URL, client key, client version.
-2. **`Tool`** — name, description, JSON input schema, and an **async** handler
-   (see the breaking-change note below).
-3. **`Harness`** — holds the config + tool registry + hooks; async `connect()`
-   opens a session and returns a `Session`.
-4. **`Session`** — `send(message)` drives the round-trip until a final
-   (no-`tool_use`) assistant turn arrives; `close()` ends the session.
-5. **`Hooks`** — optional `before_send` / `after_receive` / `before_tool_call`
-   / `after_tool_call` callbacks. Each gets `&mut` access to its event and may
-   mutate or log it; returning `Err` aborts the loop.
+The SDK is an **agent harness**, not a REST wrapper. Register client-side tools,
+open a session, and let `send()` drive the whole round-trip — dispatching
+server-returned tool calls to your handlers and posting results back until a
+final assistant turn arrives.
 
 ```rust
 use bae_rs::{Config, Harness, Tool};
@@ -53,13 +46,37 @@ session.close().await?;
 > runtime, which the builtin sandbox tools require. Acceptable per the crate's
 > alpha status, same posture as the WI 0003/0005 wire-protocol changes.
 
+## Surface
+
+- **`Config`** — server URL, client key, optional client version.
+- **`Tool`** — name, description, JSON `input_schema`, and an **async** handler
+  (see the breaking-change note above).
+- **`Harness`** — register tools and hooks (builder-style `with_tool` /
+  `with_hooks` or `register_tool`), then `connect()` opens a new session or
+  `join(session_id)` attaches to an existing one as a second driver; both
+  return a `Session`.
+- **`Session`** — `send(message)` drives the loop until a final (no-`tool_use`)
+  assistant turn, `close()` ends the session, and `subscribe()` /
+  `unsubscribe()` tap the live event stream out of band.
+- **`Hooks`** — `before_send`, `after_receive`, `before_tool_call`,
+  `after_tool_call`, and `on_event` (the live event stream). Each gets `&mut`
+  access to its value and may mutate or log it; returning `Err` aborts the loop.
+- **Built-in tools** (opt-in) — `read_file` / `write_file` / `explore_files`
+  (scoped file access), `run_shell_command` / `run_shell_named` (local or
+  server-side sandboxes), and `launch_subagent` (delegate to a CLI); attach them
+  with `register_sandbox_tool()` / `register_subagent_tool()`.
+- **Errors** — one `Error` enum with variants `Api` (RFC 7807 slug),
+  `ProvidersFailed` (a `502`, carrying the session `events`), plus RPC, tool,
+  hook, and transport failures.
+- **Events** — each live event arrives as an `EventView` whose `event_type` is
+  one of the closed 27-value set; the `on_event` hook receives every one.
+
 ## Example
 
-`examples/reference-assistant/` implements the canonical `reference-assistant`
-agent (see [`aspec/genai/agents.md`](../aspec/genai/agents.md)): it registers
-`get_current_time`, opens a session, drives a message loop, prints the reply,
-and exercises every hook point. It fails fast with a clear message if the
-provider key env var (default `ANTHROPIC_API_KEY`) is unset.
+A runnable `reference-assistant` agent lives in
+[`examples/reference-assistant/`](./examples/reference-assistant/): it registers
+`get_current_time`, opens a session, drives the loop, prints the reply, and
+exercises every hook point. Run it with:
 
 ```sh
 export BAE_CLIENT_KEY=bae_…          # from POST /admin/v1/keys

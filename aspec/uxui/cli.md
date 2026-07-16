@@ -31,8 +31,8 @@ Flag guidance:
 - `--rotate-admin-key` — revoke the current admin key and mint a fresh one this boot. **Deliberate exception to the "every flag has an env-var equivalent" rule above: no env-var equivalent exists.** An env var would rotate the key on every restart of a long-lived deployment (env vars tend to be baked into compose/k8s manifests and persist across restarts) — exactly the surprising, unwanted behavior a one-shot operator action must avoid. Combining this with `--dangerously-disable-admin-auth` is a usage error (exit 2): rotating a key that won't be enforced is a contradiction.
 - `--dangerously-disable-admin-auth` (env `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH`) — serve the admin port with no authentication (the pre-0004 zero-auth behavior). **Does** get an env-var equivalent, unlike `--rotate-admin-key` above: leaving auth off is a standing deployment choice (e.g. baked into a dev-only compose file), not a one-shot action, so the usual flag/env pairing applies.
 
-See [Admin authentication](../../docs/guides/admin-authentication.md) and
-[Admin API reference](../../docs/reference/admin-api.md) for the full
+See [Admin authentication](../../docs/guides/09-admin-authentication.md) and
+[Admin API reference](../../docs/reference/02-admin-api.md) for the full
 lifecycle these flags control.
 
 #### Inputs and outputs
@@ -63,7 +63,7 @@ Verb-first, resource-typed positional, mapping 1:1 onto the admin API's CRUD sur
 - `update profile <id> <provider> <model>` (full replacement, mirroring the API's `PUT`)
 - `delete profile <id>` / `delete key <id>`
 - `auth create key` — local-only admin-key-pair generation (no API call); pre-provisions a shared admin credential across multiple server replicas.
-- `setup` — interactive quickstart wizard; local scaffolding (generates a launcher, `.env`, and `bae-config.toml`) with an optional final step that launches the deployment and creates a first profile/key. See [Setup wizard](#setup-wizard) below and [baectl reference — `baectl setup`](../../docs/reference/baectl.md#baectl-setup) for the full question list.
+- `setup` — interactive quickstart wizard; local scaffolding (generates a launcher, `.env`, and `bae-config.toml`) with an optional final step that launches the deployment and creates a first profile/key. See [Setup wizard](#setup-wizard) below and [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup) for the full question list.
 
 Profiles get the full CRUD set; keys get create/list/delete only — there is
 no single-key-get or key-update endpoint on the admin API (keys are
@@ -122,13 +122,13 @@ so a bare enter walks the whole wizard) to build a deployment before a server
 exists to talk to. When stdin isn't a TTY (piped/CI), every question falls
 back to its default with nothing printed, and the launch question
 specifically defaults to declining rather than the interactive default — see
-[baectl reference — `baectl setup`](../../docs/reference/baectl.md#baectl-setup)
+[baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup)
 for the full question list, generated-file shapes, and exit codes. Every
 other `baectl` command's "stdin: unused" line stays accurate.
 
-See [baectl reference](../../docs/reference/baectl.md) for the complete,
+See [baectl reference](../../docs/reference/03-baectl.md) for the complete,
 implementation-verified command surface, and
-[Admin authentication](../../docs/guides/admin-authentication.md) for the
+[Admin authentication](../../docs/guides/09-admin-authentication.md) for the
 key lifecycle it auto-discovers.
 
 ## baesched and baeapi (work item 0014 — harness launchers)
@@ -140,8 +140,8 @@ Two more binaries ship, one per launcher base image family, never alongside
 unmodified** — they take no subcommands and no CLI flags of their own at all;
 every setting is an env var, matching the Docker-first, flag-free posture
 `baesrv` itself uses for its own env-first configuration surface. See
-[Harness Launchers](../../docs/guides/harness-launchers.md) and
-[Harness Launchers reference](../../docs/reference/launchers.md) for the full
+[Harness Launchers](../../docs/guides/11-harness-launchers.md) and
+[Harness Launchers reference](../../docs/reference/06-launchers.md) for the full
 walkthrough and schema.
 
 ### baesched
@@ -208,4 +208,4 @@ three routes present on every instance regardless of agent count:
 | `GET` | `/_launcher/agents/{name}` | never | Single-agent detail, same shape; `404` for an unknown name. |
 
 Full field-by-field schema and per-route request/response detail:
-[Harness Launchers reference](../../docs/reference/launchers.md).
+[Harness Launchers reference](../../docs/reference/06-launchers.md).

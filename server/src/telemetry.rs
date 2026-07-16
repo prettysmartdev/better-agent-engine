@@ -207,7 +207,7 @@ impl std::error::Error for TelemetryInitError {}
 /// Tracks collector reachability so a sustained export **outage** logs exactly
 /// one warning — on the healthy→failing transition — rather than one per failed
 /// batch, which would flood the logs under a prolonged outage (contract §5;
-/// `docs/reference/configuration.md` "Collector unreachable"). Export stays
+/// `docs/reference/05-configuration.md` "Collector unreachable"). Export stays
 /// fire-and-forget regardless: this only governs the log line, never the
 /// request path. The error text itself is never logged (it could echo config),
 /// only the fact of failure.

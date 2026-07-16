@@ -1,4 +1,4 @@
-# reference-assistant (Python)
+# reference-assistant (Rust)
 
 The canonical BAE example agent, implemented once per client SDK with identical
 behavior across Rust, TypeScript, and Python. It doubles as the parity check
@@ -15,8 +15,8 @@ between the three harnesses (see `aspec/genai/agents.md`).
 4. Prints the final assistant text to **stdout**; hook and event logs go to
    **stderr**.
 5. Exercises all five hook points (`before_send`, `after_receive`,
-   `before_tool_call`, `after_tool_call`, `on_event`) — a counter confirms each
-   fired.
+   `before_tool_call`, `after_tool_call`, `on_event`) — each logs a `[hook …]`
+   line when it fires.
 
 ## Prerequisites
 
@@ -41,13 +41,12 @@ likely an unset/invalid key on the server) if it happens at runtime.
 ## Run
 
 ```sh
-cd client-python
-uv sync
+cd client-rust
 
 export BAE_CLIENT_KEY=bae_...        # from POST /admin/v1/keys
 export ANTHROPIC_API_KEY=sk-...      # the provider key your profile references
 
-uv run python examples/reference-assistant/main.py "What time is it?"
+cargo run --example reference-assistant -- "What time is it?"
 ```
 
 The prompt argument is optional (defaults to `"What time is it?"`).

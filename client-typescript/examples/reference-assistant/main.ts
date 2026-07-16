@@ -5,7 +5,7 @@
  * (`get_current_time`), a builtin **local sandbox** shell tool, and the three
  * builtin **file tools** scoped to this example's own `workspace/` directory,
  * open a session, run a message loop, and print the assistant's replies.
- * Every harness customization point (all four hooks) is exercised at least
+ * Every harness customization point (all five hooks) is exercised at least
  * once, and the program fails with a clear message when the provider key env
  * var referenced by the profile is missing.
  *

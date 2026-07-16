@@ -63,7 +63,7 @@ impl std::error::Error for CliError {}
 /// An RFC 7807 problem document as returned by every non-2xx admin response.
 ///
 /// `type` is a short, stable slug (`bad_request`, `not_found`, …) — we match on
-/// it rather than on `status`/`title`, exactly as `docs/reference/admin-api.md`
+/// it rather than on `status`/`title`, exactly as `docs/reference/02-admin-api.md`
 /// instructs.
 #[derive(Debug, Deserialize)]
 pub struct ApiProblem {
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn parses_rfc7807_document_then_maps() {
-        // The exact RFC 7807 shape from docs/reference/admin-api.md deserializes
+        // The exact RFC 7807 shape from docs/reference/02-admin-api.md deserializes
         // into `ApiProblem` (matching on `type`, not `status`/`title`).
         let body = serde_json::json!({
             "type": "duplicate_name",

@@ -6,7 +6,7 @@ rotate or disable auth, and how to pre-provision one shared key across
 multiple server replicas.
 
 If you only need the day-to-day command surface, see the
-[baectl reference](../reference/baectl.md) — `baectl` auto-discovers and uses
+[baectl reference](../reference/03-baectl.md) — `baectl` auto-discovers and uses
 the admin key with no configuration when run inside the container. This guide
 is about the key's lifecycle, not `baectl`'s command syntax.
 
@@ -22,7 +22,7 @@ there isn't one yet, so the server:
    of entropy).
 2. Stores only its Argon2id hash in SQLite (`role='admin'`) — the same hash
    parameters used for client keys, see
-   [Admin API → Key security](../reference/admin-api.md#key-security).
+   [Admin API → Key security](../reference/02-admin-api.md#key-security).
 3. Writes the **plaintext** token to `BAE_ADMIN_KEY_FILE`
    (default `/var/lib/bae/admin-key.pem`) with `0600` permissions — readable
    only by the container's non-root `bae` user.
@@ -61,7 +61,7 @@ docker exec bae baectl list profiles
 
 `baectl` resolves the token in this order: `--admin-token`/`BAE_ADMIN_TOKEN`,
 then `--admin-key-file`/`BAE_ADMIN_KEY_FILE`, then the default path above.
-See [baectl reference → Auto-configuration](../reference/baectl.md#auto-configuration)
+See [baectl reference → Auto-configuration](../reference/03-baectl.md#auto-configuration)
 for the full precedence.
 
 ---
@@ -259,11 +259,11 @@ plaintext authenticates.
 
 ## See also
 
-- [baectl reference](../reference/baectl.md) — full command syntax for
+- [baectl reference](../reference/03-baectl.md) — full command syntax for
   `auth create key` and every other subcommand.
-- [Admin API reference](../reference/admin-api.md) — the REST surface this
+- [Admin API reference](../reference/02-admin-api.md) — the REST surface this
   key authenticates against.
-- [Configuration reference](../reference/configuration.md) — every env var
+- [Configuration reference](../reference/05-configuration.md) — every env var
   mentioned above.
 - [`aspec/architecture/security.md`](../../aspec/architecture/security.md) —
   the broader authentication/RBAC model.

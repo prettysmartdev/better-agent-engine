@@ -6,7 +6,7 @@ in `bae-config.toml`), which fallback providers to try if the primary fails,
 which MCP servers are available, which sandbox container images the agent
 may launch, and which client-side tools agents are allowed to declare.
 
-Profiles are managed via the admin API — see [admin-api.md](reference/admin-api.md).
+Profiles are managed via the admin API — see [02-admin-api.md](reference/02-admin-api.md).
 
 ---
 
@@ -40,7 +40,7 @@ created. The failure is logged on every attempt (never deduplicated) — see
 [Fatal primary / non-fatal fallback](#fatal-primary--non-fatal-fallback)
 below.
 
-See [Configuration](reference/configuration.md#providers) for the full
+See [Configuration](reference/05-configuration.md#providers) for the full
 `[providers]` `bae-config.toml` schema, and
 [`examples/bae-config/providers.toml`](../examples/bae-config/providers.toml)
 for a runnable three-entry example.
@@ -73,7 +73,7 @@ Rules:
   begins. If no fallback succeeds, `session.sendMessage` returns a terminal
   `result` with a "provider unavailable" message (SDKs raise `ProvidersFailedError`).
 
-`GET /admin/v1/providers` (see [Configuration](reference/configuration.md#admin-endpoint-get-adminv1providers))
+`GET /admin/v1/providers` (see [Configuration](reference/05-configuration.md#admin-endpoint-get-adminv1providers))
 returns the literal template string (e.g. `"${ANTHROPIC_API_KEY}"`), never
 the resolved value. The client-facing session open response strips
 `auth_token` entirely — it only ever surfaces `{"provider": "<kind>", "model": "<model>"}`.
@@ -97,7 +97,7 @@ the primary fails:
   or vice versa) — mixed-kind fallback chains work with no extra
   configuration; each attempt is translated independently based on its own
   registry entry's `provider` kind. See
-  [Configuration — `[providers]`](reference/configuration.md#providers).
+  [Configuration — `[providers]`](reference/05-configuration.md#providers).
 - If all providers fail, the session moves to `error` state. `session.sendMessage`
   returns a terminal `result` (HTTP 200) whose `message` contains a generic
   "provider unavailable" assistant turn and whose `events` include the failure
@@ -122,7 +122,7 @@ not just the request that first surfaces the typo. If an already-open
 session's next `session.sendMessage` hits the same missing-primary condition
 (e.g. the server restarted with a changed `bae-config.toml`), that turn ends
 via the existing `session.error` (`reason: "provider_config"`) path instead
-of serving a message — see [Message Types](reference/message-types.md#sessionerror).
+of serving a message — see [Message Types](reference/04-message-types.md#sessionerror).
 
 ---
 
@@ -142,8 +142,8 @@ advertised to the provider. A name not found in the registry is skipped
 non-fatally (an error is logged every session creation; session open still
 succeeds).
 
-See [MCP Servers guide](guides/mcp-servers.md) for a hands-on walkthrough,
-and [Configuration](reference/configuration.md) for the full `bae-config.toml`
+See [MCP Servers guide](guides/02-mcp-servers.md) for a hands-on walkthrough,
+and [Configuration](reference/05-configuration.md) for the full `bae-config.toml`
 schema.
 
 > **Alpha breaking change.** Prior to work item 0003, `mcp_servers` accepted
@@ -172,11 +172,11 @@ session opened against this profile, once its client key registers as a
 driver, receives a `session.sandbox.available` notification listing exactly
 these images and their current status — never any other profile's images,
 even ones known and successfully pulled on the same running server. See
-[Sandboxes guide](guides/sandboxes.md) for the full walkthrough (declaring
+[Sandboxes guide](guides/03-sandboxes.md) for the full walkthrough (declaring
 the field, the background provisioning task, the driver-connect
 notification, starting/stopping a remote sandbox, and binding
 `run_shell_command`/`run_shell_named` in a client harness) and
-[Configuration — Sandbox driver](reference/configuration.md#sandbox-driver)
+[Configuration — Sandbox driver](reference/05-configuration.md#sandbox-driver)
 for the server-wide `BAE_SANDBOX_DRIVER` selection this sits on top of.
 
 Behavior:
@@ -195,7 +195,7 @@ Behavior:
   harness's own **local** sandbox (its local Docker/Apple Containers engine)
   is never validated against `available_sandboxes` — see
   [Sandboxes — Local sandboxes report their own
-  lifecycle](guides/sandboxes.md#local-sandboxes-report-their-own-lifecycle).
+  lifecycle](guides/03-sandboxes.md#local-sandboxes-report-their-own-lifecycle).
 
 ### Example: no remote sandboxes
 
@@ -281,10 +281,10 @@ is accepted. A client declaring an additional tool not in the list is rejected.
 
 This assumes `bae-config.toml` declares matching `[providers]` entries named
 `anthropic-sonnet` and `anthropic-haiku` — see
-[Configuration — `[providers]`](reference/configuration.md#providers).
+[Configuration — `[providers]`](reference/05-configuration.md#providers).
 
 Create it (admin requests need the bootstrap admin key — see the
-[admin authentication guide](guides/admin-authentication.md)):
+[admin authentication guide](guides/09-admin-authentication.md)):
 
 ```sh
 ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)

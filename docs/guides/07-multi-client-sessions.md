@@ -7,14 +7,14 @@ as driver A, join it as driver B (a different client key, same profile), have
 both send messages, and watch the server serialize their turns FIFO while
 every participant sees every other participant's activity.
 
-For the conceptual model see [Wire Protocol — FIFO turn ownership](../reference/wire-protocol.md#fifo-turn-ownership-and-driver-registration).
-For the endpoint/method reference see [Client API](../reference/client-api.md).
+For the conceptual model see [Wire Protocol — FIFO turn ownership](../reference/01-wire-protocol.md#fifo-turn-ownership-and-driver-registration).
+For the endpoint/method reference see [Client API](../reference/00-client-api.md).
 
 ---
 
 ## Prerequisites
 
-- A running BAE server (see [Quickstart](quickstart.md)) configured with a
+- A running BAE server (see [Quickstart](00-quickstart.md)) configured with a
   `[providers]` entry — e.g.
   [`examples/bae-config/providers.toml`](../../examples/bae-config/providers.toml):
 
@@ -132,7 +132,7 @@ curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
 > **A different profile can never join.** If B's client key belonged to a
 > different profile, this call would fail with `403 profile_mismatch` before
 > touching the session at all — no event logged, no session key minted. See
-> [Client API — `join`](../reference/client-api.md#post-apiv1sessionsidjoin--join-an-existing-session).
+> [Client API — `join`](../reference/00-client-api.md#post-apiv1sessionsidjoin--join-an-existing-session).
 
 Confirm both are registered:
 
@@ -217,7 +217,7 @@ curl -s "http://localhost:8080/api/v1/sessions/$SESSION_ID/events" \
   -H "Authorization: Bearer $SESSION_KEY_A" | python3 -m json.tool
 ```
 
-See [Message Types — Typical event sequences](../reference/message-types.md#typical-event-sequences)
+See [Message Types — Typical event sequences](../reference/04-message-types.md#typical-event-sequences)
 for the annotated version of this exact sequence.
 
 ---
@@ -230,7 +230,7 @@ these are **never** merged or shared. If A declared `only_a` and B declared
 `only_a` (plus any session-wide MCP tools) and never `only_b`, and vice versa
 for B's turn — enforced by construction, since each turn only ever reads the
 *acting* driver's own declared tool list. See
-[Wire Protocol — Per-turn tool scoping](../reference/wire-protocol.md#per-turn-tool-scoping-and-event-attribution).
+[Wire Protocol — Per-turn tool scoping](../reference/01-wire-protocol.md#per-turn-tool-scoping-and-event-attribution).
 
 ---
 
@@ -244,7 +244,7 @@ triggers abandonment: a `session.error` (`reason: "driver_turn_abandoned"`)
 is logged, the server merges parked server results with synthetic error
 results for unanswered client calls, and the session stays `open` with a valid
 provider transcript. See
-[Wire Protocol — "Remaining connected"](../reference/wire-protocol.md#remaining-connected-is-a-return-before-timeout-guarantee-not-a-held-socket).
+[Wire Protocol — "Remaining connected"](../reference/01-wire-protocol.md#remaining-connected-is-a-return-before-timeout-guarantee-not-a-held-socket).
 
 ---
 
@@ -272,5 +272,5 @@ while A is still active leaves the session (and A) untouched.
 Per the work item, `Harness.connect()` and the new `Harness.join(sessionId)`
 both call `session.registerDriver` internally as part of session setup —
 application code never has to call it directly. See
-[Building a Client — the harness API](building-a-client.md#the-harness-api)
+[Building a Client — the harness API](01-building-a-client.md#the-harness-api)
 for the full per-language surface.

@@ -3,11 +3,11 @@
 The `issue-triage` example is a worked agent that composes three existing BAE
 capabilities on one session:
 
-- [File tools](file-tools.md) read the cloned repository under a per-run
+- [File tools](04-file-tools.md) read the cloned repository under a per-run
   `work_root` and deny `.env` files.
-- [Sandbox tools](sandboxes.md) provide the shell used to install `git`, clone,
+- [Sandbox tools](03-sandboxes.md) provide the shell used to install `git`, clone,
   and inspect the repository.
-- [MCP servers](mcp-servers.md) provide GitHub issue, label, and comment tools
+- [MCP servers](02-mcp-servers.md) provide GitHub issue, label, and comment tools
   through the profile's `mcp_servers = ["github"]` opt-in.
 
 The same agent is shipped in all three SDKs. The runnable details and exact
@@ -32,7 +32,7 @@ For a repository the operator does not fully trust, use
 and every command selected by the model run with the harness process's real
 host privileges, on the same filesystem and network where the developer's
 other work lives. Reserve it for a fully trusted repo or a disposable/CI-
-throwaway environment. The [sandbox guide's None section](sandboxes.md#none-unsandboxed-local-execution)
+throwaway environment. The [sandbox guide's None section](03-sandboxes.md#none-unsandboxed-local-execution)
 describes that tradeoff in the capability reference.
 
 Give `GITHUB_TOKEN` the narrowest scope that works: `issues:write` on the
@@ -118,8 +118,8 @@ the example translates the server's `sandbox_image_not_allowed` response into
 an actionable message naming the missing image and the profile field to fix;
 it does not leave the raw JSON-RPC error as the operator's only explanation.
 
-See [MCP Servers](mcp-servers.md) for server registration, profile opt-in,
-and client-key/session details, and [Sandboxes](sandboxes.md) for image
+See [MCP Servers](02-mcp-servers.md) for server registration, profile opt-in,
+and client-key/session details, and [Sandboxes](03-sandboxes.md) for image
 provisioning and remote-sandbox lifecycle details.
 
 ## Execution modes
@@ -207,14 +207,14 @@ guides:
 1. It creates `./issue-triage-work/<owner>-<repo>/`, canonicalizes it, and — in
    `none` mode only — builds `FileToolConfig` with that directory as the only
    allowed directory and `env` as a denied extension, registering the three file
-   tools before `connect()`, as described in [File Tools](file-tools.md). In the
+   tools before `connect()`, as described in [File Tools](04-file-tools.md). In the
    two sandbox modes the file tools are **not** attached at all: the clone lands
    inside the container, out of these host-scoped tools' reach, so they would be
    useless (the container shell does the exploration instead).
 2. It obtains the harness's sandbox session and registers one
    `run_shell_command` bound to the selected target with `RemoteMode::Auto`.
    `remote-sandbox` is started before the list turn; local and none dispatch
-   through the client harness as described in [Sandboxes](sandboxes.md). The
+   through the client harness as described in [Sandboxes](03-sandboxes.md). The
    example uses a deterministic `/tmp/issue-triage/<repo>` checkout root in
    container modes (and creates it before cloning), so it never passes a
    host-only absolute path into a container. Those container checkouts are not
@@ -222,7 +222,7 @@ guides:
    container shell performs exploration in the two sandbox modes.
 3. The profile supplies GitHub's MCP tools. The example does not hardcode
    upstream GitHub tool names; MCP discovery makes the tools available to the
-   model, following [MCP Servers](mcp-servers.md).
+   model, following [MCP Servers](02-mcp-servers.md).
 4. It opens one session, sends the list prompt, parses the first fenced JSON
    array (with a bracketed-array fallback), then sends one per-issue prompt on
    that same session.
@@ -243,7 +243,7 @@ The following is the acceptance walkthrough for the real GitHub MCP path:
 1. Start BAE with a config containing the provider entry and either the hosted
    or local GitHub MCP entry. Export `GITHUB_TOKEN` in the server's environment
    with only `issues:write` on the test repository. Confirm the MCP registry
-   lists `github` using the checks in [MCP Servers](mcp-servers.md).
+   lists `github` using the checks in [MCP Servers](02-mcp-servers.md).
 2. Create a profile with `mcp_servers: ["github"]` and all four client-side
    tool names listed above. With `baectl`, the common case is:
 
@@ -260,7 +260,7 @@ The following is the acceptance walkthrough for the real GitHub MCP path:
    For `remote-sandbox`, create the same profile through the admin API with
    `"available_sandboxes": ["python:3.12"]` (or the exact value of
    `TRIAGE_SANDBOX_IMAGE`) and wait for that image to become `available`; the
-   [sandbox guide](sandboxes.md#step-1--declare-available_sandboxes-on-a-profile)
+   [sandbox guide](03-sandboxes.md#step-1--declare-available_sandboxes-on-a-profile)
    shows the request and status check. For `none`, use that mode only in a
    disposable environment; for `local-sandbox`, use a client container
    engine.
@@ -279,7 +279,7 @@ The following is the acceptance walkthrough for the real GitHub MCP path:
    `available_sandboxes`; the example should explain how to add it rather than
    surfacing only `sandbox_image_not_allowed`.
 6. If you need wire-level evidence, use the session id printed on stderr and
-   the session events endpoint from the [MCP guide](mcp-servers.md). Look for
+   the session events endpoint from the [MCP guide](02-mcp-servers.md). Look for
    `mcp.request`/`mcp.response` events for `github` and successful
    `tool.result` events around the list, label, and comment calls.
 

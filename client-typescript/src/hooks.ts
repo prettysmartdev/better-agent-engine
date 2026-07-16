@@ -30,5 +30,5 @@ export interface Hooks {
   on_event?: (event: SessionEvent) => void | Promise<void>;
 }
 
-/** The four hook point names, for diagnostics. */
+/** The five hook point names, for diagnostics. */
 export type HookName = keyof Hooks;

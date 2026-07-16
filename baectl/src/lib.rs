@@ -10,7 +10,7 @@
 //! Module layout mirrors the work item's spec:
 //! - [`cli`] — the clap derive command tree and the runner that dispatches it.
 //! - [`admin_client`] — a `reqwest`-based wrapper over `/admin/v1/*` with typed
-//!   request/response bodies mirroring `docs/reference/admin-api.md`.
+//!   request/response bodies mirroring `docs/reference/02-admin-api.md`.
 //! - [`output`] — human-readable vs `--json` rendering.
 //! - [`error`] — maps RFC 7807 error bodies and transport failures to exit
 //!   codes (0 success / 1 runtime / 2 usage).

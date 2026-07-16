@@ -9,7 +9,7 @@ same steps generalize to other servers.
 
 ## Prerequisites
 
-- A running BAE server (see [Quickstart](quickstart.md)).
+- A running BAE server (see [Quickstart](00-quickstart.md)).
 - **Node.js** with `npx` on PATH — used by the filesystem server.
 - `curl` for the admin API calls.
 
@@ -66,7 +66,7 @@ After (re)starting, verify the server loaded the config. This endpoint has
 no `baectl` wrapper (it's a read-only diagnostic, not part of the
 profile/key CRUD surface `baectl` covers), so use `curl` directly with the
 admin key `baesrv` wrote on first boot (see
-[Admin authentication](admin-authentication.md)):
+[Admin authentication](09-admin-authentication.md)):
 
 ```sh
 ADMIN_KEY=$(docker exec bae cat /var/lib/bae/admin-key.pem)
@@ -88,7 +88,7 @@ If `items` is empty, the server started without finding the config file. Check
 that the path is correct and that the process has permission to read it.
 
 > The endpoint shows names and transport types only — no secrets, no paths.
-> See [Admin API](../reference/admin-api.md#get-adminv1mcp-servers).
+> See [Admin API](../reference/02-admin-api.md#get-adminv1mcp-servers).
 
 ---
 
@@ -98,7 +98,7 @@ that the path is correct and that the process has permission to read it.
 entry in `bae-config.toml`):
 
 This assumes `bae-config.toml` also declares an `anthropic-sonnet` entry
-under `[providers]` (see [Configuration — `[providers]`](../reference/configuration.md#providers))
+under `[providers]` (see [Configuration — `[providers]`](../reference/05-configuration.md#providers))
 — `[mcp]` and `[providers]` coexist freely in one file, as
 [`examples/bae-config/providers.toml`](../../examples/bae-config/providers.toml)'s
 header comment notes.
@@ -113,7 +113,7 @@ client-side tools, MCP-only.)
 
 To update an existing profile (full replacement — `baectl` preserves the
 current name unless you pass `--name`; see the
-[baectl reference](../reference/baectl.md#baectl-update-profile)):
+[baectl reference](../reference/03-baectl.md#baectl-update-profile)):
 
 ```sh
 docker exec bae baectl update profile pro_… anthropic-sonnet \
@@ -174,7 +174,7 @@ docker exec bae curl -s -X POST http://127.0.0.1:8081/admin/v1/keys \
 
 Copy the `key` field — it is shown exactly once. (Or use
 `docker exec bae baectl create key fs-agent pro_… --json` — see the
-[baectl reference](../reference/baectl.md#baectl-create-key).)
+[baectl reference](../reference/03-baectl.md#baectl-create-key).)
 
 ```sh
 CLIENT_KEY="bae_…"
@@ -337,7 +337,7 @@ headers   = { Authorization = "Bearer ${SEARCH_MCP_TOKEN}" }
 ```
 
 `[providers]` (the LLM provider registry — see
-[Configuration](../reference/configuration.md#providers)) coexists with
+[Configuration](../reference/05-configuration.md#providers)) coexists with
 `[mcp]` in the same file with no naming conflict — the two are separate
 registries, so a provider and an MCP server may even share a `name`. Other
 future top-level sections (e.g. `[logging]`) follow the same pattern; unknown

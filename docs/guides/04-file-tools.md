@@ -2,7 +2,7 @@
 
 Every client SDK ships three builtin tools — `read_file`, `write_file`, and
 `explore_files` — that give an agent scoped filesystem access. Unlike the
-[sandbox tools](sandboxes.md), file tools touch the local filesystem directly
+[sandbox tools](03-sandboxes.md), file tools touch the local filesystem directly
 and need no live `Session`: they are built once from a security-constraint
 config and registered through the ordinary pre-`connect()` tool builder, the
 same as any other client-side tool. This guide walks through the constraint
@@ -151,8 +151,8 @@ sandbox — not a program bug. The model should see the rejection as tool
 output it can read and react to (try a different path, ask the user, give
 up gracefully), exactly the same way the server turns a failed MCP or
 sandbox call into an error-shaped `tool.result` rather than aborting the
-turn (see [Sandboxes](sandboxes.md) and
-[Message Types — `tool.result`](../reference/message-types.md#toolresult)).
+turn (see [Sandboxes](03-sandboxes.md) and
+[Message Types — `tool.result`](../reference/04-message-types.md#toolresult)).
 
 This is the **one place** a builtin tool constructor deliberately
 catches-and-wraps rather than propagates. If you are writing your own custom

@@ -14,7 +14,7 @@ produce.
 
 ## Prerequisites
 
-- A running BAE server (see [Quickstart](quickstart.md)) with `docker` (or
+- A running BAE server (see [Quickstart](00-quickstart.md)) with `docker` (or
   `container`, on macOS) on `PATH` if you want to exercise a real sandbox —
   the concepts below apply the same way whether or not the underlying binary
   is actually present, since the server itself falls back to a structured
@@ -131,7 +131,7 @@ given session may use — a profile is a hard trust boundary, exactly like
 `session.startRemoteSandbox` asks the server to start a container from one of
 the session's own profile's `available_sandboxes` images, using the
 server-wide configured driver (`BAE_SANDBOX_DRIVER` — see
-[Configuration — Sandbox driver](../reference/configuration.md#sandbox-driver)):
+[Configuration — Sandbox driver](../reference/05-configuration.md#sandbox-driver)):
 
 ```sh
 curl -s -N -X POST "http://localhost:8080/api/v1/sessions/$SESSION_ID/rpc" \
@@ -150,7 +150,7 @@ Requesting an image not in **this session's own** profile's
 `available_sandboxes` — including an image that some *other* profile on the
 same server has successfully provisioned — is rejected with
 `-32011 sandbox_image_not_allowed` before any container is started. See
-[Client API Reference](../reference/client-api.md#sessionstartremotesandbox)
+[Client API Reference](../reference/00-client-api.md#sessionstartremotesandbox)
 for the full params/result/error table.
 
 One sandbox per session, not per driver — see
@@ -180,7 +180,7 @@ constructors:
   substitution (the command-injection boundary).
 
 Sandbox tools need a live `Session`/transport handle (unlike the [file
-tools](file-tools.md), which need none), so — unlike every other builtin tool
+tools](04-file-tools.md), which need none), so — unlike every other builtin tool
 in this work item — they are built from a `SandboxSession` handle obtained
 from the **harness**, registered on the harness, and only bound to a real
 transport once `connect()`/`join()` returns. Auto-mode declarations in
@@ -391,7 +391,7 @@ session.sandbox.stopped   (image, sandbox_id, reason, dispatch: remote)
 Closing the session while a remote sandbox is still running triggers the
 identical stop sequence automatically, with `reason: "session_close"`
 instead of `"explicit"` — the server always eventually logs a terminal event
-for its own sandbox. See [Message Types](../reference/message-types.md) for
+for its own sandbox. See [Message Types](../reference/04-message-types.md) for
 the exact payload shape of each event.
 
 ### Local sandboxes report their own lifecycle
@@ -482,5 +482,5 @@ its existing MCP-connection and broadcast-channel teardown. Each SDK's
 > that is killed (not gracefully shut down) rather than closing sessions
 > normally leaves no record of what it started. See
 > [Configuration — Abandoned containers are not automatically cleaned
-> up](../reference/configuration.md#abandoned-containers-are-not-automatically-cleaned-up)
+> up](../reference/05-configuration.md#abandoned-containers-are-not-automatically-cleaned-up)
 > for the operator-facing caveat and mitigation.

@@ -19,7 +19,7 @@ config file; it must never redeclare `ENTRYPOINT`/`CMD`, or the launcher
 binary never runs and the container does nothing.
 
 For the exact config schema and env var reference, see
-[Harness Launchers Reference](../reference/launchers.md). Ready-to-run
+[Harness Launchers Reference](../reference/06-launchers.md). Ready-to-run
 examples for all three live in
 [`examples/launchers/`](../../examples/launchers/).
 
@@ -134,7 +134,7 @@ command  = "/usr/local/bin/weekly-digest-harness"
 schedule = "0 0 8 * * MON"
 ```
 
-Full field reference: [Reference — `bae-schedules.toml`](../reference/launchers.md#bae-schedulestoml-bae-launcher-schedule-binary-baesched).
+Full field reference: [Reference — `bae-schedules.toml`](../reference/06-launchers.md#bae-schedulestoml-bae-launcher-schedule-binary-baesched).
 
 ### The two overlap policies — don't conflate them
 
@@ -213,7 +213,7 @@ field = "priority"
 flag  = "--priority"
 ```
 
-Full field reference and every route: [Reference — `bae-api.toml`/`bae-app.toml`](../reference/launchers.md#bae-apitoml--bae-apptoml-bae-launcher-api--bae-launcher-webapp-binary-baeapi).
+Full field reference and every route: [Reference — `bae-api.toml`/`bae-app.toml`](../reference/06-launchers.md#bae-apitoml--bae-apptoml-bae-launcher-api--bae-launcher-webapp-binary-baeapi).
 
 ### The HTTP-trigger overlap asymmetry
 

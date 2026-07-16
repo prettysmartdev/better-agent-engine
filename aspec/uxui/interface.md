@@ -6,7 +6,7 @@ BAE's product surface is the REST API, the `baesrv` CLI (see uxui/cli.md),
 the three client libraries, and — as of work item 0007 — **MAX**, a browser
 dashboard shipped in the `bae-max` container image variant (`max/`, see
 architecture/design.md's Component 6 and
-[docs/guides/max-webapp.md](../../docs/guides/max-webapp.md)). MAX is the
+[docs/guides/10-max-webapp.md](../../docs/guides/10-max-webapp.md)). MAX is the
 admin/debug web dashboard this file anticipated; the sections below describe
 what it actually is rather than what a hypothetical future one might be.
 

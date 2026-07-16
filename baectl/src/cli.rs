@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn create_profile_body_matches_documented_shape() {
         // The JSON built for `POST /admin/v1/profiles` must match
-        // docs/reference/admin-api.md field-for-field.
+        // docs/reference/02-admin-api.md field-for-field.
         let a = parse_create_profile(&[
             "baectl",
             "create",

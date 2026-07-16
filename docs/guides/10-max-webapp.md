@@ -183,7 +183,7 @@ other than another observer.
    provider registry, and the telemetry configuration `baesrv` loaded from
    `bae-config.toml` at startup — no create/edit/delete affordances here,
    just a fetch-and-render page equivalent to
-   [`GET /admin/v1/config`](../reference/admin-api.md#config). Every
+   [`GET /admin/v1/config`](../reference/02-admin-api.md#config). Every
    secret-bearing value (MCP server `headers`, provider `auth_token`,
    telemetry `otlp_headers`) renders as a fixed dots-only `••••••••` marker
    exactly as the server sent it — MAX never regenerates, transforms, or
@@ -194,12 +194,12 @@ other than another observer.
 
 ## See also
 
-- [Admin API reference](../reference/admin-api.md) — the endpoints MAX's
+- [Admin API reference](../reference/02-admin-api.md) — the endpoints MAX's
   Keys/Profiles/Sessions tabs are thin proxies over, including the two
   session-visibility routes MAX depends on.
-- [Admin authentication](admin-authentication.md) — the admin key lifecycle
+- [Admin authentication](09-admin-authentication.md) — the admin key lifecycle
   MAX reuses internally.
-- [Event Streaming](event-streaming.md) — the underlying `session.subscribe`
+- [Event Streaming](06-event-streaming.md) — the underlying `session.subscribe`
   model MAX's live event graph is built on.
 - [aspec/devops/infrastructure.md](../../aspec/devops/infrastructure.md) —
   the `bae-max` container's dual-process requirement.

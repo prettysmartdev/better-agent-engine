@@ -20,7 +20,7 @@ Security and RBAC:
 ## The `bae-max` variant: a deliberate exception to one-process-per-container
 
 `bae-max` (built from `Dockerfile.max`, see
-[docs/guides/max-webapp.md](../../docs/guides/max-webapp.md)) is a second
+[docs/guides/10-max-webapp.md](../../docs/guides/10-max-webapp.md)) is a second
 image variant that additionally bundles MAX (`max/`), a browser dashboard.
 Every other container this project ships runs exactly one supervised
 process; `bae-max` is the one deliberate exception, because MAX has to run
@@ -47,7 +47,7 @@ boundary, which is exactly the thing this project's admin-port design avoids.
   `bae-max` adds no new network exposure to the admin port itself, only to
   MAX's own port. Because that port *is* reachable off-loopback, MAX gates
   every route behind its own login (see
-  [docs/guides/max-webapp.md](../../docs/guides/max-webapp.md)).
+  [docs/guides/10-max-webapp.md](../../docs/guides/10-max-webapp.md)).
 - Same data volume, no new volume: MAX's self-generated password file and
   its per-profile observer-key file both live on the same `/var/lib/bae`
   volume operators already mount, alongside the admin key file.
@@ -114,7 +114,7 @@ confirm the base image itself works, never a real deployment.
   API/webapp launcher's trigger routes are open by default
   (`BAE_LAUNCHER_API_TOKEN` unset) — see
   [architecture/security.md](../architecture/security.md) and
-  [docs/guides/harness-launchers.md](../../docs/guides/harness-launchers.md).
+  [docs/guides/11-harness-launchers.md](../../docs/guides/11-harness-launchers.md).
   A bearer token is optional hardening on top of, never a substitute for, the
   same TLS-terminating-reverse-proxy/internal-network requirement every other
   bae port already has.
