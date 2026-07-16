@@ -2,8 +2,9 @@
 #
 # All local development runs inside the containerized dev image (Dockerfile.dev),
 # with the repository bind-mounted at /workspace. Component Makefiles
-# (server/, client-rust/, client-typescript/, client-python/) invoke the
-# toolchains directly and are what actually run inside the container.
+# (server/, client-rust/, client-typescript/, client-python/, max/, and
+# launchers/) invoke the toolchains directly and are what actually run inside
+# the container.
 #
 # Container engine: Docker is used when its CLI exists and the daemon responds.
 # Otherwise, if Apple's `container` CLI (https://github.com/apple/container)
@@ -19,7 +20,10 @@ PROJECT    := better-agent-engine
 DEV_IMAGE  ?= awman-$(PROJECT):latest
 IMAGE      ?= $(PROJECT):latest
 MAX_IMAGE  ?= $(PROJECT):max
-COMPONENTS := server baectl client-rust client-typescript client-python max
+LAUNCHER_SCHEDULE_IMAGE ?= $(PROJECT):launcher-schedule
+LAUNCHER_API_IMAGE      ?= $(PROJECT):launcher-api
+LAUNCHER_WEBAPP_IMAGE   ?= $(PROJECT):launcher-webapp
+COMPONENTS := server baectl client-rust client-typescript client-python max launchers/core launchers/schedule launchers/api launchers/webapp
 PORT       ?= 8080
 
 # Pick the container engine: docker if the CLI exists and the daemon is up,
@@ -74,7 +78,8 @@ endif
 # Note: the per-component <verb>-<component> targets are pattern rules and
 # intentionally NOT declared .PHONY — make ignores pattern rules for .PHONY
 # targets.
-.PHONY: help engine dev-image ensure-engine ensure-dev-image shell image image-max run \
+.PHONY: help engine dev-image ensure-engine ensure-dev-image shell image image-max \
+	image-launcher-schedule image-launcher-api image-launcher-webapp run \
 	run/baesrv run/baemax build test lint fmt clean check-static image-smoke release
 
 help: ## Show available targets
@@ -117,6 +122,15 @@ image: ensure-engine ## Build the production server image (Dockerfile)
 
 image-max: ensure-engine ## Build the bae-max image variant (Dockerfile.max)
 	$(ENGINE) build --file Dockerfile.max --tag $(MAX_IMAGE) .
+
+image-launcher-schedule: ensure-engine ## Build the schedule launcher base image
+	$(ENGINE) build --file Dockerfile.launcher-schedule --tag $(LAUNCHER_SCHEDULE_IMAGE) .
+
+image-launcher-api: ensure-engine ## Build the API launcher base image
+	$(ENGINE) build --file Dockerfile.launcher-api --tag $(LAUNCHER_API_IMAGE) .
+
+image-launcher-webapp: ensure-engine ## Build the webapp launcher base image
+	$(ENGINE) build --file Dockerfile.launcher-webapp --tag $(LAUNCHER_WEBAPP_IMAGE) .
 
 # Static-binary regression guard for baectl. Runs inside the dev image, which
 # carries the host-arch <arch>-unknown-linux-musl target + musl-tools, and asserts the
@@ -218,3 +232,19 @@ fmt-%: $(DEV_IMAGE_DEP)
 	$(RUN_IN_DEV) make -C $* fmt
 clean-%: $(DEV_IMAGE_DEP)
 	$(RUN_IN_DEV) make -C $* clean
+
+# GNU Make's pattern matching strips a directory prefix when the target
+# pattern contains no slash, so build-% does not match a target such as
+# build-launchers/core. Keep the ordinary rules above unchanged for the flat
+# components and mirror them with slash-aware launcher rules so the path-form
+# component targets advertised by COMPONENTS work as well.
+build-launchers/%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C launchers/$* build
+test-launchers/%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C launchers/$* test
+lint-launchers/%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C launchers/$* lint
+fmt-launchers/%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C launchers/$* fmt
+clean-launchers/%: $(DEV_IMAGE_DEP)
+	$(RUN_IN_DEV) make -C launchers/$* clean

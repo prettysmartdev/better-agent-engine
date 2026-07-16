@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>BAE Launcher (fixture SPA)</title>
+  </head>
+  <body>
+    <!--
+      Minimal stand-in for `launchers/webapp/web/dist/index.html` (work item
+      0014, tests-webapp step). This is NOT the real Vite build output — a
+      committed fixture keeps `make -C launchers/api test` self-contained and
+      offline without depending on a Node toolchain or a prior
+      `make -C launchers/webapp/web build`. It exercises exactly what
+      `http::serve`'s BAE_LAUNCHER_WEBAPP_STATIC_DIR handling actually does:
+      serve this file at `/` and as the SPA fallback for any unknown
+      client-side route.
+    -->
+    <div id="root">bae-launcher-webapp-fixture-root</div>
+  </body>
+</html>

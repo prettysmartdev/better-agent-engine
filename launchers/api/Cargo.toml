@@ -1,0 +1,60 @@
+[package]
+name = "launcher-api"
+version = "0.1.0"
+edition = "2021"
+description = "BAE API harness launcher (baeapi): serves a validated JSON HTTP trigger endpoint per configured agent"
+license = "Apache-2.0"
+# baeapi ships only baked into the `bae-launcher-api` / `bae-launcher-webapp` base
+# images (its version tracks the image tag), never as a standalone crates.io
+# release — see aspec/devops/cicd.md.
+publish = false
+
+[[bin]]
+name = "baeapi"
+path = "src/main.rs"
+
+[dependencies]
+# The shared launcher primitives: `${VAR}` resolution, spawn-and-stream with
+# per-agent log-line prefixing, unique-name validation, logging init, and the
+# shared error/exit-code mapping. Plain path dependency — `launchers/` is a flat
+# filesystem grouping, NOT a Cargo workspace (see notes-core.md / work item 0014
+# section A). The launcher-api Dockerfile build stage must `COPY launchers/core/`
+# alongside this crate so the relative path resolves in the build context.
+launcher-core = { path = "../core" }
+# HTTP server — the same framework `baesrv` already uses (`server/Cargo.toml`),
+# so no new HTTP stack enters the project. `macros`/`rt-multi-thread` back
+# `#[tokio::main]`; `net` for the listener; `signal` for graceful shutdown.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# Adapts the child's `spawn_and_stream` output (and the peeked-first-item chain)
+# into the `axum::body::Body::from_stream` chunked response body.
+tokio-stream = "0.1"
+# Config (de)serialization and the JSON request/introspection wire shapes.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `bae-api.toml` / `bae-app.toml` parsing. Pinned to the same `0.8` line the
+# rest of the project uses (pure-Rust; preserves the static-musl binary posture).
+toml = "0.8"
+# Pure-Rust JSON Schema validator — no TLS/native dependency, so it carries no
+# static-linking risk (work item 0014 section C). `default-features = false`
+# drops the optional HTTP/file `$ref` resolvers (which would pull a network
+# stack) — every schema is inline in the config, so remote resolution is never
+# needed and staying offline is a hard requirement.
+jsonschema = { version = "0.48", default-features = false }
+# Structured logging (startup warnings, request logging). Same `BAE_LOG`
+# env-filter convention as `server/`; the subscriber itself is installed by
+# `launcher-core::init_logging`.
+tracing = "0.1"
+# Constant-time bearer-token comparison (timing-oracle resistant), mirroring
+# `server/Cargo.toml`'s use of the same crate for key verification.
+subtle = "2"
+# Optional static SPA hosting for the webapp launcher image. The plain API
+# launcher leaves BAE_LAUNCHER_WEBAPP_STATIC_DIR unset, so this dependency adds
+# no routes or behavior there.
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+# Router tests exercise axum in-process, without binding a socket or making a
+# network call. These traits provide `oneshot` and incremental body frames.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

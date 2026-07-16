@@ -41,6 +41,9 @@ jobs:
           cache-from: type=gha,scope=dev-image
           cache-to: type=gha,scope=dev-image,mode=max
 
+      # The root Makefile's COMPONENTS enumeration includes the four launcher
+      # paths (launchers/core, launchers/schedule, launchers/api, and
+      # launchers/webapp), so this remains one generic all-components job.
       - name: Build all components
         run: make build
 

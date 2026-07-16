@@ -1,0 +1,29 @@
+[package]
+name = "launcher-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared primitives for the BAE harness launchers (spawn/env/logging), depended on by launcher-schedule and launcher-api"
+license = "Apache-2.0"
+# launcher-core ships only baked into the `baesched`/`baeapi` binaries inside the
+# launcher base images (its version tracks the image tag), never as a standalone
+# crates.io release — see aspec/devops/cicd.md. The marker is about registry
+# visibility, not about who consumes it: nothing outside `launchers/` depends on
+# this crate, but it is still permanently unpublished.
+publish = false
+
+[dependencies]
+# Child-process spawning + concurrent stdout/stderr draining. `process`/`io-util`
+# give `tokio::process::Command` and the buffered line reader; `rt`/`sync` back
+# the per-child drain tasks and the mpsc channel the output stream is built on.
+# Deliberately NO `net`/`signal`/HTTP features — this crate has no knowledge of
+# HTTP or cron (those live in launcher-api / launcher-schedule).
+tokio = { version = "1", features = ["process", "io-util", "rt", "sync"] }
+# Wraps the child's output mpsc receiver as the `impl Stream<Item = LogLine>`
+# returned by `spawn_and_stream`. Re-exports the `Stream` trait consumers use,
+# so no separate `futures-core` dependency is needed.
+tokio-stream = "0.1"
+# Structured logging. `init_logging` builds the shared subscriber; the crate also
+# emits its own warnings. Same `tracing`/`tracing-subscriber` stack, and the same
+# `BAE_LOG` env-filter convention, as `server/`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

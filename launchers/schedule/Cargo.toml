@@ -1,0 +1,28 @@
+[package]
+name = "launcher-schedule"
+version = "0.1.0"
+edition = "2021"
+description = "Cron scheduler launcher for BAE harnesses"
+license = "Apache-2.0"
+# This binary ships only inside the bae-launcher-schedule image and is never
+# published to crates.io.
+publish = false
+
+[[bin]]
+name = "baesched"
+path = "src/main.rs"
+
+[dependencies]
+# Shared launcher behavior: ${VAR} resolution, child spawning/output prefixes,
+# unique-name validation, logging, and common error/exit-code semantics.
+launcher-core = { path = "../core" }
+# TOML config parsing for bae-schedules.toml.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Tokio owns signal handling, independent invocation tasks, and shutdown timing.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+# Tokio-native six-field cron scheduler. Cron-specific behavior stays here,
+# rather than leaking into launcher-core.
+tokio-cron-scheduler = "0.14"
+tracing = "0.1"

@@ -1,0 +1,35 @@
+# bae-api.toml — example config for the bae-launcher-api base image
+#
+# Point baeapi at this file with either:
+#   BAE_LAUNCHER_API_CONFIG=/etc/bae/bae-api.toml   (the image's default path)
+#   BAE_LAUNCHER_API_CONFIG=examples/launchers/api/bae-api.toml baeapi
+#
+# `[[agents]]` is always an array; one entry here becomes one route:
+#   POST /agents/echo/trigger
+
+[server]
+addr = "0.0.0.0:9090"   # optional; BAE_LAUNCHER_API_ADDR overrides this if set
+
+[[agents]]
+name    = "echo"
+command = "/usr/local/bin/example-harness"
+
+# The POST body must satisfy this JSON Schema, validated BEFORE the harness is
+# ever spawned — an invalid body gets a 400 with the failing field, no process
+# started.
+[agents.request_schema]
+type     = "object"
+required = ["prompt"]
+[agents.request_schema.properties.prompt]
+type = "string"
+
+# Copies the validated "prompt" field from the POST body into the child's
+# AGENT_PROMPT environment variable. Body-derived values are copied verbatim —
+# never ${VAR}-resolved, since a request body is untrusted input.
+[[agents.env_template]]
+field = "prompt"
+env   = "AGENT_PROMPT"
+
+# Uncomment to demonstrate a static, ${VAR}-resolved secret (resolved from
+# baeapi's own environment immediately before spawning, never logged):
+# env = { API_TOKEN = "${MY_HARNESS_TOKEN}" }

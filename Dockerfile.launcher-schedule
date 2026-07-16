@@ -1,0 +1,38 @@
+# Better Agent Engine (BAE) — bae-launcher-schedule base image.
+#
+# This is a base image for a user's Dockerfile to extend with one or more
+# harnesses and a bae-schedules.toml. It is intentionally a single-process
+# image: baesched owns the schedules and supervises each child invocation.
+#
+# IMPORTANT FOR EXTENDING DOCKERFILES: add harnesses/configuration with COPY
+# only. Do NOT override ENTRYPOINT or CMD — doing so prevents baesched from
+# running and defeats the launcher's scheduling behavior.
+#
+#   docker build -f Dockerfile.launcher-schedule \
+#     -t better-agent-engine:launcher-schedule .
+
+FROM rust:1-bookworm AS build
+WORKDIR /build
+# launcher-schedule has a relative path dependency on launcher-core. Keep both
+# independently-buildable crates in their own directories in the build context
+# so Cargo can resolve that dependency; do not flatten either COPY.
+COPY launchers/core/ ./launchers/core/
+COPY launchers/schedule/ ./launchers/schedule/
+RUN cargo build --release --manifest-path launchers/schedule/Cargo.toml
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --user-group --home-dir /var/lib/bae bae \
+    && mkdir -p /etc/bae \
+    && chown bae:bae /etc/bae
+
+COPY --from=build /build/launchers/schedule/target/release/baesched /usr/local/bin/baesched
+
+USER bae
+ENV BAE_SCHEDULES_CONFIG=/etc/bae/bae-schedules.toml \
+    BAE_LOG=info
+# The schedule launcher has no HTTP surface, so there is no port to expose;
+# process liveness is reported by the container's own status and logs.
+ENTRYPOINT ["baesched"]

@@ -1,0 +1,40 @@
+# Better Agent Engine (BAE) — bae-launcher-api base image.
+#
+# This is a base image for a user's Dockerfile to extend with one or more
+# harnesses and a bae-api.toml. It is intentionally a single-process image:
+# baeapi owns the HTTP listener and supervises each child invocation.
+#
+# IMPORTANT FOR EXTENDING DOCKERFILES: add harnesses/configuration with COPY
+# only. Do NOT override ENTRYPOINT or CMD — doing so prevents baeapi from
+# running and defeats the launcher's API behavior.
+#
+#   docker build -f Dockerfile.launcher-api \
+#     -t better-agent-engine:launcher-api .
+
+FROM rust:1-bookworm AS build
+WORKDIR /build
+# launcher-api has a relative path dependency on launcher-core. Keep both
+# independently-buildable crates in their own directories in the build context
+# so Cargo can resolve that dependency; do not flatten either COPY.
+COPY launchers/core/ ./launchers/core/
+COPY launchers/api/ ./launchers/api/
+RUN cargo build --release --manifest-path launchers/api/Cargo.toml
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --user-group --home-dir /var/lib/bae bae \
+    && mkdir -p /etc/bae \
+    && chown bae:bae /etc/bae
+
+COPY --from=build /build/launchers/api/target/release/baeapi /usr/local/bin/baeapi
+
+USER bae
+ENV BAE_LAUNCHER_API_CONFIG=/etc/bae/bae-api.toml \
+    BAE_LAUNCHER_API_ADDR=0.0.0.0:9090 \
+    BAE_LOG=info
+# The trigger port is intentionally plain HTTP; put this base image behind the
+# same TLS-terminating reverse proxy required by the other BAE network ports.
+EXPOSE 9090
+ENTRYPOINT ["baeapi"]

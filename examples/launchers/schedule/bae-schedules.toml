@@ -1,0 +1,27 @@
+# bae-schedules.toml — example config for the bae-launcher-schedule base image
+#
+# Point baesched at this file with either:
+#   BAE_SCHEDULES_CONFIG=/etc/bae/bae-schedules.toml   (the image's default path)
+#   BAE_SCHEDULES_CONFIG=examples/launchers/schedule/bae-schedules.toml baesched
+#
+# `[[agents]]` is always an array — even a one-agent image uses it, since a
+# single entry and twenty entries are the same shape. `name` must be unique;
+# it doubles as the log-prefix key on every line this agent's harness prints.
+
+[[agents]]
+name        = "hello-cron"
+command     = "/usr/local/bin/example-harness"
+args        = ["--mode", "cron"]
+env         = { GREETING = "hello from baesched" }   # values may reference ${SECRET_ENV_VAR}
+schedule    = "*/30 * * * * *"   # 6-field cron (sec min hour day month day-of-week); fast on
+                                  # purpose so `docker run` shows output within half a minute
+
+# A second, independently-scheduled agent in the SAME image/container — proves
+# the "N agents per image" shape even in this minimal example. It runs on its
+# own timer with its own overlap guard; a slow/hung `hello-cron` never delays
+# this one, and vice versa (see docs/guides/harness-launchers.md).
+[[agents]]
+name        = "hourly-check"
+command     = "/usr/local/bin/example-harness"
+args        = ["--mode", "hourly"]
+schedule    = "0 0 * * * *"

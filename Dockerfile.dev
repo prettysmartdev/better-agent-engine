@@ -1,7 +1,7 @@
 # Better Agent Engine (BAE) — local development toolchain image.
 #
-# One image with every toolchain needed to build, test, and lint all five
-# components (server, baectl, client-rust, client-typescript, client-python).
+# One image with every toolchain needed to build, test, and lint all components,
+# including the launchers' Rust crates and Vite frontend.
 # Build it with `make dev-image`; the root Makefile runs all component
 # targets inside a container of this image with the repo mounted at
 # /workspace. Also serves as the base image for .awman/Dockerfile.claude.

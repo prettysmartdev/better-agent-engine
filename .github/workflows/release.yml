@@ -1,16 +1,18 @@
-# Release: on a vX.Y.Z tag, build and push BOTH production images to GHCR,
+# Release: on a vX.Y.Z tag, build and push all production/base images to GHCR,
 # multi-arch (linux/amd64 + linux/arm64).
 #
 # Triggered by `make release VERSION=vX.Y.Z` pushing the tag (after it has published
-# the client SDKs). For each image — the standard server (Dockerfile) and bae-max
-# (Dockerfile.max) — every architecture is built on its OWN native runner (no slow
-# QEMU emulation; the Dockerfiles derive their Rust target from `uname -m`, so they
+# the client SDKs). Every image is built on its OWN native runner (no slow QEMU
+# emulation; the Dockerfiles derive their Rust target from `uname -m`, so they
 # build correctly on each host unchanged), pushed to GHCR by digest, then the
 # per-arch digests are merged into one multi-arch manifest list carrying the final
 # tags, per aspec/devops/cicd.md:
-#   ghcr.io/prettysmartdev/better-agent-engine:<semver>       + :latest
-#   ghcr.io/prettysmartdev/better-agent-engine:<semver>-max   + :max
-# The floating :latest / :max tags only move for stable (non-prerelease) versions.
+#   ghcr.io/prettysmartdev/better-agent-engine:<semver>                    + :latest
+#   ghcr.io/prettysmartdev/better-agent-engine:<semver>-max                + :max
+#   ghcr.io/prettysmartdev/better-agent-engine:<semver>-launcher-schedule + :launcher-schedule
+#   ghcr.io/prettysmartdev/better-agent-engine:<semver>-launcher-api      + :launcher-api
+#   ghcr.io/prettysmartdev/better-agent-engine:<semver>-launcher-webapp   + :launcher-webapp
+# The floating suffix tags only move for stable (non-prerelease) versions.
 name: release
 
 on:
@@ -26,7 +28,7 @@ jobs:
   test:
     uses: ./.github/workflows/test.yml
 
-  # Build each (image × arch) on its native runner and push by digest.
+# Build each (image × arch) on its native runner and push by digest.
   build:
     name: build ${{ matrix.image }} (${{ matrix.arch }})
     needs: test
@@ -39,6 +41,12 @@ jobs:
           - { image: standard, dockerfile: Dockerfile,     arch: arm64, runner: ubuntu-24.04-arm }
           - { image: max,      dockerfile: Dockerfile.max, arch: amd64, runner: ubuntu-latest }
           - { image: max,      dockerfile: Dockerfile.max, arch: arm64, runner: ubuntu-24.04-arm }
+          - { image: launcher-schedule, dockerfile: Dockerfile.launcher-schedule, arch: amd64, runner: ubuntu-latest }
+          - { image: launcher-schedule, dockerfile: Dockerfile.launcher-schedule, arch: arm64, runner: ubuntu-24.04-arm }
+          - { image: launcher-api,      dockerfile: Dockerfile.launcher-api,      arch: amd64, runner: ubuntu-latest }
+          - { image: launcher-api,      dockerfile: Dockerfile.launcher-api,      arch: arm64, runner: ubuntu-24.04-arm }
+          - { image: launcher-webapp,   dockerfile: Dockerfile.launcher-webapp,   arch: amd64, runner: ubuntu-latest }
+          - { image: launcher-webapp,   dockerfile: Dockerfile.launcher-webapp,   arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v4
 
@@ -90,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        image: [standard, max]
+        image: [standard, max, launcher-schedule, launcher-api, launcher-webapp]
     steps:
       - name: Download digests for ${{ matrix.image }}
         uses: actions/download-artifact@v4
@@ -109,14 +117,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Compute the tag flags. Standard → :<semver> (+ :latest); max → :<semver>-max
-      # (+ :max). The floating tag is added only for stable (non-prerelease) versions.
+      # Compute the tag flags. Standard → :<semver> (+ :latest); each other
+      # image → :<semver>-<image> (+ :<image>). Floating tags move only for
+      # stable (non-prerelease) versions.
       - name: Compute tags
         id: tags
         run: |
           semver="${GITHUB_REF_NAME#v}"
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          if [ "${{ matrix.image }}" = "max" ]; then suffix="-max"; float="max"; else suffix=""; float="latest"; fi
+          case "${{ matrix.image }}" in
+            standard) suffix=""; float="latest" ;;
+            max|launcher-schedule|launcher-api|launcher-webapp)
+              suffix="-${{ matrix.image }}"; float="${{ matrix.image }}" ;;
+            *) echo "unknown image variant: ${{ matrix.image }}" >&2; exit 1 ;;
+          esac
 
           args="-t ${image}:${semver}${suffix}"
           if [[ "$semver" != *-* ]]; then args="${args} -t ${image}:${float}"; fi
@@ -134,7 +148,8 @@ jobs:
       - name: Inspect & summarize
         run: |
           semver="${GITHUB_REF_NAME#v}"
-          suffix=""; [ "${{ matrix.image }}" = "max" ] && suffix="-max"
+          suffix=""
+          [ "${{ matrix.image }}" = "standard" ] || suffix="-${{ matrix.image }}"
           ref="${{ steps.tags.outputs.image }}:${semver}${suffix}"
           docker buildx imagetools inspect "$ref"
           {

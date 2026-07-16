@@ -130,3 +130,82 @@ See [baectl reference](../../docs/reference/baectl.md) for the complete,
 implementation-verified command surface, and
 [Admin authentication](../../docs/guides/admin-authentication.md) for the
 key lifecycle it auto-discovers.
+
+## baesched and baeapi (work item 0014 — harness launchers)
+
+Two more binaries ship, one per launcher base image family, never alongside
+`baesrv`/`baectl` in the same image: `baesched` (`bae-launcher-schedule`) and
+`baeapi` (`bae-launcher-api` and, unmodified, `bae-launcher-webapp`). Both are
+**base-image binaries an agent developer's own Dockerfile is expected to run
+unmodified** — they take no subcommands and no CLI flags of their own at all;
+every setting is an env var, matching the Docker-first, flag-free posture
+`baesrv` itself uses for its own env-first configuration surface. See
+[Harness Launchers](../../docs/guides/harness-launchers.md) and
+[Harness Launchers reference](../../docs/reference/launchers.md) for the full
+walkthrough and schema.
+
+### baesched
+
+Binary name: baesched
+Install path: `/usr/local/bin` inside the `bae-launcher-schedule` base image
+Storage location: none of its own — reads `bae-schedules.toml` once at startup; no database, no local persistence of run history or output.
+
+#### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `BAE_SCHEDULES_CONFIG` | `/etc/bae/bae-schedules.toml` | Path to the config file. A missing file is not an error (starts with zero agents); a malformed one is. |
+| `BAE_SCHEDULES_SHUTDOWN_TIMEOUT` | `30` | Whole seconds of grace given to in-flight invocations after `SIGTERM`/`SIGINT` before they're force-killed. A non-integer value is a usage error at startup. |
+| `BAE_LOG` | `info` | Tracing filter for `baesched`'s own stderr logs, same variable name and posture as `baesrv`'s `BAE_LOG`. |
+
+#### Inputs and outputs
+
+- stdin: unused.
+- stdout: forwarded child stdout only, each line prefixed `[name] ` — never `baesched`'s own logs.
+- stderr: `baesched`'s own tracing logs, plus forwarded child stderr (also `[name] `-prefixed).
+- Exit codes: **0** success (including a clean signal-triggered shutdown — a received `SIGTERM`/`SIGINT` is never itself a failure), **1** runtime error (a `tokio-cron-scheduler` internal initialization failure), **2** usage error (malformed TOML, an unknown top-level field, a duplicate/blank agent `name`, a schedule that isn't exactly six cron fields or doesn't parse, an invalid `BAE_SCHEDULES_SHUTDOWN_TIMEOUT` — **and, unlike `baeapi` below, also an existing-but-unreadable config file**: `baesched` maps that case to a usage error, not a runtime one).
+
+#### No HTTP surface
+
+`baesched` opens no port and has no `/healthz` — by design, not omission; see
+[Infrastructure — the three launcher base images](../devops/infrastructure.md#the-three-launcher-base-images-extended-not-run-standalone).
+Liveness is process-level only (`docker ps`, the container's exit status).
+
+### baeapi
+
+Binary name: baeapi
+Install path: `/usr/local/bin` inside both the `bae-launcher-api` and `bae-launcher-webapp` base images (the exact same binary in both)
+Storage location: none of its own — reads `bae-api.toml`/`bae-app.toml` once at startup; no database, no persisted run history — a trigger's output is streamed to the caller and forwarded to `baeapi`'s own stdout/stderr (`docker logs`), never written to a file.
+
+#### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `BAE_LAUNCHER_API_CONFIG` | `/etc/bae/bae-api.toml` in `bae-launcher-api`; `/etc/bae/bae-app.toml` in `bae-launcher-webapp` | Path to the config file. Same variable name in both images; only the baked-in default path differs per image. |
+| `BAE_LAUNCHER_API_ADDR` | `0.0.0.0:9090` | Listen address; overrides `[server] addr` from the config file. |
+| `BAE_LAUNCHER_API_TOKEN` | _(unset)_ | Bearer token gating every `/agents/*` route (never `/healthz`/`/_launcher/*`). **Unset by default — open port, loud startup warning.** See [Security](../architecture/security.md). |
+| `BAE_LAUNCHER_WEBAPP_STATIC_DIR` | _(unset in `bae-launcher-api`)_ | When set to a non-empty value, additionally serves that directory as a static SPA at `/` with an `index.html` client-side-routing fallback. Baked in by `bae-launcher-webapp`'s own Dockerfile `ENV`; left unset in `bae-launcher-api`. |
+| `BAE_LAUNCHER_API_SHUTDOWN_TIMEOUT` | `30` | Whole seconds the post-signal graceful drain may take before the process exits anyway, force-killing still-running child invocations. A non-integer value is a usage error at startup. Mirrors `BAE_SCHEDULES_SHUTDOWN_TIMEOUT`. |
+| `BAE_LOG` | `info` | Tracing filter for `baeapi`'s own stderr logs. |
+
+#### Inputs and outputs
+
+- stdin: unused.
+- stdout: forwarded child stdout only, each line prefixed `[name] ` — the same posture as `baesched`, so `docker logs` carries every agent's attributed output. The same lines are *also* streamed into that trigger's own HTTP response body (`POST /agents/{name}/trigger`, `application/x-ndjson`).
+- stderr: `baeapi`'s own tracing logs (startup, one line per HTTP request, `/healthz` at DEBUG so health checks don't drown the log), plus forwarded child stderr (also `[name] `-prefixed).
+- Exit codes: **0** success (clean shutdown after a `SIGTERM`/`SIGINT` — the graceful drain is bounded by `BAE_LAUNCHER_API_SHUTDOWN_TIMEOUT`, so even a hung child's open trigger request only delays exit, never prevents it), **1** runtime error (an unreadable-but-present config file, or a listener bind failure), **2** usage error (malformed TOML, an unknown/wrong-shape top-level key such as a singular `[agent]` table, an invalid `request_schema`, a duplicate/blank agent `name`, an invalid `BAE_LAUNCHER_API_SHUTDOWN_TIMEOUT`).
+
+#### Fixed routes
+
+One shared `axum` router serves every configured agent's trigger route plus
+three routes present on every instance regardless of agent count:
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/agents/{name}/trigger` | Bearer, if `BAE_LAUNCHER_API_TOKEN` is set | Validate the JSON body against the agent's `request_schema`, template it into env/args, spawn, and stream the response as chunked NDJSON. |
+| `GET` | `/healthz` | never | `200 OK`, empty body. |
+| `GET` | `/_launcher/agents` | never | Every configured agent's safe presentation fields and `request_schema`, in config order — never `command`/`args`/`env`/`env_template`/`arg_template` or a resolved `${VAR}` value. |
+| `GET` | `/_launcher/agents/{name}` | never | Single-agent detail, same shape; `404` for an unknown name. |
+
+Full field-by-field schema and per-route request/response detail:
+[Harness Launchers reference](../../docs/reference/launchers.md).

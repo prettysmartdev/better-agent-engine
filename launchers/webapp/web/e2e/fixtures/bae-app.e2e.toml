@@ -1,0 +1,70 @@
+# Three-agent fixture for the browser-driven E2E suite (playwright.config.ts
+# documents the exact `baeapi` invocation that serves it). Each agent is a
+# self-contained `sh` harness, so the fixture runs anywhere with a POSIX shell
+# — no network, no provider keys.
+#
+# The `sleep` between the two output lines is what lets the E2E suite assert
+# the chat view renders the stream *live* (first line visible before the
+# second exists) rather than only after the child exits.
+
+[server]
+addr = "127.0.0.1:9091"
+
+[[agents]]
+name = "summarize"
+command = "sh"
+args = ["-c", "echo \"summarize:$AGENT_PROMPT\"; sleep 1; echo summarize-done"]
+display_name = "Summarizer"
+description = "Echoes the prompt back with a summarize: prefix."
+icon = "📝"
+
+[agents.request_schema]
+type = "object"
+required = ["prompt"]
+[agents.request_schema.properties.prompt]
+type = "string"
+
+[[agents.env_template]]
+field = "prompt"
+env = "AGENT_PROMPT"
+
+[[agents.prompts]]
+label = "Summarize the day"
+prompt = "Summarize today's activity."
+
+[[agents]]
+name = "translate"
+command = "sh"
+args = ["-c", "echo \"translate:$AGENT_TEXT\"; sleep 1; echo translate-done"]
+display_name = "Translator"
+description = "Echoes the text back with a translate: prefix."
+icon = "🌍"
+chat_input_field = "text"
+
+[agents.request_schema]
+type = "object"
+required = ["text"]
+[agents.request_schema.properties.text]
+type = "string"
+
+[[agents.env_template]]
+field = "text"
+env = "AGENT_TEXT"
+
+[[agents]]
+name = "triage"
+command = "sh"
+args = ["-c", "echo \"triage:$AGENT_PROMPT\"; echo triage-done"]
+display_name = "Triage"
+description = "Echoes the prompt back with a triage: prefix."
+icon = "🚨"
+
+[agents.request_schema]
+type = "object"
+required = ["prompt"]
+[agents.request_schema.properties.prompt]
+type = "string"
+
+[[agents.env_template]]
+field = "prompt"
+env = "AGENT_PROMPT"
