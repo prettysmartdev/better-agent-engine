@@ -302,9 +302,19 @@ async function bootStack(): Promise<Stack> {
 }
 
 async function teardownStack(s: Stack): Promise<void> {
+  // `http.Server.close()` only resolves once EVERY connection has ended, and
+  // both the browser WebSockets and the keep-alive sockets pooled by undici
+  // (fetch) and the bridge's upstream stay open well past the last test. Left
+  // to idle-timeout on their own they routinely outlast the afterAll hook
+  // budget, so force them shut: terminate the live WS clients, then
+  // `closeAllConnections()` on each HTTP server before awaiting its close.
+  for (const client of s.max.wss.clients) client.terminate();
   s.max.wss.close();
+  s.max.server.closeAllConnections();
   await new Promise<void>((r) => s.max.server.close(() => r()));
+  s.proxy.server.closeAllConnections();
   await new Promise<void>((r) => s.proxy.server.close(() => r()));
+  s.mock.closeAllConnections();
   await new Promise<void>((r) => s.mock.close(() => r()));
   s.baesrv.kill("SIGKILL");
   await new Promise<void>((r) => {

@@ -14,10 +14,13 @@
 //!
 //! The Argon2id parameters and key format below are pinned to match
 //! `server/src/store/keys.rs` **exactly** (64 MiB / t=3 / p=1 / 32-byte output;
-//! `bae_admin_` prefix; 24 bytes = 192 bits of CSPRNG entropy). Because
-//! Argon2id's PHC string embeds its own salt and cost parameters, the server
-//! verifies this hash with no shared code — both sides just implement standard
-//! PHC Argon2id.
+//! `bae_admin_` prefix; 24 bytes = 192 bits of CSPRNG entropy) — including that
+//! module's debug/test-only drop to a cheap memory/iteration cost (see the
+//! `cfg(debug_assertions)` constants below). Because Argon2id's PHC string
+//! embeds its own salt and cost parameters, the server verifies this hash with
+//! no shared code — both sides just implement standard PHC Argon2id, and a hash
+//! minted by either cost verifies under the other. Shipped release binaries on
+//! both sides always use the full floor.
 
 use argon2::password_hash::rand_core::OsRng as SaltRng;
 use argon2::password_hash::SaltString;
@@ -31,8 +34,18 @@ pub const ADMIN_KEY_PREFIX: &str = "bae_admin_";
 const KEY_ENTROPY_BYTES: usize = 24;
 
 // --- Argon2id parameters (must match server/src/store/keys.rs) ---
-const ARGON2_MEMORY_KIB: u32 = 64 * 1024; // 64 MiB
+// Release builds — the only thing shipped — use the full production floor;
+// debug/test builds drop to a cheap cost so unoptimized Argon2 doesn't make
+// hashing sluggish. Verification reads the cost from the PHC string, so a hash
+// minted under either profile still verifies under the other.
+#[cfg(not(debug_assertions))]
+const ARGON2_MEMORY_KIB: u32 = 64 * 1024; // 64 MiB (production floor)
+#[cfg(not(debug_assertions))]
 const ARGON2_ITERATIONS: u32 = 3;
+#[cfg(debug_assertions)]
+const ARGON2_MEMORY_KIB: u32 = 64; // debug/test only — cheap, never shipped
+#[cfg(debug_assertions)]
+const ARGON2_ITERATIONS: u32 = 1;
 const ARGON2_PARALLELISM: u32 = 1;
 const ARGON2_OUTPUT_LEN: usize = 32;
 

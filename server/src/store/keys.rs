@@ -16,7 +16,12 @@
 //! - **Argon2id parameters** (documented so operators can tune per deployment):
 //!   memory = 64 MiB, iterations (time cost) = 3, parallelism = 1, 32-byte
 //!   output. These meet the work item's floor (memory ≥ 64 MiB, iterations ≥ 3,
-//!   parallelism = 1).
+//!   parallelism = 1). **Debug/test builds only** substitute a cheap
+//!   memory/iteration cost (see [`ARGON2_MEMORY_KIB`]/[`ARGON2_ITERATIONS`]):
+//!   the production cost runs an order of magnitude slower unoptimized, adding
+//!   ~1 s to *every* authenticated request and pushing auth-heavy integration
+//!   tests past their timeouts, for zero security value against throwaway
+//!   loopback test keys. Shipped release binaries always use the full floor.
 //! - **Verification** recomputes the hash with the parameters embedded in the
 //!   stored PHC string and compares the raw digests with
 //!   [`subtle::ConstantTimeEq`], so a partial-match timing oracle cannot leak
@@ -54,10 +59,24 @@ pub const KEY_ENTROPY_BYTES: usize = 24;
 pub const KEY_PREFIX_LEN: usize = 8;
 
 // --- Argon2id parameters (see module docs) ---
-/// Memory cost in KiB: 65536 KiB = 64 MiB.
+// Cost is set only at hash *creation*; `verify_key` rebuilds it from the stored
+// PHC string, so a hash minted under either profile still verifies under the
+// other (only the creation cost differs). Release builds — the only thing
+// shipped — always use the full production floor; debug/test builds drop to a
+// cheap cost so unoptimized Argon2 doesn't add ~1 s to every authenticated
+// request. Keep these two blocks in sync with the module-level docs.
+/// Memory cost in KiB: 65536 KiB = 64 MiB (production floor).
+#[cfg(not(debug_assertions))]
 const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
-/// Time cost (iterations).
+/// Time cost (iterations), production floor.
+#[cfg(not(debug_assertions))]
 const ARGON2_ITERATIONS: u32 = 3;
+/// Memory cost in KiB for debug/test builds only — cheap, never shipped.
+#[cfg(debug_assertions)]
+const ARGON2_MEMORY_KIB: u32 = 64;
+/// Time cost (iterations) for debug/test builds only — cheap, never shipped.
+#[cfg(debug_assertions)]
+const ARGON2_ITERATIONS: u32 = 1;
 /// Parallelism (lanes).
 const ARGON2_PARALLELISM: u32 = 1;
 /// Output length in bytes.
