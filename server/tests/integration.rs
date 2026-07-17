@@ -5857,12 +5857,20 @@ async fn remote_subagent_dispatch_is_non_blocking_and_completes_in_background() 
     )
     .await;
 
+    // Coarse latency guard: a regression that blocks the turn on the (never-yet-
+    // released) runner would hang `send_message` until the 120 s turn timeout, so
+    // any bound comfortably below that catches it. Non-blocking dispatch returns
+    // in milliseconds; the generous margin here tolerates severe scheduler
+    // starvation on oversubscribed CI (dozens of multi-threaded test runtimes
+    // contending for a few cores), where a fast turn's client-side wall clock can
+    // still drift past a second or two. The definitive non-blocking proof is the
+    // deterministic runner-still-pending / completed-absent assertions below.
     let began = tokio::time::Instant::now();
     let (_status, response, raw) = ts
         .send_message(&sid, &skey, json!({ "content": "launch" }))
         .await;
     assert!(
-        began.elapsed() < Duration::from_secs(2),
+        began.elapsed() < Duration::from_secs(30),
         "run_turn awaited the sleeping runner: {raw}"
     );
     let launch_id = subagent_launch_id(&response);
