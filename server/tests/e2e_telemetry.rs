@@ -581,29 +581,13 @@ async fn otlp_receiver_observes_one_connected_client_server_trace_and_disabled_s
     disabled.stop().await;
 }
 
-/// A down/misconfigured collector must never add latency to, or fail, a
-/// client-facing request: OTLP export is fire-and-forget behind the batch
-/// processor / periodic reader (contract §5; work item's "collector unreachable"
-/// edge case). Point `otlp_endpoint` at a reserved-then-released loopback port
-/// (nothing listening → every export attempt refused) and drive a full agent
-/// round trip, asserting it completes normally and well inside the export
-/// timeout envelope.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn collector_unreachable_does_not_affect_request_latency_or_success() {
-    let _serial = e2e_serial().lock().await;
-    let provider_url = start_provider_mock().await;
-    // Reserve a loopback port and immediately release it: nothing is listening,
-    // so the OTLP/gRPC exporter's connection attempts are refused.
-    let dead_collector = unused_loopback_addr();
-    let server = start_server(
-        &provider_url,
-        Some(&format!(
-            "[telemetry]\nenabled = true\notlp_endpoint = \"http://{dead_collector}\"\n"
-        )),
-    )
-    .await;
-    let client_key = create_client_key(&server).await;
-
+/// Drive the canonical connect → send → close SDK round trip against `server`
+/// and return how long it took. The tool round trip plus the per-request
+/// Argon2id authentications dominate this time, so it is the hardware-dependent
+/// baseline the unreachable-collector assertion measures against — never an
+/// absolute wall-clock budget, which varies several-fold across CI runners.
+async fn timed_round_trip(server: &RunningServer) -> Duration {
+    let client_key = create_client_key(server).await;
     let tool = Tool::new(
         "get_current_time",
         "Return a deterministic test time",
@@ -615,27 +599,67 @@ async fn collector_unreachable_does_not_affect_request_latency_or_success() {
         .with_tool(tool)
         .connect()
         .await
-        .expect("SDK connect despite unreachable collector");
+        .expect("SDK connect");
     let reply = session
         .send("run the canonical tool fixture")
         .await
-        .expect("SDK send despite unreachable collector");
+        .expect("SDK send");
     assert_eq!(reply.text(), "tool round-trip complete");
-    session
-        .close()
-        .await
-        .expect("SDK close despite unreachable collector");
-    let elapsed = started.elapsed();
+    session.close().await.expect("SDK close");
+    started.elapsed()
+}
 
-    // Session authentication deliberately uses expensive password hashing, so
-    // the normal five-request round trip already takes several seconds. It
-    // nevertheless stays well below one 10-second export timeout *per
-    // request*: request-path export would make this six-span flow take tens of
-    // seconds rather than its normal single-digit duration.
+/// A down/misconfigured collector must never add latency to, or fail, a
+/// client-facing request: OTLP export is fire-and-forget behind the batch
+/// processor / periodic reader (contract §5; work item's "collector unreachable"
+/// edge case). Point `otlp_endpoint` at a reserved-then-released loopback port
+/// (nothing listening → every export attempt refused) and drive a full agent
+/// round trip, asserting it completes normally and no slower than the same flow
+/// with telemetry off.
+///
+/// The assertion is deliberately *relative* to a telemetry-disabled baseline
+/// rather than a fixed wall-clock bound. The flow's cost is dominated by five
+/// deliberately-expensive Argon2id authentications, whose debug-build runtime
+/// varies several-fold across CI hardware; an absolute bound close to that cost
+/// is flaky (a slow runner trips it even though export never touched the request
+/// path). A real request-path regression, by contrast, would add at least one
+/// full 10s `EXPORT_TIMEOUT` per exporting request — an order of magnitude above
+/// the sub-second overhead healthy fire-and-forget export adds — so a margin
+/// well below one export timeout separates the two cleanly on any hardware.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collector_unreachable_does_not_affect_request_latency_or_success() {
+    let _serial = e2e_serial().lock().await;
+    let provider_url = start_provider_mock().await;
+
+    // Baseline: the identical round trip against a telemetry-DISABLED server. No
+    // exporter exists, so nothing can be on the request path — this is the
+    // flow's irreducible, hardware-specific cost.
+    let baseline_server = start_server(&provider_url, None).await;
+    let baseline = timed_round_trip(&baseline_server).await;
+    baseline_server.stop().await;
+
+    // Reserve a loopback port and immediately release it: nothing is listening,
+    // so the OTLP/gRPC exporter's connection attempts are refused.
+    let dead_collector = unused_loopback_addr();
+    let server = start_server(
+        &provider_url,
+        Some(&format!(
+            "[telemetry]\nenabled = true\notlp_endpoint = \"http://{dead_collector}\"\n"
+        )),
+    )
+    .await;
+    let elapsed = timed_round_trip(&server).await;
+    server.stop().await;
+
+    // Healthy fire-and-forget export adds well under a second over the baseline;
+    // request-path export would add >= one 10s `EXPORT_TIMEOUT`. An 8s margin
+    // (comfortably below one export timeout, comfortably above jitter) is the
+    // dividing line, calibrated to this runner rather than an absolute bound.
+    let budget = baseline + Duration::from_secs(8);
     assert!(
-        elapsed < Duration::from_secs(15),
-        "connect/send/close took {elapsed:?} against an unreachable collector — \
+        elapsed < budget,
+        "connect/send/close took {elapsed:?} against an unreachable collector \
+         (telemetry-disabled baseline {baseline:?}, budget {budget:?}) — \
          export must stay off the request path"
     );
-    server.stop().await;
 }
