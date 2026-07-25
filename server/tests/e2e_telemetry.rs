@@ -583,9 +583,9 @@ async fn otlp_receiver_observes_one_connected_client_server_trace_and_disabled_s
 
 /// Drive the canonical connect → send → close SDK round trip against `server`
 /// and return how long it took. The tool round trip plus the per-request
-/// Argon2id authentications dominate this time, so it is the hardware-dependent
-/// baseline the unreachable-collector assertion measures against — never an
-/// absolute wall-clock budget, which varies several-fold across CI runners.
+/// Authentication and the tool round trip contribute to this time, making it
+/// the hardware-dependent baseline the unreachable-collector assertion measures
+/// against — never an absolute wall-clock budget, which varies across CI runners.
 async fn timed_round_trip(server: &RunningServer) -> Duration {
     let client_key = create_client_key(server).await;
     let tool = Tool::new(
@@ -618,14 +618,12 @@ async fn timed_round_trip(server: &RunningServer) -> Duration {
 /// with telemetry off.
 ///
 /// The assertion is deliberately *relative* to a telemetry-disabled baseline
-/// rather than a fixed wall-clock bound. The flow's cost is dominated by five
-/// deliberately-expensive Argon2id authentications, whose debug-build runtime
-/// varies several-fold across CI hardware; an absolute bound close to that cost
-/// is flaky (a slow runner trips it even though export never touched the request
-/// path). A real request-path regression, by contrast, would add at least one
-/// full 10s `EXPORT_TIMEOUT` per exporting request — an order of magnitude above
-/// the sub-second overhead healthy fire-and-forget export adds — so a margin
-/// well below one export timeout separates the two cleanly on any hardware.
+/// rather than a fixed wall-clock bound. An absolute bound would be flaky across
+/// CI hardware even though export never touches the request path. A real
+/// request-path regression, by contrast, would add at least one full 10s
+/// `EXPORT_TIMEOUT` per exporting request — an order of magnitude above the
+/// sub-second overhead healthy fire-and-forget export adds — so a margin well
+/// below one export timeout separates the two cleanly on any hardware.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn collector_unreachable_does_not_affect_request_latency_or_success() {
     let _serial = e2e_serial().lock().await;

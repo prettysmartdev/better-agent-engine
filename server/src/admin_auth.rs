@@ -10,7 +10,7 @@
 //! auth is explicitly disabled), by one of three paths:
 //!
 //! - **self-generate** (first boot, or after a rotation): mint a fresh
-//!   `bae_admin_<random>` token, store only its Argon2id hash, and write the
+//!   `bae_admin_<random>` token, store only its SHA-256 digest, and write the
 //!   plaintext to [`AdminAuthConfig::key_file`] with `0600` permissions. This is
 //!   the file `baectl` auto-reads.
 //! - **ingest a pre-provisioned hash** (multi-replica flow): if a JSON hash file
@@ -64,12 +64,11 @@ pub struct AdminAuthConfig {
 
 /// The on-disk pre-provisioned hash document (`BAE_ADMIN_KEY_HASH_FILE`).
 ///
-/// Argon2id's PHC encoding embeds its own salt and cost parameters, so the
-/// `key_hash` is independently verifiable by the server with no coordination
-/// with whatever produced it (`baectl auth create key`).
+/// `key_hash` is a bare SHA-256 hex digest, so every replica can ingest the
+/// identical value with no shared secret or hashing parameters.
 #[derive(Debug, Deserialize)]
 struct AdminKeyHashFile {
-    /// Argon2id PHC string, e.g. `$argon2id$v=19$m=65536,t=3,p=1$...`.
+    /// Lowercase-hex SHA-256 digest (64 characters).
     key_hash: String,
     /// Display prefix, e.g. `bae_admin_1a2b`.
     prefix: String,
@@ -89,7 +88,7 @@ fn default_hash_file_name() -> String {
 #[derive(Debug)]
 pub enum AdminAuthError {
     /// The hash file exists but could not be parsed (bad JSON, missing field, or
-    /// a `key_hash` that is not a valid Argon2id PHC string). An operator
+    /// a `key_hash` that is not a valid SHA-256 hex digest). An operator
     /// authoring/transfer mistake — a usage error (exit 2).
     MalformedHashFile { path: PathBuf, detail: String },
     /// A database error while reading, inserting, or revoking admin keys.
@@ -224,7 +223,7 @@ fn self_generate(store: &Store, cfg: &AdminAuthConfig) -> Result<(), AdminAuthEr
 }
 
 /// Read and validate the pre-provisioned hash file. A read error, invalid JSON,
-/// missing field, or a `key_hash` that is not a valid Argon2id PHC string is a
+/// missing field, or a `key_hash` that is not a valid SHA-256 hex digest is a
 /// usage error (the operator authored/transferred it wrong).
 fn read_hash_file(cfg: &AdminAuthConfig) -> Result<AdminKeyHashFile, AdminAuthError> {
     let raw =
@@ -243,12 +242,12 @@ fn read_hash_file(cfg: &AdminAuthConfig) -> Result<AdminKeyHashFile, AdminAuthEr
             detail: "key_hash and prefix must be non-empty".to_string(),
         });
     }
-    // Reject a hash that is not a parseable Argon2id PHC string now, at boot,
+    // Reject a hash that is not a valid SHA-256 hex digest now, at boot,
     // rather than letting every admin request silently fail to verify later.
     if !keys::is_valid_key_hash(&parsed.key_hash) {
         return Err(AdminAuthError::MalformedHashFile {
             path: cfg.hash_file.clone(),
-            detail: "key_hash is not a valid Argon2id PHC string".to_string(),
+            detail: "key_hash is not a valid SHA-256 hex digest".to_string(),
         });
     }
     Ok(parsed)

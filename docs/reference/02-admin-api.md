@@ -224,8 +224,8 @@ deleted profiles are excluded from list and get responses.
 }
 ```
 
-> **`key` is shown exactly once.** Copy the plaintext now — only an Argon2id
-> hash is stored and there is no way to retrieve the plaintext later. See
+> **`key` is shown exactly once.** Copy the plaintext now — only an unsalted
+> SHA-256 digest is stored and there is no way to retrieve the plaintext later. See
 > [Key security](#key-security) below.
 
 **Errors:**
@@ -548,26 +548,22 @@ for the underlying config file schema each part of this response reflects.
 ## Key security
 
 Keys are generated with 192 bits of entropy from the OS CSPRNG (24 random
-bytes, hex-encoded). Only an Argon2id hash is stored in SQLite — the
-plaintext is discarded immediately after it is returned to the caller. Hash
-parameters:
+bytes, hex-encoded). Only an unsalted SHA-256 digest is stored in SQLite,
+encoded as exactly 64 lowercase hexadecimal characters; the plaintext is
+discarded immediately after it is returned to the caller.
 
-| Parameter | Value |
+| Property | Value |
 |---|---|
-| Algorithm | Argon2id |
-| Memory cost | 64 MiB (65536 KiB) |
-| Time cost (iterations) | 3 |
-| Parallelism | 1 |
-| Output length | 32 bytes |
-| Salt | Fresh OS CSPRNG random per hash |
+| Token entropy | 192 bits |
+| Digest algorithm | SHA-256 |
+| Digest representation | 64 lowercase hexadecimal characters |
+| Salt | None |
+| Tunable parameters | None |
 
-Verification is constant-time (`subtle::ConstantTimeEq`) to prevent
-timing-oracle attacks. Parameters are embedded in the stored PHC string, so
-retuning them for a new deployment does not invalidate existing hashes.
-
-To tune parameters for your hardware: increase memory cost first (more
-resistant to GPU attacks), then iterations. Parallelism can be raised on
-multi-core verifiers but 1 is the conservative default.
+Verification hashes the candidate token's exact bytes and compares the
+encoded digests in constant time (`subtle::ConstantTimeEq`) to prevent
+timing-oracle attacks. The deterministic digest format requires no
+parameter or replica coordination.
 
 ### Admin keys vs. client keys
 

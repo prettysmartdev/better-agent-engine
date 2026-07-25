@@ -22,9 +22,8 @@ toml = "0.8"
 # Structured logging to stderr.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Key hashing (Argon2id) and CSPRNG. argon2 0.5 / rand 0.8 share rand_core 0.6,
-# which keeps `rand::rngs::OsRng` available as the spec requires.
-argon2 = "0.5"
+# Key hashing (SHA-256), CSPRNG, and constant-time comparison for token auth.
+sha2 = "0.10"
 rand = "0.8"
 # Constant-time comparison for key verification (timing-oracle resistant).
 subtle = "2"

@@ -566,7 +566,7 @@ SERVE OPTIONS (admin-port authentication):
     --admin-key-file <path>        Plaintext admin-key file the server writes on
                                    self-generate and baectl reads. Default
                                    /var/lib/bae/admin-key.pem; also BAE_ADMIN_KEY_FILE.
-    --admin-key-hash-file <path>   Pre-provisioned Argon2id hash file to ingest
+    --admin-key-hash-file <path>   Pre-provisioned key-hash file to ingest
                                    (read-only). Default
                                    /var/lib/bae/admin-key-hash.pem; also
                                    BAE_ADMIN_KEY_HASH_FILE.

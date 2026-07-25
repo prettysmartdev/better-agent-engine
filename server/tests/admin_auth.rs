@@ -242,10 +242,10 @@ async fn second_boot_is_a_noop() {
 async fn pre_provisioned_hash_file_is_ingested_verbatim() {
     let h = Harness::new();
     // Produce a hash file exactly as `baectl auth create key` would: a plaintext
-    // and its Argon2id PHC hash. (The cross-crate round trip lives in
+    // and its SHA-256 hex digest. (The cross-crate round trip lives in
     // baectl_cli.rs; here the server's own keys build the fixture.)
     let generated = keys::generate_admin_key();
-    let hash = keys::hash_key(&generated.plaintext).unwrap();
+    let hash = keys::hash_key(&generated.plaintext);
     std::fs::write(
         &h.hash_file,
         json!({ "key_hash": hash, "prefix": generated.prefix, "name": "provisioned-admin" })
@@ -287,7 +287,7 @@ async fn rotate_admin_key_mints_fresh_material_and_ignores_hash_file() {
     // Drop a valid hash file that rotation must *ignore* (rotation always mints
     // fresh material, never re-ingests).
     let provisioned = keys::generate_admin_key();
-    let provisioned_hash = keys::hash_key(&provisioned.plaintext).unwrap();
+    let provisioned_hash = keys::hash_key(&provisioned.plaintext);
     std::fs::write(
         &h.hash_file,
         json!({ "key_hash": provisioned_hash, "prefix": provisioned.prefix }).to_string(),
@@ -398,10 +398,10 @@ fn malformed_hash_file_is_a_usage_error_exit_2() {
     for bad in [
         "not json at all",
         r#"{"prefix": "bae_admin_1a2b"}"#, // no key_hash
-        r#"{"key_hash": "$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHQ$c29tZWhhc2g"}"#, // no prefix
+        r#"{"key_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#, // no prefix
         r#"{"key_hash": "", "prefix": "bae_admin_1a2b"}"#, // empty key_hash
-        r#"{"key_hash": "not-a-phc-string", "prefix": "bae_admin_1a2b"}"#,
-        r#"{"key_hash": "$2b$12$notargon2id", "prefix": "bae_admin_1a2b"}"#, // wrong algorithm
+        r#"{"key_hash": "not-a-sha256-hex-digest", "prefix": "bae_admin_1a2b"}"#,
+        r#"{"key_hash": "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF", "prefix": "bae_admin_1a2b"}"#, // uppercase is non-canonical
     ] {
         std::fs::write(&h.hash_file, bad).unwrap();
         let err = admin_auth::bootstrap(&h.store, &h.config(false, false))
@@ -426,7 +426,7 @@ async fn multiple_active_admin_keys_all_authenticate() {
     let first = h.read_key();
 
     let second = keys::generate_admin_key();
-    let second_hash = keys::hash_key(&second.plaintext).unwrap();
+    let second_hash = keys::hash_key(&second.plaintext);
     h.store
         .with_conn(|c| {
             keys::insert_admin_key_from_hash(c, "recovered", &second.prefix, &second_hash)

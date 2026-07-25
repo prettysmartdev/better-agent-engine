@@ -20,8 +20,8 @@ there isn't one yet, so the server:
 
 1. Generates a `bae_admin_<48 hex chars>` token from the OS CSPRNG (192 bits
    of entropy).
-2. Stores only its Argon2id hash in SQLite (`role='admin'`) — the same hash
-   parameters used for client keys, see
+2. Stores only its unsalted SHA-256 digest in SQLite (`role='admin'`), encoded
+   as 64 lowercase hex characters and verified in constant time. See
    [Admin API → Key security](../reference/02-admin-api.md#key-security).
 3. Writes the **plaintext** token to `BAE_ADMIN_KEY_FILE`
    (default `/var/lib/bae/admin-key.pem`) with `0600` permissions — readable
@@ -190,8 +190,9 @@ This writes two files into `./admin-key/`:
 
 - **`admin-key.pem`** — the plaintext `bae_admin_<random>` token. This is the
   **live credential** — treat it like a password. `0600` permissions.
-- **`admin-key-hash.pem`** — a JSON document holding the Argon2id hash of
-  that same token, plus its display prefix and `--name`. `0600` permissions,
+- **`admin-key-hash.pem`** — a JSON document holding the 64-character
+  lowercase SHA-256 digest of that same token, plus its display prefix and
+  `--name`. `0600` permissions,
   lower sensitivity (a one-way hash can't be turned back into the
   plaintext), but still worth keeping off of world-readable storage — anyone
   who can plant this file on a replica's volume before its first boot can
@@ -199,7 +200,7 @@ This writes two files into `./admin-key/`:
 
 ```json
 {
-  "key_hash": "$argon2id$v=19$m=65536,t=3,p=1$<b64salt>$<b64hash>",
+  "key_hash": "b8f15df49ca3acc355c07ed98cc11d61d7e172db85ceab49cc3ef02381f983c5",
   "prefix": "bae_admin_1a2b",
   "name": "shared-admin"
 }
@@ -225,8 +226,9 @@ write `BAE_ADMIN_KEY_FILE` (it has nothing to write; it never had the
 plaintext).
 
 A malformed hash file (bad JSON, missing `key_hash`/`prefix`, or a
-`key_hash` that isn't a valid Argon2id PHC string) is a startup usage error
-(exit `2`) — caught once at boot rather than silently ignored.
+`key_hash` that isn't exactly 64 lowercase hexadecimal characters) is a
+startup usage error (exit `2`) — caught once at boot rather than silently
+ignored.
 
 ### Step 3 — keep the plaintext wherever you run `baectl`/operate
 
@@ -246,14 +248,11 @@ need to log into any individual replica to read a self-generated key.
 
 ### Why this works with no shared code
 
-The hash file's Argon2id PHC string embeds its own salt and cost parameters.
-`baectl`'s local Argon2id implementation and the server's are independent —
-they don't share code or coordinate parameters out of band — but because
-both sides implement the standard PHC Argon2id format, the server can verify
-a hash `baectl` produced with no special-casing. This is proven by the
-integration test that generates a pair with `baectl auth create key`, feeds
-the hash into a freshly booted test server, and confirms the paired
-plaintext authenticates.
+`baectl` and `baesrv` independently hash the exact token bytes with unsalted
+SHA-256 and encode the result as the same 64 lowercase hexadecimal characters.
+There are no salts, cost parameters, or other hashing settings to coordinate;
+each replica can ingest the same digest and verify the shared plaintext in
+constant time.
 
 ---
 

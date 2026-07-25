@@ -11,28 +11,28 @@
 //! - **Entropy.** Both key bodies draw [`KEY_ENTROPY_BYTES`] (24 bytes = 192
 //!   bits, comfortably above the required 128) from the OS CSPRNG
 //!   (`rand::rngs::OsRng`).
-//! - **At rest.** Only an Argon2id hash is stored, never the plaintext. The
-//!   plaintext is returned to the caller exactly once, at creation.
-//! - **Argon2id parameters** (documented so operators can tune per deployment):
-//!   memory = 64 MiB, iterations (time cost) = 3, parallelism = 1, 32-byte
-//!   output. These meet the work item's floor (memory ≥ 64 MiB, iterations ≥ 3,
-//!   parallelism = 1). **Debug/test builds only** substitute a cheap
-//!   memory/iteration cost (see [`ARGON2_MEMORY_KIB`]/[`ARGON2_ITERATIONS`]):
-//!   the production cost runs an order of magnitude slower unoptimized, adding
-//!   ~1 s to *every* authenticated request and pushing auth-heavy integration
-//!   tests past their timeouts, for zero security value against throwaway
-//!   loopback test keys. Shipped release binaries always use the full floor.
-//! - **Verification** recomputes the hash with the parameters embedded in the
-//!   stored PHC string and compares the raw digests with
+//! - **At rest.** Only the lowercase-hex SHA-256 digest of a key is stored,
+//!   never the plaintext. The plaintext is returned to the caller exactly once,
+//!   at creation.
+//! - **Verification.** The candidate digest is recomputed and compared with
 //!   [`subtle::ConstantTimeEq`], so a partial-match timing oracle cannot leak
 //!   information.
+//!
+//! # Design note
+//!
+//! Key tokens are unique, high-entropy CSPRNG values, so salts do not add useful
+//! protection: salts defend against precomputation/rainbow tables and
+//! cross-record hash-equality leaks, both moot for these tokens. Authentication
+//! deliberately keeps its candidate-select-then-constant-time-compare shape
+//! instead of looking up `WHERE key_hash = ?`: dropping the slow KDF already meets the
+//! performance goal, while retaining the comparison preserves the explicit
+//! posture in `aspec/architecture/security.md` without relying on SQL digest
+//! comparison timing.
 
-use argon2::password_hash::rand_core::OsRng as SaltRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
-use argon2::{Algorithm, Argon2, Params, Version};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::{generate_id, NOW_SQL};
@@ -58,30 +58,6 @@ pub const KEY_ENTROPY_BYTES: usize = 24;
 /// Number of leading characters of a key stored/displayed as its prefix.
 pub const KEY_PREFIX_LEN: usize = 8;
 
-// --- Argon2id parameters (see module docs) ---
-// Cost is set only at hash *creation*; `verify_key` rebuilds it from the stored
-// PHC string, so a hash minted under either profile still verifies under the
-// other (only the creation cost differs). Release builds — the only thing
-// shipped — always use the full production floor; debug/test builds drop to a
-// cheap cost so unoptimized Argon2 doesn't add ~1 s to every authenticated
-// request. Keep these two blocks in sync with the module-level docs.
-/// Memory cost in KiB: 65536 KiB = 64 MiB (production floor).
-#[cfg(not(debug_assertions))]
-const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
-/// Time cost (iterations), production floor.
-#[cfg(not(debug_assertions))]
-const ARGON2_ITERATIONS: u32 = 3;
-/// Memory cost in KiB for debug/test builds only — cheap, never shipped.
-#[cfg(debug_assertions)]
-const ARGON2_MEMORY_KIB: u32 = 64;
-/// Time cost (iterations) for debug/test builds only — cheap, never shipped.
-#[cfg(debug_assertions)]
-const ARGON2_ITERATIONS: u32 = 1;
-/// Parallelism (lanes).
-const ARGON2_PARALLELISM: u32 = 1;
-/// Output length in bytes.
-const ARGON2_OUTPUT_LEN: usize = 32;
-
 /// A freshly generated key: the one-time plaintext plus its display prefix.
 ///
 /// `plaintext` must be shown to the operator/agent exactly once and never
@@ -97,12 +73,8 @@ pub struct GeneratedKey {
 /// Errors from hashing or verifying a key.
 #[derive(Debug)]
 pub enum KeyError {
-    /// The Argon2 parameters were rejected (should not happen with our constants).
-    Params(argon2::Error),
-    /// Hashing failed.
-    Hash(argon2::password_hash::Error),
-    /// The stored hash string was malformed / not a valid PHC string.
-    MalformedHash(argon2::password_hash::Error),
+    /// The stored key hash is not a 64-character lowercase-hex SHA-256 digest.
+    MalformedHash,
     /// A SQLite error occurred while looking up a key for authentication.
     Db(rusqlite::Error),
 }
@@ -110,9 +82,9 @@ pub enum KeyError {
 impl std::fmt::Display for KeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KeyError::Params(e) => write!(f, "invalid Argon2 parameters: {e}"),
-            KeyError::Hash(e) => write!(f, "key hashing failed: {e}"),
-            KeyError::MalformedHash(e) => write!(f, "stored key hash is malformed: {e}"),
+            KeyError::MalformedHash => {
+                write!(f, "stored key hash is not a 64-char hex digest")
+            }
             KeyError::Db(e) => write!(f, "database error during key lookup: {e}"),
         }
     }
@@ -154,76 +126,39 @@ pub fn key_prefix(key: &str) -> String {
     key.chars().take(KEY_PREFIX_LEN).collect()
 }
 
-/// Hash a plaintext key with Argon2id, returning a self-describing PHC string
-/// (algorithm, parameters, salt, and digest) suitable for storage.
-pub fn hash_key(plaintext: &str) -> Result<String, KeyError> {
-    let salt = SaltString::generate(&mut SaltRng);
-    let hash = hasher()?
-        .hash_password(plaintext.as_bytes(), &salt)
-        .map_err(KeyError::Hash)?;
-    Ok(hash.to_string())
+/// Hash a plaintext key as a lowercase-hex SHA-256 digest suitable for storage.
+pub fn hash_key(plaintext: &str) -> String {
+    to_hex(&Sha256::digest(plaintext.as_bytes()))
 }
 
-/// Verify a plaintext key against a stored PHC hash in constant time.
+/// Verify a plaintext key against a stored SHA-256 digest in constant time.
 ///
 /// Returns `Ok(true)` on match, `Ok(false)` on mismatch, and `Err` only if the
-/// stored hash cannot be parsed. The comparison recomputes the digest using the
-/// parameters recorded in `stored` (forward-compatible if we ever retune) and
-/// compares raw bytes with [`ConstantTimeEq`].
+/// stored hash is not a well-formed digest. The comparison uses the raw bytes
+/// of the lower-hex digest with [`ConstantTimeEq`].
 pub fn verify_key(plaintext: &str, stored: &str) -> Result<bool, KeyError> {
-    let parsed = PasswordHash::new(stored).map_err(KeyError::MalformedHash)?;
-    let salt = parsed.salt.ok_or(KeyError::MalformedHash(
-        argon2::password_hash::Error::SaltInvalid(
-            argon2::password_hash::errors::InvalidValue::Malformed,
-        ),
-    ))?;
-    let expected = parsed.hash.ok_or(KeyError::MalformedHash(
-        argon2::password_hash::Error::Password,
-    ))?;
+    if !is_valid_key_hash(stored) {
+        return Err(KeyError::MalformedHash);
+    }
 
-    // Rebuild the hasher from the stored PHC parameters so old hashes still
-    // verify after a parameter change.
-    let algorithm = Algorithm::try_from(parsed.algorithm).map_err(KeyError::Hash)?;
-    let params = Params::try_from(&parsed).map_err(KeyError::Hash)?;
-    let argon2 = Argon2::new(algorithm, Version::V0x13, params);
-
-    let computed = argon2
-        .hash_password(plaintext.as_bytes(), salt)
-        .map_err(KeyError::Hash)?;
-    let computed = computed
-        .hash
-        .ok_or(KeyError::Hash(argon2::password_hash::Error::Password))?;
-
-    // Constant-time compare of the raw digests. `ct_eq` returns 0 immediately
+    let computed = hash_key(plaintext);
+    // Constant-time compare of the encoded digest bytes. `ct_eq` returns 0 immediately
     // for differing lengths (lengths are not secret), and otherwise compares
     // every byte without early return.
-    Ok(bool::from(computed.as_bytes().ct_eq(expected.as_bytes())))
+    Ok(bool::from(computed.as_bytes().ct_eq(stored.as_bytes())))
 }
 
-/// Whether `stored` parses as a well-formed Argon2id PHC hash string.
+/// Whether `stored` is a well-formed lowercase-hex SHA-256 digest.
 ///
 /// Used to validate a pre-provisioned admin-key hash file at startup (so a
 /// malformed hash is rejected once, at boot, rather than silently failing every
-/// admin request later). Only checks structural validity — that the string is a
-/// parseable PHC hash naming the `argon2id` algorithm with a salt and digest —
-/// not that it hashes any particular plaintext.
+/// admin request later). Only checks structural validity, not that it hashes
+/// any particular plaintext.
 pub fn is_valid_key_hash(stored: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(stored) else {
-        return false;
-    };
-    parsed.algorithm.as_str() == "argon2id" && parsed.salt.is_some() && parsed.hash.is_some()
-}
-
-/// Build an Argon2id hasher with our fixed parameters.
-fn hasher() -> Result<Argon2<'static>, KeyError> {
-    let params = Params::new(
-        ARGON2_MEMORY_KIB,
-        ARGON2_ITERATIONS,
-        ARGON2_PARALLELISM,
-        Some(ARGON2_OUTPUT_LEN),
-    )
-    .map_err(KeyError::Params)?;
-    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+    stored.len() == 64
+        && stored
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Lowercase-hex encode, no external dependency.
@@ -244,7 +179,7 @@ fn to_hex(bytes: &[u8]) -> String {
 // `role`; every query filters by `role` so a session key can never be accepted
 // as a client key or vice versa. Session keys additionally store their owning
 // session id in the `name` column, which is how a session key is looked up for
-// authentication without an O(number-of-keys) Argon2 scan.
+// authentication without an O(number-of-keys) expensive-hash scan.
 // ---------------------------------------------------------------------------
 
 /// A key row as surfaced to the API. Deliberately omits `key_hash`, which must
@@ -286,7 +221,7 @@ pub fn insert_client_key(
     generated: &GeneratedKey,
 ) -> Result<KeyRecord, InsertError> {
     let id = generate_id(KEY_ID_PREFIX);
-    let hash = hash_key(&generated.plaintext).map_err(InsertError::Key)?;
+    let hash = hash_key(&generated.plaintext);
     let sql = format!(
         "INSERT INTO keys \
            (id, name, key_hash, key_prefix, role, profile_id, client_id, created_at) \
@@ -314,7 +249,7 @@ pub fn insert_session_key(
     generated: &GeneratedKey,
 ) -> Result<KeyRecord, InsertError> {
     let id = generate_id(KEY_ID_PREFIX);
-    let hash = hash_key(&generated.plaintext).map_err(InsertError::Key)?;
+    let hash = hash_key(&generated.plaintext);
     let sql = format!(
         "INSERT INTO keys \
            (id, name, key_hash, key_prefix, role, profile_id, client_id, created_at) \
@@ -365,8 +300,8 @@ pub fn list_client_keys(
 ///
 /// Candidates are narrowed by `key_prefix` (a public, deterministic selector)
 /// and `role = 'client'` with `deleted_at IS NULL` enforced *in the query* — a
-/// deleted key is never even hashed against. Each candidate's stored Argon2
-/// hash is verified in constant time. On success `last_used_at` is stamped and
+/// deleted key is never even hashed against. Each candidate's stored SHA-256
+/// digest is verified in constant time. On success `last_used_at` is stamped and
 /// the record returned.
 pub fn authenticate_client(conn: &Connection, token: &str) -> Result<Option<KeyRecord>, KeyError> {
     let prefix = key_prefix(token);
@@ -491,7 +426,7 @@ const STATE_CLOSED: &str = "closed";
 // Admin keys (`role='admin'`) authorize the loopback admin port. They are
 // bootstrapped once at server startup (see `crate::admin_auth`): either
 // self-generated (the server writes the plaintext to a file and stores only the
-// hash) or ingested from a pre-provisioned Argon2id hash (the server never sees
+// hash) or ingested from a pre-provisioned SHA-256 digest (the server never sees
 // the plaintext). Unlike client/session keys they carry no `profile_id`/
 // `client_id`. There is normally exactly one active admin row, but the code
 // never assumes that — a pre-provisioned replica and a manually recovered key
@@ -521,7 +456,7 @@ pub fn insert_generated_admin_key(
     generated: &GeneratedKey,
 ) -> Result<KeyRecord, InsertError> {
     let id = generate_id(KEY_ID_PREFIX);
-    let hash = hash_key(&generated.plaintext).map_err(InsertError::Key)?;
+    let hash = hash_key(&generated.plaintext);
     let sql = format!(
         "INSERT INTO keys \
            (id, name, key_hash, key_prefix, role, profile_id, client_id, created_at) \
@@ -532,11 +467,11 @@ pub fn insert_generated_admin_key(
         .map_err(InsertError::Sqlite)
 }
 
-/// Persist an admin key from a pre-provisioned Argon2id PHC hash. The server
+/// Persist an admin key from a pre-provisioned SHA-256 digest. The server
 /// never learns the plaintext in this path — this is the multi-replica
 /// pre-provisioning flow, where every replica ingests the identical hash
 /// (produced by `baectl auth create key`) so one plaintext authenticates
-/// against all of them. `key_hash` must already be a valid PHC string; `prefix`
+/// against all of them. `key_hash` must already be a valid digest; `prefix`
 /// is stored for display only.
 pub fn insert_admin_key_from_hash(
     conn: &Connection,
@@ -642,32 +577,57 @@ mod tests {
     }
 
     #[test]
-    fn hash_round_trips() {
+    fn hash_is_lowercase_hex_and_round_trips() {
         let k = generate_client_key();
-        let hash = hash_key(&k.plaintext).unwrap();
-        assert!(hash.starts_with("$argon2id$"));
+        let hash = hash_key(&k.plaintext);
+        assert_eq!(hash.len(), 64);
+        assert!(hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
         assert!(verify_key(&k.plaintext, &hash).unwrap());
     }
 
     #[test]
     fn wrong_key_is_rejected() {
-        let hash = hash_key("bae_correct").unwrap();
+        let hash = hash_key("bae_correct");
         assert!(!verify_key("bae_wrong", &hash).unwrap());
     }
 
     #[test]
-    fn distinct_salts_produce_distinct_hashes() {
-        let h1 = hash_key("bae_same").unwrap();
-        let h2 = hash_key("bae_same").unwrap();
-        assert_ne!(h1, h2, "each hash must use a fresh random salt");
-        // ...yet both verify.
+    fn hashing_is_deterministic_and_distinguishes_tokens() {
+        let h1 = hash_key("bae_same");
+        let h2 = hash_key("bae_same");
+        assert_eq!(h1, h2, "unsalted SHA-256 must be deterministic");
         assert!(verify_key("bae_same", &h1).unwrap());
         assert!(verify_key("bae_same", &h2).unwrap());
+
+        assert_ne!(
+            hash_key("bae_different"),
+            h1,
+            "different plaintext tokens must have different digests"
+        );
+    }
+
+    #[test]
+    fn key_hash_validation_accepts_only_lowercase_sha256_hex() {
+        let real_digest = hash_key("bae_example");
+        assert_eq!(
+            real_digest,
+            "eda16c9d44478e028502e6ac0245bc17b96f4bec9ee6c5ad2c971c52b6a246a0"
+        );
+        assert!(is_valid_key_hash(&real_digest));
+        assert!(!is_valid_key_hash(&real_digest.to_ascii_uppercase()));
+        assert!(!is_valid_key_hash(&"a".repeat(63)));
+        assert!(!is_valid_key_hash(&"a".repeat(65)));
+        assert!(!is_valid_key_hash(&"g".repeat(64)));
+        assert!(!is_valid_key_hash(
+            "$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHQ$c29tZWhhc2g"
+        ));
     }
 
     #[test]
     fn malformed_stored_hash_errors() {
-        assert!(verify_key("bae_x", "not-a-phc-string").is_err());
+        assert!(verify_key("bae_x", "not-a-sha256-hex-digest").is_err());
     }
 
     #[test]
@@ -685,7 +645,7 @@ mod tests {
     fn admin_key_shape_entropy_and_hash_round_trip() {
         // Mirrors `client_key_shape` + `entropy_meets_floor` + `hash_round_trips`
         // for the new admin key: prefix, ≥128 bits of entropy measured off a real
-        // key, and an Argon2id hash that verifies its own plaintext and rejects a
+        // key, and a SHA-256 digest that verifies its own plaintext and rejects a
         // wrong one (the property `baectl`'s independent hasher must match).
         let k = generate_admin_key();
         assert!(k.plaintext.starts_with(ADMIN_KEY_PREFIX));
@@ -704,8 +664,8 @@ mod tests {
         assert_eq!(k.prefix.len(), KEY_PREFIX_LEN);
         assert_eq!(k.prefix, &k.plaintext[..KEY_PREFIX_LEN]);
 
-        let hash = hash_key(&k.plaintext).unwrap();
-        assert!(hash.starts_with("$argon2id$"));
+        let hash = hash_key(&k.plaintext);
+        assert!(is_valid_key_hash(&hash));
         assert!(verify_key(&k.plaintext, &hash).unwrap());
         assert!(!verify_key("bae_admin_wrong", &hash).unwrap());
     }
@@ -718,7 +678,7 @@ mod tests {
         let correct = "bae_0000000000000000000000000000000000000000000000000";
         let near_miss = "bae_0000000000000000000000000000000000000000000000001";
         assert_eq!(correct.len(), near_miss.len());
-        let hash = hash_key(correct).unwrap();
+        let hash = hash_key(correct);
         assert!(verify_key(correct, &hash).unwrap());
         assert!(!verify_key(near_miss, &hash).unwrap());
     }
