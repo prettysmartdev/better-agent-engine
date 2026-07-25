@@ -1,10 +1,16 @@
 //! Process-level OpenTelemetry E2E coverage.
 //!
-//! Unlike `integration.rs`'s in-memory exporter tests, this starts the real
-//! `baesrv` binary with `[telemetry]` enabled and accepts the OTLP/gRPC it
-//! exports.  The Rust SDK is given a real (test-only) OTel SDK which exports to
-//! that same receiver, proving W3C propagation joins client and server spans
+//! Unlike `server/tests/integration.rs`'s in-memory exporter tests, this starts
+//! the real `baesrv` binary with `[telemetry]` enabled and accepts the OTLP/gRPC
+//! it exports.  The Rust SDK is given a real (test-only) OTel SDK which exports
+//! to that same receiver, proving W3C propagation joins client and server spans
 //! in the payload a collector actually receives.
+//!
+//! Because it needs both the real server binary and the real client SDK, this
+//! test lives in the `e2e` crate rather than in either component — see the
+//! crate docs in `e2e/src/lib.rs`. Run it with `make test-e2e` from the
+//! repository root; a bare `cargo test` works too, provided `baesrv` has been
+//! built (see [`baesrv_binary`]).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -254,6 +260,49 @@ fn test_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("bae-telemetry-e2e-{label}-{nonce}"))
 }
 
+/// Absolute path to the `baesrv` binary this suite drives.
+///
+/// While this test lived in `server/tests/`, Cargo supplied the path for free
+/// as `env!("CARGO_BIN_EXE_baesrv")`. That variable is only set for integration
+/// tests of the package that *declares* the binary, so from this crate it does
+/// not exist and the path is resolved at runtime instead:
+///
+/// 1. `$BAE_E2E_BAESRV`, which `make test` sets after building the binary. This
+///    is the supported path and the only one CI uses.
+/// 2. Failing that, `server/target/{debug,release}/baesrv`, so a bare
+///    `cargo test` still works when the server happens to be built already.
+///    `debug` wins because that is what a plain `cargo build` produces; set the
+///    env var explicitly if you want a specific profile.
+///
+/// A missing binary is a hard error naming the fix, rather than an opaque "No
+/// such file or directory" from the spawn in [`start_server`].
+fn baesrv_binary() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("BAE_E2E_BAESRV") {
+        let path = PathBuf::from(explicit);
+        assert!(
+            path.is_file(),
+            "BAE_E2E_BAESRV is set to {}, which is not a file",
+            path.display()
+        );
+        return path;
+    }
+    let server_target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("server")
+        .join("target");
+    for profile in ["debug", "release"] {
+        let candidate = server_target.join(profile).join("baesrv");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "baesrv binary not found under {}. Run `make test-e2e` from the repository root \
+         (it builds the server first), or point BAE_E2E_BAESRV at an existing binary.",
+        server_target.display()
+    );
+}
+
 async fn start_server(provider: &str, telemetry: Option<&str>) -> RunningServer {
     let dir = test_dir(if telemetry.is_some() {
         "enabled"
@@ -273,7 +322,7 @@ async fn start_server(provider: &str, telemetry: Option<&str>) -> RunningServer 
 
     let client_addr = unused_loopback_addr();
     let admin_addr = unused_loopback_addr();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_baesrv"))
+    let mut child = Command::new(baesrv_binary())
         .arg("serve")
         .arg("--config")
         .arg(&config)

@@ -1,0 +1,45 @@
+[package]
+name = "bae-e2e"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-component end-to-end tests for BAE — drives the real baesrv binary with a real client SDK"
+license = "Apache-2.0"
+# Test-only crate: it has no library or binary anyone consumes, so it is never
+# published. The `publish = false` marker here is permanent, same posture as
+# baectl / launcher-core (see aspec/devops/cicd.md).
+publish = false
+
+# This crate exists so that tests spanning *two* components have somewhere to
+# live that is downstream of both. Nothing here is a runtime dependency of
+# anything — everything is a dev-dependency, consumed only by `tests/`.
+[dev-dependencies]
+# The Rust client SDK under test. This crate depends on client-rust so that
+# `server/` does not have to: an end-to-end test that proves client and server
+# spans join into one trace needs the real, shipped client, but making the
+# server depend on its own client inverts the layering and breaks server/'s
+# standalone buildability (it also silently broke the Docker image builds,
+# since Cargo resolves dev-dependencies even for `cargo build --release`).
+bae-rs = { path = "../client-rust" }
+# Async runtime for the tests themselves. `process` spawns the real baesrv
+# binary, `net` reserves ephemeral loopback ports, `sync` backs the receiver
+# shutdown channel.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "sync"] }
+# HTTP client for the admin/client REST calls and the readiness poll. Pinned to
+# rustls to match the rest of the workspace (no OpenSSL anywhere).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The in-test mock model provider the server is pointed at.
+axum = "0.8"
+serde_json = "1"
+# OTel client-side SDK bring-up: the test installs a real tracer provider and
+# W3C propagator on the client side, so the `traceparent` the SDK emits is the
+# shipped one rather than a header the test hand-wrote.
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-webpki-roots"] }
+# The in-test OTLP/gRPC collector both sides export to. `opentelemetry-proto`
+# supplies the generated TraceService server, `tonic` the gRPC transport, and
+# `tokio-stream` adapts a bound TcpListener into the incoming stream tonic
+# serves on (so the receiver can take an ephemeral port).
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "gen-tonic-messages", "trace"] }
+tonic = { version = "0.14", features = ["transport"] }
+tokio-stream = { version = "0.1", features = ["net"] }

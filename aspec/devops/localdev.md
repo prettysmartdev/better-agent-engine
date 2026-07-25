@@ -7,7 +7,7 @@ Build tools: make (orchestration), cargo, npm, uv (per component, inside the dev
 
 Developer Loop:
 - Host requirements are only `docker` and `make`. Build the dev toolchain image once with `make dev-image` (Dockerfile.dev: Rust stable, Node 22, Python 3 + uv); the root Makefile bind-mounts the repo at /workspace and runs everything inside it.
-- Whole-repo verbs: `make build|test|lint|fmt|clean` loop over all four components. Single-component verbs: `make <verb>-<component>`, e.g. `make test-server`, `make lint-client-python`.
+- Whole-repo verbs: `make build|test|lint|fmt|clean` loop over every component in the root Makefile's `COMPONENTS`. Single-component verbs: `make <verb>-<component>`, e.g. `make test-server`, `make lint-client-python`, `make test-e2e`.
 - `make shell` opens an interactive shell in the dev container; inside it, work directly in a component with `make -C <component> <verb>`.
 - `make run` starts the server in the dev container with the port published; `make image` builds the production server image.
 

@@ -41,7 +41,13 @@ make test-max
 ```
 
 The components are `server`, `baectl`, `client-rust`, `client-typescript`,
-`client-python`, and `max`.
+`client-python`, `max`, the four `launchers/` paths (`launchers/core`,
+`launchers/schedule`, `launchers/api`, `launchers/webapp`), and `e2e`.
+
+`e2e` is the odd one out: a test-only crate for coverage that spans two
+components at once, so it can exist without either component depending on the
+other. `make test-e2e` builds `baesrv` first and runs the suite against that
+binary as a child process.
 
 Inside the dev container (or on a host with the toolchains installed) you can
 also work directly in a component directory: `make -C server test`.

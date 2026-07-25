@@ -23,7 +23,9 @@ MAX_IMAGE  ?= $(PROJECT):max
 LAUNCHER_SCHEDULE_IMAGE ?= $(PROJECT):launcher-schedule
 LAUNCHER_API_IMAGE      ?= $(PROJECT):launcher-api
 LAUNCHER_WEBAPP_IMAGE   ?= $(PROJECT):launcher-webapp
-COMPONENTS := server baectl client-rust client-typescript client-python max launchers/core launchers/schedule launchers/api launchers/webapp
+# `e2e` is last deliberately: it drives the server binary as a child process, so
+# running it after the components it exercises gives a more useful failure order.
+COMPONENTS := server baectl client-rust client-typescript client-python max launchers/core launchers/schedule launchers/api launchers/webapp e2e
 PORT       ?= 8080
 
 # Pick the container engine: docker if the CLI exists and the daemon is up,

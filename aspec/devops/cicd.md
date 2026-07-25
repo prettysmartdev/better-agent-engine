@@ -6,7 +6,8 @@ Platform: github
 
 Build & Test (`.github/workflows/test.yml`):
 - On every push (any branch) and every PR, build/lint/test all components using the same entrypoints as local dev: build the dev image (buildx + GHA layer cache, tagged as the Makefile's `DEV_IMAGE` so `ensure-dev-image` reuses it), then `make build`, `make lint`, `make test` — CI never invents steps that local dev doesn't have.
-- One job runs the full suite across all components (`server/`, `baectl/`, `client-rust/`, `client-typescript/`, `client-python/`, `max/`, `launchers/core`, `launchers/schedule`, `launchers/api`, `launchers/webapp`). Per-component path filtering is a possible future optimization, not yet implemented.
+- One job runs the full suite across all components (`server/`, `baectl/`, `client-rust/`, `client-typescript/`, `client-python/`, `max/`, `launchers/core`, `launchers/schedule`, `launchers/api`, `launchers/webapp`, `e2e/`). Per-component path filtering is a possible future optimization, not yet implemented.
+- `e2e/` runs last in the `COMPONENTS` loop. Its Makefile builds `baesrv` and passes the path via `BAE_E2E_BAESRV`, so it needs no CI step of its own — but note it is the one component whose tests spawn a real server process rather than linking the code under test.
 - `make test`/`make lint` must pass before merge. All tests are offline (no real providers/network).
 - The workflow also exposes `workflow_call` so the release workflow can reuse it as a gate.
 

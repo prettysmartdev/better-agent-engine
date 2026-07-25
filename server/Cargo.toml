@@ -67,10 +67,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # tests, so a driven turn's exported span tree can be asserted without a real
 # collector. The `testing` feature is dev-only; production never pulls it in.
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
-# Process-level telemetry E2E coverage runs the real server binary and a Rust
-# harness against an in-test OTLP/gRPC receiver.  These protocol/server types
-# are test-only; production continues to use the exporter supplied above.
-opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "gen-tonic-messages", "trace"] }
-tonic = { version = "0.14", features = ["transport"] }
-tokio-stream = { version = "0.1", features = ["net"] }
-bae-rs = { path = "../client-rust" }
+# NOTE: nothing here may be a path dependency on another component. Cargo
+# resolves dev-dependencies even for `cargo build --release`, so such an edge
+# makes server/ un-buildable on its own and breaks the Docker images, whose
+# build context is deliberately server/ + baectl/ only. Cross-component tests
+# (server binary + a real client SDK) belong in the `e2e/` crate, which sits
+# downstream of both — see e2e/src/lib.rs.
