@@ -27,10 +27,10 @@ serde_json = "1"
 # Ergonomic error enum for the CLI's error type and its exit-code mapping.
 thiserror = "2"
 # Local admin-key generation for `baectl auth create key` ONLY (every other
-# command is a pure HTTP client). Argon2id + OsRng mirror `server/Cargo.toml`'s
-# choices and parameters so the hash baectl writes is independently verifiable
-# by the server with no shared code (standard PHC Argon2id on both sides).
-argon2 = "0.5"
+# command is a pure HTTP client). SHA-256 + OsRng mirror `server/Cargo.toml`'s
+# choices exactly so the hash baectl writes is byte-for-byte the same digest
+# the server computes — a bare unsalted digest, not a self-describing hash.
+sha2 = "0.10"
 rand = "0.8"
 # `baectl setup` reads back an existing `bae-config.toml`/`.env` on the
 # idempotent Edit path (and to summarize a saved configuration). The generated

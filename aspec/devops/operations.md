@@ -19,8 +19,7 @@ Environment variables:
 - Provider credentials (e.g. `ANTHROPIC_API_KEY`) are passed through the environment of whichever process calls the provider.
 
 Secrets:
-- API keys are stored only as Argon2id salted hashes in SQLite; plaintext is shown once at creation and then discarded.
-- Argon2id parameters: memory 64 MiB, iterations (time cost) 3, parallelism 1, output 32 bytes. These are embedded in the stored PHC string, so existing hashes remain verifiable after a parameter change. To tune for your hardware: raise memory cost first (more GPU-resistant), then iterations; parallelism can be increased on multi-core verifiers.
+- API keys are high-entropy 192-bit tokens stored only as unsalted SHA-256 hex digests in SQLite and verified in constant time; there are no hashing parameters to tune and no hashing state to keep in sync across replicas.
 - Provider keys and the bootstrap admin key come from the environment / operator, are never written to the database or logs, and should be rotated on any suspicion of exposure.
 
 ## Ongoing operations

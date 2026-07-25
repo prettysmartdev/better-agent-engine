@@ -3,7 +3,7 @@
 //! The full client-facing surface: exchange a client key for a session, drive
 //! the message loop, replay the event log, and close the session. Auth is a
 //! bearer key on every request — the client key on session creation, the
-//! session key on everything else — verified with Argon2id in constant time,
+//! session key on everything else — verified with a constant-time SHA-256 digest compare,
 //! filtered by `role` and `deleted_at IS NULL` in the lookup query.
 
 use std::collections::{HashMap, HashSet};

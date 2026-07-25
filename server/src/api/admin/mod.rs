@@ -5,7 +5,7 @@
 //! reachable off-host. Like the client listener it speaks plain HTTP.
 //!
 //! Every `/admin/v1/*` route requires an `Authorization: Bearer <admin_key>`
-//! header (an active `role='admin'` key, Argon2id-verified in constant time)
+//! header (an active `role='admin'` key, SHA-256-verified in constant time)
 //! unless the operator explicitly opts out with
 //! `--dangerously-disable-admin-auth`, which restores the historical zero-auth
 //! behavior. See [`crate::admin_auth`] for the bootstrap that provisions the

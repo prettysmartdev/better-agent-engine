@@ -332,7 +332,7 @@ for the full flow.
 
   ```json
   {
-    "key_hash": "$argon2id$v=19$m=65536,t=3,p=1$<b64salt>$<b64hash>",
+    "key_hash": "b8f15df49ca3acc355c07ed98cc11d61d7e172db85ceab49cc3ef02381f983c5",
     "prefix": "bae_admin_1a2b",
     "name": "provisioned-admin"
   }
@@ -342,12 +342,11 @@ for the full flow.
   `BAE_ADMIN_KEY_HASH_FILE` resolves to, before that replica's first boot.
 
 The token is generated with 192 bits of CSPRNG entropy (24 random bytes,
-hex-encoded) and hashed with Argon2id using the exact same parameters as the
-server (memory 64 MiB, iterations 3, parallelism 1, output 32 bytes) — see
-[Key security](02-admin-api.md#key-security). Because Argon2id's PHC string
-embeds its own salt and cost parameters, the hash `baectl` produces is
-independently verifiable by the server with no shared code between the two
-binaries.
+hex-encoded) and hashed with unsalted SHA-256 over its exact bytes, then
+encoded as 64 lowercase hexadecimal characters — see
+[Key security](02-admin-api.md#key-security). The deterministic format has no
+salt or tunable parameters, so `baectl` and the server independently produce
+the same digest without shared code or out-of-band configuration.
 
 **Output:** stdout prints the two file paths (scriptable); stderr prints
 handling guidance for each file.

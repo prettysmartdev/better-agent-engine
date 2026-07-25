@@ -6,7 +6,7 @@
 //! `baectl` binary — built once as a test prerequisite from the sibling
 //! `baectl/` crate — is exec'd against it. This proves the two independently
 //! built binaries interoperate over HTTP, and (in the `auth create key` round
-//! trip) that their two independent Argon2id implementations are compatible.
+//! trip) that their two independent SHA-256 implementations are compatible.
 //! Everything is fully offline: no real network, no provider keys.
 //!
 //! Coverage (see `/awman/context/workflow/test-plan.md`):
@@ -18,7 +18,7 @@
 //!   single-page behavior;
 //! - auto-discovery precedence (key file vs. explicit `--admin-token`);
 //! - `baectl auth create key` → server `BAE_ADMIN_KEY_HASH_FILE` ingest round
-//!   trip (cross-crate Argon2id compatibility).
+//!   trip (cross-crate SHA-256 compatibility).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -525,7 +525,7 @@ async fn token_discovery_precedence() {
 }
 
 // ---------------------------------------------------------------------------
-// `baectl auth create key` → server hash ingest round trip (Argon2id compat)
+// `baectl auth create key` → server hash ingest round trip (SHA-256 compat)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -564,7 +564,7 @@ async fn auth_create_key_hash_ingest_round_trip() {
     }
 
     // Boot a FRESH server that ingests baectl's hash file, then prove the paired
-    // plaintext authenticates — the server verifies baectl's Argon2id hash with
+    // plaintext authenticates — the server verifies baectl's SHA-256 hash with
     // no shared code.
     let plaintext = std::fs::read_to_string(&key_file)
         .unwrap()

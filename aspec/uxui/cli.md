@@ -27,7 +27,7 @@ Flag guidance:
 
 `serve`'s admin-port-authentication flags (work item 0004):
 - `--admin-key-file <path>` (env `BAE_ADMIN_KEY_FILE`, default `/var/lib/bae/admin-key.pem`) — plaintext admin-key file the server writes on self-generate and `baectl` reads.
-- `--admin-key-hash-file <path>` (env `BAE_ADMIN_KEY_HASH_FILE`, default `/var/lib/bae/admin-key-hash.pem`) — pre-provisioned Argon2id hash file to ingest (read-only input).
+- `--admin-key-hash-file <path>` (env `BAE_ADMIN_KEY_HASH_FILE`, default `/var/lib/bae/admin-key-hash.pem`) — pre-provisioned key-hash file containing an unsalted SHA-256 hex digest to ingest (read-only input).
 - `--rotate-admin-key` — revoke the current admin key and mint a fresh one this boot. **Deliberate exception to the "every flag has an env-var equivalent" rule above: no env-var equivalent exists.** An env var would rotate the key on every restart of a long-lived deployment (env vars tend to be baked into compose/k8s manifests and persist across restarts) — exactly the surprising, unwanted behavior a one-shot operator action must avoid. Combining this with `--dangerously-disable-admin-auth` is a usage error (exit 2): rotating a key that won't be enforced is a contradiction.
 - `--dangerously-disable-admin-auth` (env `BAE_DANGEROUSLY_DISABLE_ADMIN_AUTH`) — serve the admin port with no authentication (the pre-0004 zero-auth behavior). **Does** get an env-var equivalent, unlike `--rotate-admin-key` above: leaving auth off is a standing deployment choice (e.g. baked into a dev-only compose file), not a one-shot action, so the usual flag/env pairing applies.
 

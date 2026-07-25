@@ -534,7 +534,7 @@ fn run_auth_create_key(args: &AuthCreateKeyArgs) -> Result<(), CliError> {
         "baectl: wrote admin key pair.\n\
          - {key}: the plaintext admin token — LIVE CREDENTIAL, keep it secret; \
          place it where baectl/operators run (at BAE_ADMIN_KEY_FILE).\n\
-         - {hash}: the Argon2id hash — drop onto every replica's data volume at \
+         - {hash}: the SHA-256 key hash — drop onto every replica's data volume at \
          BAE_ADMIN_KEY_HASH_FILE before first boot.",
         key = key_path.display(),
         hash = hash_path.display(),
