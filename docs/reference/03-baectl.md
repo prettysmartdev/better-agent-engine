@@ -3,8 +3,8 @@
 `baectl` is a command-line HTTP client for the [admin API](02-admin-api.md)
 (`/admin/v1/*`). It ships as a static binary at `/usr/local/bin/baectl` inside
 both the dev and production images, alongside `baesrv`. Run it with
-`docker exec`/`container exec` against a running container — it needs no Rust
-toolchain and no network access to build or install.
+`docker exec`/`container exec` against a running container — for admin commands
+there is nothing to install, and no Rust toolchain or network access is needed.
 
 ```sh
 docker exec bae baectl create profile main anthropic-sonnet \
@@ -14,8 +14,10 @@ docker exec bae baectl create profile main anthropic-sonnet \
 `baectl` covers **profile and key management**, plus one local scaffolding
 command, [`baectl setup`](#baectl-setup), that generates a runnable
 deployment (compose file/script, `.env`, `bae-config.toml`) before a server
-exists to talk to. It does not open sessions or send messages — those hit the
-client port (8080) with a client/session key and are documented in the
+exists to talk to. `setup` is also the one command you run on the **host**
+rather than through `docker exec`, so it needs a host-native binary (details in
+its section below). `baectl` does not open sessions or send messages — those hit
+the client port (8080) with a client/session key and are documented in the
 [Client API](00-client-api.md) and the [guides](../guides/00-quickstart.md).
 
 ---
@@ -376,18 +378,23 @@ server in the same invocation.
 **Run it on the host, not inside the image.** `setup` drives your host's
 container engine (`docker compose up -d` / `./bae-setup.sh`), so it must run
 where that engine is — not inside the production image, whose entrypoint is
-`baesrv` and which carries no `docker`/`container` client. `baectl` ships as a
-self-contained static binary inside the image; copy it out once and run it on
-the host:
+`baesrv` and which carries no `docker`/`container` client. The binary in the
+image is a static *Linux* binary built for the image, so it is not the copy to
+run on the host — a macOS host cannot execute it at all. Build a host-native
+`baectl` from a checkout instead:
 
 ```sh
-cid=$(docker create ghcr.io/prettysmartdev/better-agent-engine:latest)
-docker cp "$cid":/usr/local/bin/baectl ./baectl
-docker rm "$cid" >/dev/null
-./baectl setup
+make build-baectl        # → baectl/target/host/release/baectl
+baectl/target/host/release/baectl setup
 ```
 
-(Or use the `baectl` a source build produced.)
+> **Coming soon: a one-line installer**, which will be the normal way to get a
+> host `baectl` — no checkout or Rust toolchain:
+>
+> ```sh
+> # PLACEHOLDER — not published yet; use the source build above.
+> curl -fsSL https://<install-host-tbd>/baectl/install.sh | sh
+> ```
 
 **Flags:**
 

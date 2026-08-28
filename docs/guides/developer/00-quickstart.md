@@ -30,6 +30,10 @@ reused throughout — keep the same terminal open.
   carries the Rust, Node, and Python/uv toolchains, so `make image` and friends
   don't require any of them on your host. See [DEVELOPING.md](../../../DEVELOPING.md)
   for the full build loop.
+- **A Rust toolchain** ([rustup](https://rustup.rs)) **for Part 1, step 2 only**
+  — `baectl` runs on the host, not in a container, so `make build-baectl` builds
+  it with your toolchain for your platform. There's a Docker-only fallback on
+  Linux hosts (see that step).
 - **A provider API key** — this guide uses `ANTHROPIC_API_KEY`. Export it now;
   the server and the local example both read it:
   ```sh
@@ -65,18 +69,29 @@ make image
 
 ### 2. Get a `baectl` binary
 
-The wizard is a host-side tool, so you need `baectl` on the host. Copy it out of
-the image you just built (arch-agnostic, and guaranteed to match your build):
+The wizard is a host-side tool, so you need a `baectl` that runs on **your**
+machine. Build it from source and put it on `PATH` for the rest of this guide:
 
 ```sh
-cid=$(docker create better-agent-engine:latest)
-docker cp "$cid":/usr/local/bin/baectl ./baectl
-docker rm "$cid" >/dev/null
+make build-baectl
+export PATH="$PWD/baectl/target/host/release:$PATH"
 ```
 
-> Prefer a direct source build? `make build-baectl` cross-compiles the static
-> musl binary to `baectl/target/<arch>-unknown-linux-musl/release/baectl`. The
-> copy-out above avoids having to name the target triple.
+`build-baectl` is the one component verb that runs on the **host** rather than in
+the dev image: it compiles with your own Rust toolchain for your own platform
+(macOS included), so the binary is directly runnable. It's the only step in this
+guide that wants [Rust](https://rustup.rs) on the host — everything else still
+needs just Docker and `make`.
+
+> **Coming soon: a one-line installer**, so a host `baectl` needs no toolchain:
+>
+> ```sh
+> # PLACEHOLDER — not published yet; use `make build-baectl` above.
+> curl -fsSL https://<install-host-tbd>/baectl/install.sh | sh
+> ```
+>
+> It will install the *released* binary, so keep building from source whenever
+> you're iterating on `baectl` itself.
 
 ### 3. Run the wizard with `--dev`
 
@@ -86,7 +101,7 @@ pre-answers the wizard's "use locally-built image tags?" question. Run it from
 the repo root and **press Enter through every prompt** to accept the defaults:
 
 ```sh
-./baectl setup --dev
+baectl setup --dev
 ```
 
 It writes `docker-compose.yml`, `.env`, and `bae-config.toml` into the current
@@ -134,7 +149,7 @@ The client key is printed **once** as `key: bae_…`. Export it — Part 2 reads
 export BAE_CLIENT_KEY="bae_…"      # paste the key
 ```
 
-> On Apple's `container` CLI, run `./baectl setup --dev --apple`; admin commands
+> On Apple's `container` CLI, run `baectl setup --dev --apple`; admin commands
 > are then `container exec bae baectl …` instead of `docker compose exec baesrv
 > …`. See [`baectl setup`](../../reference/03-baectl.md#baectl-setup) for the
 > full question list and flags (including `--dev`), and
@@ -282,13 +297,16 @@ From the directory `baectl setup` wrote its files to:
 
 ```sh
 docker compose down -v          # stop the server and drop its data volume
-rm -f docker-compose.yml .env bae-config.toml baectl   # the generated files
+rm -f docker-compose.yml .env bae-config.toml   # the generated files
 ```
 
 (The webapp container in Part 3 used `--rm`, so it's already gone. If you used
 `make run/baesrv` instead, tear it down with `docker rm -f bae && docker volume
 rm bae-data`; for `make run`, `Ctrl-C` stops the dev container, which was
 started with `--rm`.)
+
+The `baectl` you built is a build artifact under `baectl/target/` —
+`make clean-baectl` drops it.
 
 Optionally drop the locally-built images and the Part 3 retag:
 
@@ -315,7 +333,7 @@ Developer-specific first, then the failures shared with the
   `make image-launcher-webapp` and the `docker tag …` retag above so
   `ghcr.io/prettysmartdev/better-agent-engine:launcher-webapp` resolves locally.
 - **The compose file still references a GHCR tag** — you ran `baectl setup`
-  without `--dev`. Re-run `./baectl setup --dev` and choose **Edit** (accepting
+  without `--dev`. Re-run `baectl setup --dev` and choose **Edit** (accepting
   every default) to rewrite `docker-compose.yml` with the local tag.
 - **`403 tool_not_allowed` when the example opens a session** — the profile
   doesn't allow `get_current_time`. Recreate it with

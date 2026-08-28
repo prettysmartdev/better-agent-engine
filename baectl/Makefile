@@ -4,10 +4,13 @@
 # `build` cross-compiles the release artifact for the musl target so the binary
 # is fully statically linked and drops into the `debian:bookworm-slim` runtime
 # image with no libc/OpenSSL dependency — the same binary shape the production
-# Dockerfile bundles. `test`/`lint`/`fmt` use the native host target (faster,
-# no cross-compilation needed to run `cargo test`/`clippy`).
+# Dockerfile bundles. It therefore assumes a Linux toolchain (the dev image, or a
+# Linux host with the musl target installed). `build-host` is the counterpart for
+# the copy a developer runs on their *own* machine. `test`/`lint`/`fmt` use the
+# native host target (faster, no cross-compilation needed to run
+# `cargo test`/`clippy`).
 
-.PHONY: help build test lint fmt clean check-static
+.PHONY: help build build-host test lint fmt clean check-static
 
 # Derive the musl target from the build host's architecture (x86_64 or aarch64)
 # so the static binary is native to whatever machine runs the build — no x86-only
@@ -19,6 +22,19 @@ help: ## Show available targets
 
 build: ## Compile the release static binary (musl target)
 	cargo build --release --target $(MUSL_TARGET)
+
+# The host-native build, for the copy of baectl a developer runs on their own
+# machine: `baectl setup` is a host-side wizard that drives the local container
+# engine from outside, so that binary has to be native to the host — a Linux/musl
+# one is unusable on macOS. No `--target`, so it picks up whatever toolchain the
+# host has. CARGO_TARGET_DIR keeps the output out of target/{release,debug},
+# which the dev-container builds write to, so the host binary is never clobbered
+# by a Linux one from `make build`/`make test` — and the path below is identical
+# on every platform, with no target triple to name. Invoked by the root
+# `make build-baectl`.
+build-host: ## Compile the release binary for this host (native toolchain)
+	CARGO_TARGET_DIR=target/host cargo build --release
+	@echo "built: $(CURDIR)/target/host/release/baectl"
 
 test: ## Run tests (native host target)
 	cargo test

@@ -51,6 +51,7 @@ Global config:
 
 Binary name: baectl
 Install path: /usr/local/bin (inside both the dev and production Docker images, alongside `baesrv`; compiled as a static `x86_64-unknown-linux-musl` binary — see devops/cicd.md and architecture/design.md's Component 5)
+Host install: `baectl setup` runs on the host, outside the container, so it needs a binary native to the host — the in-image musl binary does not serve that case (it cannot execute on macOS). Interim path is a source build (`make build-baectl`, see devops/localdev.md). **Planned and not yet built:** a one-line `curl | sh` installer for released binaries, which becomes the documented host install path; the user-facing guides carry a clearly-marked placeholder for it until then.
 Storage location: none of its own — a pure HTTP client over the admin API. `auth create key` writes two local files (`admin-key.pem`, `admin-key-hash.pem`) into an operator-chosen `--out-dir`, not a fixed storage location.
 
 ### Design principles:

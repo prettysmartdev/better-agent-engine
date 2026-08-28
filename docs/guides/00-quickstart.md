@@ -19,7 +19,11 @@ reused throughout — keep the same terminal open.
   ```sh
   export ANTHROPIC_API_KEY="sk-ant-…"
   ```
-- **This repo checked out** — Parts 2 and 3 build and run code from it.
+- **This repo checked out** — Part 1 builds `baectl` from it, and Parts 2 and 3
+  build and run code from it.
+- **A Rust toolchain** ([rustup](https://rustup.rs)) **and `make`** to build
+  `baectl` in Part 1. This goes away once the one-line installer ships (see
+  Part 1).
 - **For Part 2 only**, the toolchain for the language you pick: Node.js ≥ 20
   (TypeScript), Python ≥ 3.10 + [uv](https://docs.astral.sh/uv/) (Python), or a
   Rust toolchain (Rust).
@@ -29,20 +33,29 @@ reused throughout — keep the same terminal open.
 ## Part 1 — Start the server
 
 The quickest way to a running, configured server is the **`baectl setup`**
-wizard. `baectl` is a small static binary — a one-line `curl | sh` installer is
-on the way, but for now copy it out of the published image:
+wizard. It runs on your **host** — it drives your container engine from the
+outside — so you need a `baectl` built for your own platform. Build it from the
+checkout; this is the one step that wants a [Rust toolchain](https://rustup.rs)
+on the host:
 
 ```sh
-cid=$(docker create ghcr.io/prettysmartdev/better-agent-engine:latest)
-docker cp "$cid":/usr/local/bin/baectl ./baectl
-docker rm "$cid" >/dev/null
+make build-baectl
+export PATH="$PWD/baectl/target/host/release:$PATH"
 ```
+
+> **Coming soon: a one-line installer**, so `baectl` needs no toolchain and no
+> checkout:
+>
+> ```sh
+> # PLACEHOLDER — not published yet; use the source build above.
+> curl -fsSL https://<install-host-tbd>/baectl/install.sh | sh
+> ```
 
 Run the wizard from the repo root and **press Enter through every prompt** to
 accept the defaults:
 
 ```sh
-./baectl setup
+baectl setup
 ```
 
 It writes `docker-compose.yml`, `.env`, and `bae-config.toml` into the current
@@ -85,7 +98,7 @@ The client key is printed **once** as `key: bae_…`. Export it — Part 2 reads
 export BAE_CLIENT_KEY="bae_…"      # paste the key
 ```
 
-> On Apple's `container` CLI, run `./baectl setup --apple`; admin commands are
+> On Apple's `container` CLI, run `baectl setup --apple`; admin commands are
 > then `container exec bae baectl …` instead of `docker compose exec baesrv …`.
 > The server speaks plain HTTP on port **8080** (the admin port stays
 > loopback-only inside the container); terminate TLS upstream. See
@@ -203,17 +216,30 @@ From the directory `baectl setup` wrote its files to:
 
 ```sh
 docker compose down -v          # stop the server and drop its data volume
-rm -f docker-compose.yml .env bae-config.toml baectl   # the generated files
+rm -f docker-compose.yml .env bae-config.toml   # the generated files
 ```
 
 (The webapp container in Part 3 used `--rm`, so it's already gone. If you used
 the by-hand `docker run` path instead, tear it down with
-`docker rm -f bae && docker volume rm bae-data`.)
+`docker rm -f bae && docker volume rm bae-data`. The `baectl` you built in Part 1
+is a build artifact under `baectl/target/` — `make clean-baectl` drops it.)
 
 ---
 
 ## Troubleshooting
 
+- **The container starts, then exits with `cannot open database at
+  /var/lib/bae/bae.db: unable to open database file`** — the `bae-data` volume is
+  root-owned, so the image's non-root `bae` user can't create the SQLite file.
+  Apple's `container` (unlike docker) doesn't seed a fresh volume's ownership
+  from the image. Launchers `setup` generates now fix this themselves; if you
+  have an older `bae-setup.sh`, re-run `baectl setup` and choose **Edit** to
+  regenerate it, or repair the volume once by hand:
+  ```sh
+  container run --rm --user 0:0 --entrypoint /bin/chown \
+    --volume bae-data:/var/lib/bae \
+    ghcr.io/prettysmartdev/better-agent-engine:latest -R bae:bae /var/lib/bae
+  ```
 - **`403 tool_not_allowed` when the example opens a session** — the profile
   doesn't allow `get_current_time`. Recreate it with
   `--allowed-tool get_current_time` (Part 1).

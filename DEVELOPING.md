@@ -44,6 +44,15 @@ The components are `server`, `baectl`, `client-rust`, `client-typescript`,
 `client-python`, `max`, the four `launchers/` paths (`launchers/core`,
 `launchers/schedule`, `launchers/api`, `launchers/webapp`), and `e2e`.
 
+`make build-baectl` is the one verb that runs on the **host** instead of in the
+dev image, using your own Rust toolchain: `baectl` is a host-side tool (its
+`setup` wizard drives the local container engine from outside), so the binary has
+to be native to your machine — a Linux one from the container is useless on a
+macOS host. It lands at `baectl/target/host/release/baectl`. The static musl
+binary that ships in the images is built by the Dockerfiles, and
+`make check-static` (or `make -C baectl build` inside the dev image) reproduces
+that shape.
+
 `e2e` is the odd one out: a test-only crate for coverage that spans two
 components at once, so it can exist without either component depending on the
 other. `make test-e2e` builds `baesrv` first and runs the suite against that

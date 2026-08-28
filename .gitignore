@@ -21,6 +21,8 @@ __pycache__/
 .env.*
 data/
 bae-examples.env
+bae-config.toml
+bae-setup.sh
 
 # awman workflow internals
 .awman/workflows

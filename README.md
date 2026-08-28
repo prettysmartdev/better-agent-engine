@@ -193,10 +193,10 @@ the [Harness Launchers guide](docs/guides/11-harness-launchers.md).
 
 ## Quickstart
 
-The fastest path is the **`baectl setup`** wizard: extract the bundled `baectl`
-binary from the image and run it to scaffold `docker-compose.yml`, `.env`, and
-`bae-config.toml`, launch the server, and mint your first profile and client
-key. Prefer to start the server by hand?
+The fastest path is the **`baectl setup`** wizard: build the host `baectl` with
+`make build-baectl` (a one-line `curl | sh` installer is coming) and run it to
+scaffold `docker-compose.yml`, `.env`, and `bae-config.toml`, launch the server,
+and mint your first profile and client key. Prefer to start the server by hand?
 
 ```sh
 docker run -p 8080:8080 -v bae-data:/var/lib/bae ghcr.io/prettysmartdev/better-agent-engine:latest

@@ -82,7 +82,8 @@ endif
 # targets.
 .PHONY: help engine dev-image ensure-engine ensure-dev-image shell image image-max \
 	image-launcher-schedule image-launcher-api image-launcher-webapp run \
-	run/baesrv run/baemax build test lint fmt clean check-static image-smoke release
+	run/baesrv run/baemax build build-baectl test lint fmt clean check-static \
+	image-smoke release
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_/-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -222,6 +223,23 @@ fmt: ## Format every component
 clean: ## Clean every component's build artifacts
 build test lint fmt clean: $(DEV_IMAGE_DEP)
 	$(RUN_IN_DEV) bash -ec 'for c in $(COMPONENTS); do echo "==> $$c: $@"; make -C $$c $@; done'
+
+# baectl is the one component built on the *host* instead of in the dev image.
+# It is a host-side tool — the `baectl setup` wizard drives the local container
+# engine from outside — so the binary must be native to the machine that runs it.
+# Building it in the dev image would hand a macOS developer a Linux binary, and
+# the shipped musl target needs a Linux toolchain the host may not have. This
+# explicit rule wins over the build-% pattern below. The static musl binary that
+# ships in the images is built by the Dockerfiles; `make check-static` guards
+# that shape, and `make -C baectl build` still produces it inside the dev image.
+build-baectl: ## Build baectl for this host with the local Rust toolchain
+	@command -v cargo >/dev/null 2>&1 || { \
+		echo "error: cargo not found on PATH — build-baectl uses the host's own Rust toolchain." >&2; \
+		echo "       Install Rust (https://rustup.rs), or copy the binary out of the built" >&2; \
+		echo "       image on a Linux host — see docs/guides/developer/00-quickstart.md." >&2; \
+		exit 1; \
+	}
+	$(MAKE) -C baectl build-host
 
 # Per-component verbs: make <verb>-<component>, e.g. `make test-client-rust`.
 build-%: $(DEV_IMAGE_DEP)

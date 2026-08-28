@@ -1451,6 +1451,23 @@ fn write_apple_script(dir: &Path, config: &SetupConfig) -> Result<(), CliError> 
     ));
     out.push_str(&format!("container stop {name} >/dev/null 2>&1 || true\n"));
     out.push_str(&format!("container rm {name} >/dev/null 2>&1 || true\n\n"));
+    // Apple's `container` creates an empty, root-owned volume; unlike docker it
+    // does not seed a fresh named volume from the image's directory, whose
+    // /var/lib/bae is chowned to the non-root `bae` user the image runs as. The
+    // server would then fail its SQLite open ("unable to open database file") and
+    // exit. Fix ownership once, in a throwaway root container, before the real
+    // run — which stays non-root. Unconditional (and recursive) so it also
+    // repairs a volume left root-owned by an earlier launch, e.g. the
+    // `--user 0:0` one the root Makefile's run/baemax target uses.
+    out.push_str("# Give the image's non-root `bae` user ownership of the data volume: a\n");
+    out.push_str("# volume `container` created is root-owned, which would fail baesrv's\n");
+    out.push_str("# SQLite open. Only this throwaway container runs as root.\n");
+    out.push_str("container run --rm --user 0:0 --entrypoint /bin/chown \\\n");
+    out.push_str(&format!("  --volume {DATA_VOLUME}:/var/lib/bae \\\n"));
+    out.push_str(&format!(
+        "  {} -R bae:bae /var/lib/bae\n\n",
+        config.image_tag()
+    ));
     out.push_str(&format!("container run -d --name {name} \\\n"));
     out.push_str(&format!(
         "  --publish \"${{BAE_ADDR_PORT}}:{}\" \\\n",
@@ -2398,6 +2415,45 @@ mod tests {
         // The .env still carries the raw value verbatim for container injection.
         let env = std::fs::read_to_string(dir.path().join(ENV_FILE)).unwrap();
         assert!(env.contains("ANTHROPIC_API_KEY=$(rm -rf /)"));
+    }
+
+    // A volume Apple's `container` creates is empty and root-owned — it does not
+    // seed ownership from the image the way docker does — so the non-root `bae`
+    // user the image runs as cannot create the SQLite file and the server exits
+    // with "unable to open database file". The launcher must repair ownership in
+    // a throwaway root container *before* starting the server, and the server
+    // itself must stay non-root.
+    #[test]
+    fn apple_script_chowns_data_volume_as_root_before_a_non_root_server_run() {
+        for variant in [Variant::Standard, Variant::Max] {
+            let dir = TempDir::new("apple-chown");
+            let cfg = config(variant, false, true);
+            write_apple_script(dir.path(), &cfg).unwrap();
+            let script = std::fs::read_to_string(dir.path().join(APPLE_SCRIPT)).unwrap();
+
+            let chown = script
+                .find("--entrypoint /bin/chown")
+                .expect("no chown step: a fresh root-owned volume breaks the SQLite open");
+            let serve = script
+                .find("container run -d")
+                .expect("no server run in the launcher");
+            assert!(chown < serve, "chown must precede the server run");
+            // After the container is torn down, so nothing else holds the volume.
+            let rm = script.find("container rm").expect("no rm step");
+            assert!(rm < chown, "chown must follow the stop/rm teardown");
+            assert!(
+                script.contains("-R bae:bae /var/lib/bae"),
+                "chown must target the mounted data dir recursively"
+            );
+            // Only the throwaway container is root: exactly one --user in the file,
+            // and it belongs to the --rm chown run, not the detached server run.
+            assert_eq!(
+                script.matches("--user").count(),
+                1,
+                "the server run must not be given --user (it stays non-root)"
+            );
+            assert!(script[serve..].find("--user").is_none());
+        }
     }
 
     // Finding 4 — --dev/--apple are answerable interactively: a passed flag
