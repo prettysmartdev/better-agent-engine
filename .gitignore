@@ -23,6 +23,10 @@ data/
 bae-examples.env
 bae-config.toml
 bae-setup.sh
+# baectl build/ready/run local state — holds a plaintext client key
+# (resolved.json) and possibly harness secrets (harness.env); same
+# sensitivity class as .env above.
+.baectl/
 
 # awman workflow internals
 .awman/workflows

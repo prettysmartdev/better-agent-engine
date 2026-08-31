@@ -1,0 +1,10 @@
+[harness]
+name = "issue-triage"
+sdk = "python"
+run = "uv run python examples/issue-triage/main.py"
+working_dir = "../.."
+
+[harness.requires]
+allowed_tools = ["read_file", "write_file", "explore_files", "run_shell_command"]
+mcp_servers = ["github"]
+env = ["GITHUB_TOKEN", "TRIAGE_REPO", "TRIAGE_EXEC_MODE"]

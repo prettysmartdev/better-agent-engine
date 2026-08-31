@@ -51,7 +51,7 @@ Global config:
 
 Binary name: baectl
 Install path: /usr/local/bin (inside both the dev and production Docker images, alongside `baesrv`; compiled as a static `x86_64-unknown-linux-musl` binary — see devops/cicd.md and architecture/design.md's Component 5)
-Host install: `baectl setup` runs on the host, outside the container, so it needs a binary native to the host — the in-image musl binary does not serve that case (it cannot execute on macOS). Interim path is a source build (`make build-baectl`, see devops/localdev.md). **Planned and not yet built:** a one-line `curl | sh` installer for released binaries, which becomes the documented host install path; the user-facing guides carry a clearly-marked placeholder for it until then.
+Host install: `baectl setup`, `build`, `ready`, and `run` run on the host, outside the container and not via `docker exec`/`container exec`, so they need a binary native to the host — the in-image musl binary does not serve that case (it cannot execute on macOS). `ready` and `run` still use those subprocess wrappers internally to reach the loopback-only admin API. Interim path is a source build (`make build-baectl`, see devops/localdev.md). **Planned and not yet built:** a one-line `curl | sh` installer for released binaries, which becomes the documented host install path; the user-facing guides carry a clearly-marked placeholder for it until then.
 Storage location: none of its own — a pure HTTP client over the admin API. `auth create key` writes two local files (`admin-key.pem`, `admin-key-hash.pem`) into an operator-chosen `--out-dir`, not a fixed storage location.
 
 ### Design principles:
@@ -65,6 +65,9 @@ Verb-first, resource-typed positional, mapping 1:1 onto the admin API's CRUD sur
 - `delete profile <id>` / `delete key <id>`
 - `auth create key` — local-only admin-key-pair generation (no API call); pre-provisions a shared admin credential across multiple server replicas.
 - `setup` — interactive quickstart wizard; local scaffolding (generates a launcher, `.env`, and `bae-config.toml`) with an optional final step that launches the deployment and creates a first profile/key. See [Setup wizard](#setup-wizard) below and [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup) for the full question list.
+- `build <harness> [--sdk <sdk>] [--harness-dir <path>] [--launcher <launcher>] [--id <id>] [--dev] [--dir <path>]` — package a bundled or external client harness as a local artifact or launcher image.
+- `ready <id> [--fix] [--dir <path>] [--dev]` — check a built harness's server, profile, key, registry, and environment readiness, optionally applying safe fixes.
+- `run <id> [--dir <path>] [--no-ready] [--server-url <url>] [--dev]` — launch a ready local harness or detached launcher container and show where/how to use it.
 
 Profiles get the full CRUD set; keys get create/list/delete only — there is
 no single-key-get or key-update endpoint on the admin API (keys are
@@ -84,13 +87,13 @@ Flag guidance (same conventions as `baesrv` above):
   document the admin API returned (an array for an auto-paginated list);
   default is a compact human-readable summary/table.
 - `--help` on every command and subcommand.
-- `setup`-only flags, not shared with the rest of `baectl` (no admin-API
-  call to make, so no `--json`/auto-configuration flags apply): `--dev`
-  (use locally-built `make image`/`make image-max` tags instead of the
-  published GHCR tags), `--apple` (emit a `bae-setup.sh` script driving
-  Apple's `container` CLI instead of `docker-compose.yml`), `--dir <DIR>`
-  (directory to read/write the generated files in, default `.`, mirroring
-  `auth create key`'s `--out-dir`).
+- `setup`-specific flag: `--apple` (emit a `bae-setup.sh` script driving
+  Apple's `container` CLI instead of `docker-compose.yml`). The host-invoked
+  `build`, `ready`, and `run` commands also accept `--dev` (use locally-built
+  images/binaries instead of published tags) and `--dir <DIR>` (workspace
+  directory, default `.`), as shown above; `build` additionally accepts
+  `--sdk`, `--harness-dir`, `--launcher`, and `--id`, `ready` accepts `--fix`,
+  and `run` accepts `--no-ready` and `--server-url`.
 
 #### Auto-configuration
 Unlike `baesrv`, `baectl` is a client with nothing to bind — its
@@ -117,15 +120,18 @@ I/O Guidance (identical to `baesrv`'s conventions):
   itself, e.g. a malformed `--fallback` spec).
 
 ##### Setup wizard
-`setup` is the **one** `baectl` command whose "stdin: unused" line above does
+`setup` is the primary `baectl` command whose "stdin: unused" line above does
 not apply — it reads interactive stdin/stdout Q&A (each question defaulted,
 so a bare enter walks the whole wizard) to build a deployment before a server
-exists to talk to. When stdin isn't a TTY (piped/CI), every question falls
-back to its default with nothing printed, and the launch question
-specifically defaults to declining rather than the interactive default — see
+exists to talk to. `ready --fix` reads a confirmation before applying fixes,
+and container-mode `run` may prompt for missing harness secrets. When stdin
+isn't a TTY (piped/CI), every setup question falls back to its default with
+nothing printed, and the launch question specifically defaults to declining
+rather than the interactive default — see
 [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup)
 for the full question list, generated-file shapes, and exit codes. Every
-other `baectl` command's "stdin: unused" line stays accurate.
+other `baectl` command's "stdin: unused" line stays accurate unless one of
+those explicit prompts applies.
 
 See [baectl reference](../../docs/reference/03-baectl.md) for the complete,
 implementation-verified command surface, and

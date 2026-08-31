@@ -50,12 +50,8 @@
 //! already works with zero flags in-container — and parses its `--json` output,
 //! rather than building a host-side request against an unreachable port.
 
-#[cfg(test)]
-use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::VecDeque;
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -63,6 +59,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::engine::{extract_env_var, Engine, Prompter, APPLE_SCRIPT, COMPOSE_FILE};
 use crate::error::CliError;
 
 // -- Image tags -------------------------------------------------------------
@@ -84,11 +81,11 @@ const CONTAINER_CONFIG_PATH: &str = "/etc/bae/config.toml";
 /// The named data volume both launchers mount at `/var/lib/bae`.
 const DATA_VOLUME: &str = "bae-data";
 
-/// The three generated file names (the launcher varies by output mode).
-const COMPOSE_FILE: &str = "docker-compose.yml";
-const APPLE_SCRIPT: &str = "bae-setup.sh";
-const ENV_FILE: &str = ".env";
-const CONFIG_FILE: &str = "bae-config.toml";
+/// The two mode-independent generated file names (the launcher name —
+/// [`COMPOSE_FILE`] / [`APPLE_SCRIPT`] — varies by output mode and lives in
+/// [`crate::engine`], the single owner of the launcher-file convention).
+pub(crate) const ENV_FILE: &str = ".env";
+pub(crate) const CONFIG_FILE: &str = "bae-config.toml";
 
 /// The documented `BAE_*` questions of step 5 and their server defaults
 /// (`docs/reference/05-configuration.md`'s Environment Variables table). Only a
@@ -243,163 +240,14 @@ impl SetupConfig {
             (Variant::Max, true) => DEV_MAX,
         }
     }
-}
 
-// -- Prompt helpers ---------------------------------------------------------
-
-/// Minimal stdin/stdout prompter — no prompting crate (the project's stated
-/// minimal-dependency preference). When stdin is not a TTY, every question
-/// silently resolves to its default (equivalent to hitting enter through the
-/// whole wizard); the launch question is the one documented exception.
-struct Prompter {
-    interactive: bool,
-    /// Kept as a test-visible signal so non-interactive tests can prove that
-    /// no question was rendered. Production does not need to count prompts.
-    #[cfg(test)]
-    prompt_count: Cell<usize>,
-    /// Unit tests supply a finite transcript while preserving the exact
-    /// validation/re-prompt code used by a terminal invocation.
-    #[cfg(test)]
-    scripted_answers: RefCell<Option<VecDeque<String>>>,
-}
-
-impl Prompter {
-    fn new() -> Prompter {
-        Prompter {
-            interactive: io::stdin().is_terminal(),
-            #[cfg(test)]
-            prompt_count: Cell::new(0),
-            #[cfg(test)]
-            scripted_answers: RefCell::new(None),
-        }
-    }
-
-    #[cfg(test)]
-    fn scripted(answers: &[&str]) -> Prompter {
-        Prompter {
-            interactive: true,
-            prompt_count: Cell::new(0),
-            scripted_answers: RefCell::new(Some(
-                answers.iter().map(|answer| (*answer).to_string()).collect(),
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    fn non_interactive() -> Prompter {
-        Prompter {
-            interactive: false,
-            prompt_count: Cell::new(0),
-            scripted_answers: RefCell::new(None),
-        }
-    }
-
-    #[cfg(test)]
-    fn record_prompt(&self) {
-        self.prompt_count.set(self.prompt_count.get() + 1);
-    }
-
-    #[cfg(test)]
-    fn next_scripted_answer(&self) -> Option<String> {
-        self.scripted_answers
-            .borrow_mut()
-            .as_mut()
-            .and_then(VecDeque::pop_front)
-    }
-
-    /// Read one line, returning the shown default on a bare enter / EOF. In
-    /// non-interactive mode the default is returned without printing anything.
-    fn ask_line(&self, question: &str, default: &str) -> String {
-        if !self.interactive {
-            return default.to_string();
-        }
-        #[cfg(test)]
-        self.record_prompt();
-        #[cfg(test)]
-        if self.scripted_answers.borrow().is_some() {
-            return self.next_scripted_answer().unwrap_or_default();
-        }
-        print!("{question} [{default}]: ");
-        let _ = io::stdout().flush();
-        let mut buf = String::new();
-        match io::stdin().read_line(&mut buf) {
-            Ok(0) | Err(_) => default.to_string(),
-            Ok(_) => {
-                let t = buf.trim();
-                if t.is_empty() {
-                    default.to_string()
-                } else {
-                    t.to_string()
-                }
-            }
-        }
-    }
-
-    /// Ask a validated free-form question, re-prompting on invalid input rather
-    /// than aborting. Defaults are always valid by construction, so the
-    /// non-interactive path (which only ever yields the default) validates once
-    /// and returns; it never loops.
-    fn ask_validated<T>(
-        &self,
-        question: &str,
-        default: &str,
-        mut validate: impl FnMut(&str) -> Result<T, String>,
-    ) -> T {
-        loop {
-            let answer = self.ask_line(question, default);
-            match validate(&answer) {
-                Ok(v) => return v,
-                // In non-interactive mode `answer` is always the default, which
-                // is valid by construction; re-prompting would loop forever, so
-                // fall back to the raw default string as the value is unusable
-                // only if a caller passed an invalid default (a programmer bug).
-                Err(_) if !self.interactive => {
-                    // Retry once against the default; if the default is itself
-                    // invalid this is a bug, but we must not hang a CI run.
-                    return validate(default)
-                        .unwrap_or_else(|msg| panic!("invalid non-interactive default: {msg}"));
-                }
-                Err(msg) => eprintln!("  {msg}"),
-            }
-        }
-    }
-
-    /// Ask a `[y/N]`-style question. Non-interactive resolves to `default`.
-    fn ask_yes_no(&self, question: &str, default_yes: bool) -> bool {
-        if !self.interactive {
-            return default_yes;
-        }
-        let hint = if default_yes { "Y/n" } else { "y/N" };
-        loop {
-            #[cfg(test)]
-            self.record_prompt();
-            #[cfg(test)]
-            if self.scripted_answers.borrow().is_some() {
-                match self
-                    .next_scripted_answer()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "" => return default_yes,
-                    "y" | "yes" => return true,
-                    "n" | "no" => return false,
-                    _ => continue,
-                }
-            }
-            print!("{question} [{hint}]: ");
-            let _ = io::stdout().flush();
-            let mut buf = String::new();
-            match io::stdin().read_line(&mut buf) {
-                Ok(0) | Err(_) => return default_yes,
-                Ok(_) => match buf.trim().to_ascii_lowercase().as_str() {
-                    "" => return default_yes,
-                    "y" | "yes" => return true,
-                    "n" | "no" => return false,
-                    _ => eprintln!("  please answer y or n"),
-                },
-            }
+    /// The container engine + target service/container name to `exec baectl`
+    /// against, derived from the output mode and image variant.
+    fn engine(&self) -> Engine {
+        if self.apple {
+            Engine::apple(self.variant.apple_container_name())
+        } else {
+            Engine::docker(self.variant.service_name())
         }
     }
 }
@@ -449,6 +297,46 @@ struct ExistingProvider {
     provider: String,
     model: String,
     auth_token: String,
+}
+
+/// A read-only view of `bae-config.toml`'s registry sections
+/// (`[providers]`/`[mcp]`) that the harness `ready`/`run` checks inspect. Kept
+/// deliberately minimal — only the names (and each provider's `${VAR}` auth
+/// reference) the compatibility checks need.
+pub(crate) struct ConfigRegistry {
+    /// Every `[[mcp.servers]].name` declared in the registry.
+    pub(crate) mcp_server_names: Vec<String>,
+    /// Every provider, as `(registry name, auth-token env var)`. The env var is
+    /// the bare `${VAR}` name pulled from `auth_token` (`None` if it was a
+    /// literal, which `ready`'s check #5 then treats as always-resolved).
+    pub(crate) providers: Vec<(String, Option<String>)>,
+}
+
+/// Parse a `bae-config.toml`'s text into the [`ConfigRegistry`] view the
+/// harness readiness checks read. Reuses the exact same [`ExistingConfig`]
+/// deserializer the `setup` Edit-path pre-fill ([`load_prefill`]) uses, so the
+/// two readers can never drift apart.
+pub(crate) fn parse_config_registry(text: &str) -> Result<ConfigRegistry, CliError> {
+    let cfg: ExistingConfig = toml::from_str(text)
+        .map_err(|e| CliError::runtime(format!("{CONFIG_FILE} is not valid TOML: {e}")))?;
+    let mcp_server_names = cfg
+        .mcp
+        .unwrap_or_default()
+        .servers
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let providers = cfg
+        .providers
+        .unwrap_or_default()
+        .entries
+        .into_iter()
+        .map(|p| (p.name, extract_env_var(&p.auth_token)))
+        .collect();
+    Ok(ConfigRegistry {
+        mcp_server_names,
+        providers,
+    })
 }
 
 /// Pre-fill values recovered from an existing setup, used to seed Edit-path
@@ -510,14 +398,6 @@ fn validate_non_empty(field: &str, value: &str) -> Result<String, String> {
     } else {
         Ok(value.to_string())
     }
-}
-
-/// Parse `${VAR}` out of a value like `${ANTHROPIC_API_KEY}` or
-/// `Bearer ${GITHUB_TOKEN}`; returns the first bare variable name found.
-fn extract_env_var(value: &str) -> Option<String> {
-    let start = value.find("${")? + 2;
-    let end = value[start..].find('}')? + start;
-    Some(value[start..end].to_string())
 }
 
 /// Read and parse `.env` into (BAE_* overrides, other secrets). Keys are split
@@ -1754,32 +1634,10 @@ fn create_first_profile_and_key(dir: &Path, config: &SetupConfig) -> Result<(), 
     Ok(())
 }
 
-/// Run `baectl <args>` inside the launched container and return its stdout.
+/// Run `baectl <args>` inside the launched container and return its stdout,
+/// via the shared [`Engine`] exec wrapper.
 fn exec_baectl(dir: &Path, config: &SetupConfig, args: &[&str]) -> Result<String, CliError> {
-    let mut cmd = if config.apple {
-        let mut c = Command::new("container");
-        c.arg("exec")
-            .arg(config.variant.apple_container_name())
-            .arg("baectl");
-        c
-    } else {
-        let mut c = Command::new("docker");
-        c.args(["compose", "exec", "-T", config.variant.service_name()])
-            .arg("baectl");
-        c
-    };
-    cmd.args(args).current_dir(dir);
-    let output = cmd
-        .output()
-        .map_err(|e| CliError::runtime(format!("failed to exec baectl in the container: {e}")))?;
-    if !output.status.success() {
-        return Err(CliError::runtime(format!(
-            "in-container `baectl {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    config.engine().exec_baectl(dir, args)
 }
 
 // -- Filesystem + misc helpers ----------------------------------------------

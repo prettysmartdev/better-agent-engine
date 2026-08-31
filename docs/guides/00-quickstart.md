@@ -1,6 +1,10 @@
 # Quickstart
 
-Get up and running with the three things that make up a BAE deployment:
+The fastest way in is three `baectl` commands — see
+[Fastest path](#fastest-path-three-commands) right below. If you'd rather see
+each layer explained (the server, a harness talking to it, a browser-based
+launcher), the manual walkthrough that follows it covers the same ground one
+step at a time:
 
 1. **[Part 1 — the server (`baesrv`)](#part-1--start-the-server)** — one container, running and healthy.
 2. **[Part 2 — a client harness example](#part-2--run-a-client-harness-example)** — the `reference-assistant` agent, in TypeScript, Python, or Rust (your choice).
@@ -27,6 +31,110 @@ reused throughout — keep the same terminal open.
 - **For Part 2 only**, the toolchain for the language you pick: Node.js ≥ 20
   (TypeScript), Python ≥ 3.10 + [uv](https://docs.astral.sh/uv/) (Python), or a
   Rust toolchain (Rust).
+
+---
+
+## Fastest path (three commands)
+
+`baectl build`/`ready`/`run` turn a running server plus some harness code
+into a working agent conversation with no manual profile/key/env-var wiring.
+You need two things first: your provider key exported (from
+[Prerequisites](#prerequisites)) and a host `baectl` on `PATH` — that's the
+one build step, the same two lines
+[Part 1](#part-1--start-the-server) opens with:
+
+```sh
+make build-baectl
+export PATH="$PWD/baectl/target/host/release:$PATH"
+```
+
+Then, from the **repo root**:
+
+```sh
+export ANTHROPIC_API_KEY="sk-ant-…"
+baectl setup                           # once — server + provider, running
+baectl build reference-assistant       # package the example harness
+baectl run reference-assistant-rust-local   # check + fix + launch, in one step
+```
+
+- `baectl setup` writes `docker-compose.yml`/`.env`/`bae-config.toml` and
+  launches the server — you only run this once per directory. It's the same
+  command Part 1 below walks through by hand.
+- `baectl build reference-assistant` resolves the bundled Rust example under
+  `client-rust/examples/reference-assistant/` and records how to run it. It
+  prints the exact id to use next (`reference-assistant-rust-local` for the
+  Rust example over `--launcher local`, the default) — you don't need to
+  memorize the `<name>-<sdk>-<launcher>` pattern, just copy what it prints.
+- `baectl run <id>` re-checks that a profile/key exist that satisfy the
+  harness's requirements — the wizard's `default` profile allows no
+  client-side tools, while the example declares four, so `run` widens the
+  profile (additively, never dropping a name) and mints a key automatically,
+  with no prompt — then runs the example in the foreground. You'll see the
+  assistant's reply on stdout, the same round trip as
+  [Part 2](#part-2--run-a-client-harness-example) below. This is precisely the
+  `create profile --allowed-tool …` / `create key` bookkeeping Part 1 walks
+  through by hand.
+
+To inspect *what* `run` would fix without applying anything, run
+`baectl ready reference-assistant-rust-local` first — it prints the same
+six-check report and exits non-zero without launching.
+
+### The other two SDKs
+
+Swap `--sdk typescript`/`--sdk python` on the `build` step, and use the
+matching `-typescript-`/`-python-` id on `run`:
+
+```sh
+baectl build reference-assistant --sdk python
+baectl run reference-assistant-python-local
+```
+
+`--launcher local` (the default) runs the harness on your host with the
+toolchain it needs, so the language prerequisites above still apply. Python
+and Rust prepare themselves on first `run` (`uv run` syncs the virtualenv;
+`cargo run` compiles). **TypeScript does not** — its manifest's run command is
+`npm run example`, which won't install dependencies, so do this once first:
+
+```sh
+(cd client-typescript && npm install)
+```
+
+### Packaging it into a container instead
+
+Swap `--launcher local` for `schedule`, `api`, or `webapp` and `build`
+packages the same harness into a runnable launcher image — `run` then starts
+it **detached** and prints where to reach it (a clickable URL for `webapp`, a
+ready-to-copy `curl` for `api`, the cron expression for `schedule`):
+
+```sh
+baectl build reference-assistant --launcher webapp
+baectl run reference-assistant-rust-webapp     # prints: open the chat UI:  http://localhost:9090
+```
+
+This works for all three SDKs — `baectl` compiles the harness inside Docker
+and provisions the interpreter the launcher base image needs — and is the
+wired-up-to-`baesrv` counterpart to the standalone echo example in
+[Part 3](#part-3--serve-an-agent-in-the-browser-webapp-launcher) below.
+
+> **Security.** `baectl` does not set `BAE_LAUNCHER_API_TOKEN` for you, so the
+> `api`/`webapp` trigger routes on the launched container are **open** — fine on
+> `localhost`, never on a network-reachable host. Put that token in the `.env`
+> that `setup` wrote (it is forwarded into the container) and terminate TLS
+> upstream before exposing it; see the
+> [Harness Launchers security section](11-harness-launchers.md#loudly-before-anything-else-bae_launcher_api_token).
+
+### Contributors
+
+Every one of `setup`, `build`, `ready`, and `run` also takes `--dev`, so a BAE
+contributor iterating on a local client/launcher/server build can run this
+exact same loop against locally built images/binaries instead of published
+ones. The [developer quickstart](developer/00-quickstart.md#fastest-path-three-commands-all---dev)
+walks that version through end to end. See the
+[`baectl` reference](../reference/03-baectl.md#baectl-build) for the full flag
+set, what each command writes to disk, and exit codes; the
+[harness manifest reference](../reference/07-harness-manifest.md) documents
+`bae-harness.toml`, the file a harness (bundled or your own) uses to describe
+itself to `build`/`ready`/`run`.
 
 ---
 
@@ -75,16 +183,29 @@ curl -s http://localhost:8080/healthz && echo "  ← server is up"
 ```
 
 The wizard's `default` profile allows **no client-side tools**, and the
-`reference-assistant` in Part 2 declares one (`get_current_time`) — so create a
-profile that allows it, plus a client key bound to it. `baectl` runs *inside*
-the container the wizard launched (whose admin API is loopback-only), reached
-with `docker compose exec` from the directory `setup` wrote its files to:
+`reference-assistant` in Part 2 declares **four**: `get_current_time` plus the
+three builtin file tools (`read_file`, `write_file`, `explore_files`) scoped to
+the example's own `workspace/` directory. The server rejects the whole session
+open with `403 tool_not_allowed` if *any* declared tool is missing from the
+profile, so the profile has to allow all four. Create it, plus a client key
+bound to it. `baectl` runs *inside* the container the wizard launched (whose
+admin API is loopback-only), reached with `docker compose exec` from the
+directory `setup` wrote its files to:
 
 ```sh
 # Use the provider name you chose in the wizard (default: anthropic-default).
 docker compose exec baesrv baectl create profile assistant anthropic-default \
-  --allowed-tool get_current_time
+  --allowed-tool get_current_time \
+  --allowed-tool read_file \
+  --allowed-tool write_file \
+  --allowed-tool explore_files
 ```
+
+> The example's fifth tool, `run_shell_command`, is a **sandbox** tool. Those
+> are declared separately and are deliberately *not* checked against
+> `allowed_tools` — the sandbox trust boundary is the profile's allowed image
+> list — so it needs no `--allowed-tool` entry here. This is exactly the
+> bookkeeping the [fastest path](#fastest-path-three-commands) does for you.
 
 Copy the printed `id: pro_…` into the next command:
 
@@ -124,7 +245,10 @@ docker run -d --name bae \
   ghcr.io/prettysmartdev/better-agent-engine:latest
 
 docker exec bae baectl create profile assistant anthropic-sonnet \
-  --allowed-tool get_current_time
+  --allowed-tool get_current_time \
+  --allowed-tool read_file \
+  --allowed-tool write_file \
+  --allowed-tool explore_files
 docker exec bae baectl create key assistant pro_…      # paste the profile id
 export BAE_CLIENT_KEY="bae_…"                           # paste the key
 ```
@@ -140,8 +264,8 @@ baesrv` in the rest of this guide.
 ## Part 2 — Run a client harness example
 
 The `reference-assistant` is the canonical BAE agent, shipped identically in all
-three SDKs: it registers `get_current_time`, opens a session, drives the
-tool-call loop, and prints the assistant's reply. Pick **one** language — each
+three SDKs: it registers `get_current_time` and the three builtin file tools,
+opens a session, drives the tool-call loop, and prints the assistant's reply. Pick **one** language — each
 reads the `BAE_CLIENT_KEY` (and `ANTHROPIC_API_KEY`) you exported above.
 
 **TypeScript**
@@ -196,11 +320,24 @@ Open **http://localhost:9090/** and:
 2. Type a message, or click **Say hello** / **Tell a joke** — either one
    triggers the agent and streams its output into the chat live.
 
-That's the launcher end to end. To serve a **real** agent — a harness like
-Part 2's, talking to `baesrv` — you `FROM`-extend the base image, `COPY` in
-your harness binary/script and a `bae-app.toml`, and never redeclare
-`ENTRYPOINT`/`CMD`. The [Harness Launchers guide](11-harness-launchers.md) covers
-that, plus the cron (`bae-launcher-schedule`) and plain-HTTP
+That's the launcher end to end — but note this example agent just echoes; it
+never talks to `baesrv`.
+
+To serve a **real** agent — a harness like Part 2's, talking to `baesrv` —
+you have two options:
+
+- **`baectl build <harness> --launcher webapp`** does the whole thing for you:
+  it writes the extending Dockerfile and the `bae-app.toml`, compiles the
+  harness inside Docker, builds the image, and then `baectl run <id>` launches
+  it wired up to your server with a resolved profile and key. See
+  [Packaging it into a container instead](#packaging-it-into-a-container-instead)
+  above.
+- **By hand**, when you want full control: `FROM`-extend the base image, `COPY`
+  in your harness binary/script and a `bae-app.toml`, and never redeclare
+  `ENTRYPOINT`/`CMD`.
+
+The [Harness Launchers guide](11-harness-launchers.md) covers the by-hand
+route, plus the cron (`bae-launcher-schedule`) and plain-HTTP
 (`bae-launcher-api`) variants.
 
 > **Security.** The example leaves `BAE_LAUNCHER_API_TOKEN` unset, so every
@@ -217,6 +354,23 @@ From the directory `baectl setup` wrote its files to:
 ```sh
 docker compose down -v          # stop the server and drop its data volume
 rm -f docker-compose.yml .env bae-config.toml   # the generated files
+rm -rf .baectl/                 # build artifacts — see the warning below
+```
+
+> **`.baectl/` holds secrets.** `baectl ready`/`run` write
+> `.baectl/builds/<id>/resolved.json` (which carries a **plaintext client
+> key**) and `harness.env` (any harness secrets you were prompted for), both at
+> mode `0600`. The repo's `.gitignore` already covers `.baectl/`, but delete
+> the directory when you're done rather than leaving the key on disk.
+
+If you took the [container launcher path](#packaging-it-into-a-container-instead),
+`baectl run` left a **detached** container and `baectl build` left two images
+behind (the packaged image and its intermediate harness-build image):
+
+```sh
+docker rm -f reference-assistant-rust-webapp                     # the running agent
+docker rmi reference-assistant-rust-webapp:latest \
+           reference-assistant-rust-webapp-harness-build:latest  # its images
 ```
 
 (The webapp container in Part 3 used `--rm`, so it's already gone. If you used
@@ -240,9 +394,12 @@ is a build artifact under `baectl/target/` — `make clean-baectl` drops it.)
     --volume bae-data:/var/lib/bae \
     ghcr.io/prettysmartdev/better-agent-engine:latest -R bae:bae /var/lib/bae
   ```
-- **`403 tool_not_allowed` when the example opens a session** — the profile
-  doesn't allow `get_current_time`. Recreate it with
-  `--allowed-tool get_current_time` (Part 1).
+- **`403 tool_not_allowed` when the example opens a session** — the profile is
+  missing one of the four tools the example declares. The error names the
+  offending tool; the profile needs `--allowed-tool` for **all** of
+  `get_current_time`, `read_file`, `write_file`, and `explore_files` (Part 1).
+  Rather than recreating it by hand, `baectl ready <id> --fix` widens an
+  existing profile additively to cover exactly what the harness declares.
 - **The example exits complaining a provider key is unset** — export
   `ANTHROPIC_API_KEY` in the shell running the example (it fails fast locally,
   even though the key is only used server-side).

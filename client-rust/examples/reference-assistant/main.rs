@@ -75,9 +75,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
-    let prompt = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "What time is it?".to_string());
+    let prompt = std::env::var("AGENT_PROMPT").unwrap_or_else(|_| {
+        std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "What time is it?".to_string())
+    });
 
     let config = Config::new(server_url, client_key).with_client_version(bae_rs::VERSION);
 

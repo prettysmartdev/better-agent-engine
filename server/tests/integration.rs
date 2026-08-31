@@ -22,8 +22,8 @@
 //! - the revoke cascade invalidating a live session;
 //! - the JSON-RPC `/rpc` session loop: envelope error codes, live `session.event`
 //!   notification delivery on `session.sendMessage`, `session.subscribe` live +
-//!   `since_event_id` resume, and real (non-stub) MCP round trips with a local
-//!   stdio fixture MCP server (`tests/fixtures/mcp_echo_server.py`).
+//!   `since_event_id` resume, and real (non-stub) MCP round trips with the
+//!   local Cargo-built stdio fixture (`mcp_test_fixture`).
 
 #![allow(dead_code)]
 
@@ -227,7 +227,7 @@ async fn mock_handler(req: Request) -> Response {
         }
     } else if path.starts_with("/triage") {
         // A stateful scripted issue-triage agent driving the GitHub MCP fixture
-        // (`tests/fixtures/github_mock_server.py`). It reads the conversation to
+        // (`mcp_test_fixture github`). It reads the conversation to
         // decide its next tool call: list → filter PRs → per issue: fetch, then
         // either skip (marker present) or label + comment. See
         // [`triage_provider_response`].
@@ -2569,11 +2569,6 @@ fn terminal_frames(frames: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
-/// Absolute path to a file under `tests/fixtures/`.
-fn fixture(name: &str) -> String {
-    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
-}
-
 /// Build an MCP registry from a `bae-config.toml` string through the **real**
 /// loader + validator, exactly as startup would.
 fn registry_from_toml(toml: &str) -> HashMap<String, McpServerConfig> {
@@ -2587,26 +2582,29 @@ fn registry_from_toml(toml: &str) -> HashMap<String, McpServerConfig> {
     reg
 }
 
-/// A registry with one stdio server (`name`) backed by the echo fixture. If
+/// A registry with one stdio server (`name`) backed by the Cargo-built echo
+/// fixture.  Keeping the fixture in this package, rather than invoking a
+/// `python3` script, makes the offline integration suite independent of a
+/// host Python installation (macOS no longer provides one by default). If
 /// `pidfile` is given, the fixture is told to record its PID there.
 fn echo_registry(name: &str, pidfile: Option<&str>) -> HashMap<String, McpServerConfig> {
-    let fixture_path = fixture("mcp_echo_server.py");
+    let fixture_path = env!("CARGO_BIN_EXE_mcp_test_fixture");
     let args = match pidfile {
-        Some(pf) => format!("[{fixture_path:?}, {pf:?}]"),
-        None => format!("[{fixture_path:?}]"),
+        Some(pf) => format!("[\"echo\", {pf:?}]"),
+        None => "[\"echo\"]".to_owned(),
     };
     registry_from_toml(&format!(
-        "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = {args}\n"
+        "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = {fixture_path:?}\nargs = {args}\n"
     ))
 }
 
 /// A registry with one stdio server (`name`) backed by the GitHub-issues mock
-/// fixture (`tests/fixtures/github_mock_server.py`) — the offline stand-in for
-/// the GitHub MCP server the `issue-triage` example (WI 0008) drives.
+/// fixture — the offline stand-in for the GitHub MCP server the `issue-triage`
+/// example (WI 0008) drives.
 fn github_registry(name: &str) -> HashMap<String, McpServerConfig> {
-    let fixture_path = fixture("github_mock_server.py");
+    let fixture_path = env!("CARGO_BIN_EXE_mcp_test_fixture");
     registry_from_toml(&format!(
-        "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = [{fixture_path:?}]\n"
+        "[[mcp.servers]]\nname = {name:?}\ntransport = \"stdio\"\ncommand = {fixture_path:?}\nargs = [\"github\"]\n"
     ))
 }
 

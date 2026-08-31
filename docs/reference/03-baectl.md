@@ -11,12 +11,22 @@ docker exec bae baectl create profile main anthropic-sonnet \
   --allowed-tool get_current_time
 ```
 
-`baectl` covers **profile and key management**, plus one local scaffolding
-command, [`baectl setup`](#baectl-setup), that generates a runnable
-deployment (compose file/script, `.env`, `bae-config.toml`) before a server
-exists to talk to. `setup` is also the one command you run on the **host**
-rather than through `docker exec`, so it needs a host-native binary (details in
-its section below). `baectl` does not open sessions or send messages — those hit
+`baectl` covers **profile and key management**, plus four commands that run on
+the **host** rather than through `docker exec`, so each needs a host-native
+binary (details in their sections below):
+
+- [`baectl setup`](#baectl-setup) — generates a runnable deployment (compose
+  file/script, `.env`, `bae-config.toml`) and can launch it, before a server
+  exists to talk to.
+- [`baectl build`](#baectl-build), [`baectl ready`](#baectl-ready), and
+  [`baectl run`](#baectl-run) — the three verbs that turn a `setup`-launched
+  server plus some harness code into a running, wired-up agent: package a
+  harness (`build`), verify/fix its profile-and-key compatibility with the
+  server (`ready`), then launch it (`run`). Each acts on a local
+  `bae-harness.toml` manifest — see the
+  [Harness manifest reference](07-harness-manifest.md).
+
+`baectl` does not open sessions or send messages — those hit
 the client port (8080) with a client/session key and are documented in the
 [Client API](00-client-api.md) and the [guides](../guides/00-quickstart.md).
 
@@ -85,6 +95,9 @@ endpoint (keys are immutable besides revocation).
 | [`baectl delete key <id>`](#baectl-delete-key) | `DELETE /admin/v1/keys/{id}` |
 | [`baectl auth create key`](#baectl-auth-create-key) | *(local only — no API call)* |
 | [`baectl setup`](#baectl-setup) | *(local scaffolding — no API call, except post-launch `create profile`/`create key` run **inside** the container)* |
+| [`baectl build <harness>`](#baectl-build) | *(local — packages a harness into a build artifact; no API call)* |
+| [`baectl ready <id>`](#baectl-ready) | `GET /admin/v1/profiles`, `GET /admin/v1/keys`, and (additively) `POST`/`PUT` on both — all run **inside** the container, same as `setup`'s launch step |
+| [`baectl run <id>`](#baectl-run) | same admin-API access as `ready`, then launches the harness on the host or in a new container |
 
 `--help` is available on every command and subcommand (`baectl --help`,
 `baectl create --help`, `baectl create profile --help`, …).
@@ -722,6 +735,387 @@ every other `baectl` command's convention.
 
 ---
 
+### `baectl build`
+
+```
+baectl build <harness> [--sdk rust|typescript|python] [--harness-dir <path>]
+             [--launcher local|schedule|api|webapp] [--id <id>]
+             [--dev] [--dir <path>]
+```
+
+Packages a harness — a bundled example or your own project — into a disposable
+local build artifact that `ready`/`run` act on. **Runs on the host**, exactly
+like `setup`: it never opens a host-side admin client, and a container-mode
+build shells out to your local `docker`/`container` binary directly. The
+global `--admin-addr`/`--admin-token`/`--admin-key-file` flags are accepted
+(they're `global = true`) but unused here.
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `<harness>` (positional, required) | A bundled example name (`issue-triage` / `reference-assistant`), resolved under `--sdk`. Still required, but **not used for resolution**, when `--harness-dir` is given — the manifest's own `name` field is authoritative there. |
+| `--sdk <SDK>` | Which SDK directory (`client-<sdk>/`) a bundled example is resolved under: `rust` (default), `typescript`, or `python`. Has no effect with `--harness-dir` — the manifest's own `sdk` field is what actually gets recorded in the build id and `manifest.json`. |
+| `--harness-dir <path>` | Build an arbitrary directory containing its own `bae-harness.toml`, instead of a bundled example. No repo checkout required. |
+| `--launcher <LAUNCHER>` | How to package the harness: `local` (default, runs on the host), `schedule`, `api`, or `webapp` (the latter three build a container image and require the harness's `bae-harness.toml` to have a `[harness.launcher]` section). |
+| `--id <id>` | Explicit build id. Overrides the derived default verbatim and is never collision-suffixed. Must be a single non-empty path component. |
+| `--dev` | For container launchers, use the local `make image-launcher-<type>` tag (`better-agent-engine:launcher-<type>`) instead of the published `ghcr.io/prettysmartdev/better-agent-engine:launcher-<type>` tag. No effect on `--launcher local`. Recorded in the build's `manifest.json` for the [`ready`/`run` consistency-guard warning](#dev-on-ready-and-run). |
+| `--dir <path>` | Workspace directory holding `.baectl/` and the files `setup` generated. Default `.`. |
+
+**Harness resolution.** With no `--harness-dir`, `<harness>` resolves to
+`<dir>/client-<sdk>/examples/<harness>/` — a usage error if `client-<sdk>/`
+isn't found there:
+
+```
+could not resolve bundled harness '<harness>': client-<sdk>/ was not found under <dir>; use --harness-dir <path> for an external harness
+```
+
+With `--harness-dir <path>`, that directory is used directly — it must
+contain its own `bae-harness.toml` (schema:
+[Harness manifest reference](07-harness-manifest.md)), and no repo checkout is
+required at all.
+
+**Id.** Default `<name>-<sdk>-<launcher>`, taken from the harness's own
+manifest (not from `--sdk`), collision-suffixed `-2`, `-3`, … only when
+`--id` is omitted and a *different* harness/sdk/launcher combination already
+used that bare id under `--dir`. Re-running `build` for the **same**
+combination overwrites its `.baectl/builds/<id>/` files in place and prints
+`` rebuilt `<id>` `` instead of `` built `<id>` ``; a rebuild always deletes that
+build's `resolved.json` and `harness.env` first, and (for a local rebuild)
+any stale container-generation files left behind under the same explicit id —
+a changed artifact can never inherit a former readiness result or secret
+file.
+
+**`--launcher local` (default)** — no container engine involved. Writes
+`<dir>/.baectl/builds/<id>/manifest.json` only (`kind: "local"`), recording
+the harness's `run` command, its absolute `harness_dir`, `working_dir`, and
+`requires` verbatim from `bae-harness.toml`. The command itself is **not**
+run at build time — `cargo run`/`npm run`/`uv run` (etc.) build lazily on the
+first `baectl run`, which is also the point `BAE_SERVER_URL`/`BAE_CLIENT_KEY`
+become available; running it during `build` would launch the agent before
+readiness has supplied credentials.
+
+**`--launcher schedule|api|webapp`** — the harness is always compiled
+**inside Docker**, never on the host, so `build` never needs `cargo`/`npm`/`uv`
+on `PATH` for a container-mode build — only `docker`/`container`:
+
+1. **Harness build stage.** Runs
+   `docker build -f <dockerfile> [--target <target>] -t <id>-harness-build:latest <context>`.
+   `<dockerfile>` is `[harness.launcher].dockerfile` if the manifest sets one
+   (build context: the harness directory); otherwise `baectl` synthesizes a
+   per-SDK default and writes it to
+   `<dir>/.baectl/builds/<id>/Dockerfile.build.generated` (build context: the
+   harness's `working_dir` — the bundled examples' manifests live two levels
+   below their SDK project root and set `working_dir = "../.."` for exactly
+   this reason):
+
+   | `sdk` | Base image | Build command | Default artifact path |
+   |---|---|---|---|
+   | `rust` | `rust:1-bookworm` | `cargo build --release --example <name>` | `/build/target/release/<name>` |
+   | `typescript` | `node:22-bookworm` | `npm ci && npm run build` | `/opt/bae-harness/bae-harness-entrypoint` |
+   | `python` | `debian:bookworm-slim` + `python3`/`python3-venv` | `python3 -m venv /opt/bae-harness/venv && … pip install .` | `/opt/bae-harness/bae-harness-entrypoint` |
+
+   Rust compiles to a self-contained ELF binary, so its artifact path is just
+   the Cargo output. TypeScript and Python have no such artifact — their
+   harness is source plus an interpreter plus installed dependencies — so their
+   generated stages additionally **stage a self-contained tree under
+   `/opt/bae-harness`** (project sources, build output, and `node_modules` or a
+   virtualenv) and write an executable `sh` shim at
+   `/opt/bae-harness/bae-harness-entrypoint`. That shim *is* the default
+   `binary_path`, so step 2's single `COPY --from … /usr/local/bin/<name>`
+   still lands a real executable rather than a bare `.ts`/`.py` source file.
+   Python's stage deliberately uses Debian's own `python3` rather than the
+   `python:3.12` image, so the staged virtualenv's interpreter symlink still
+   resolves against the `python3` step 2 installs into the launcher image.
+
+   `[harness.launcher].binary_path` overrides the derived default path when
+   set; it is **required** when the harness supplies its own `dockerfile`
+   (`[harness.launcher].binary_path is required when dockerfile is set`) —
+   `baectl` has no way to know a custom Dockerfile's output path without
+   invoking Docker itself.
+2. **Launcher packaging.** Writes `<dir>/.baectl/builds/<id>/Dockerfile`:
+   ```dockerfile
+   FROM <base image tag>
+   COPY --from=<id>-harness-build:latest <binary_path> /usr/local/bin/<name>
+   COPY bae-{schedules,api,app}.toml /etc/bae/bae-{schedules,api,app}.toml
+   ```
+   When `baectl` also generated the build stage (i.e. the manifest sets no
+   `[harness.launcher].dockerfile`), a short SDK-specific preamble is inserted
+   between the `FROM` and the first `COPY`, and a closing `USER bae` restores
+   the launcher base's unprivileged user:
+
+   | `sdk` | Preamble |
+   |---|---|
+   | `rust` | `mkdir -p /build/examples/<name>` owned by `bae` — `cargo build --example` bakes `CARGO_MANIFEST_DIR` (`/build`) into the binary, and a harness that writes beside its own sources (every bundled example creates a `workspace/`) needs that prefix to exist and be writable. |
+   | `typescript` | Install Node 22 via the same NodeSource pattern `Dockerfile.max` uses, then `COPY --from=<harness-build> --chown=bae:bae /opt/bae-harness /opt/bae-harness`. |
+   | `python` | Install Debian's `python3`, then the same `--chown`ed `/opt/bae-harness` copy. |
+
+   The preamble exists because the `bae-launcher-*` base images are
+   `debian:bookworm-slim` with only `ca-certificates` installed: without it a
+   TypeScript or Python harness would package successfully and then fail to
+   spawn on every trigger. A harness that supplies its own
+   `[harness.launcher].dockerfile` owns its artifact's runtime requirements, so
+   **no** preamble is injected in that case — the generated file is exactly the
+   three-line shape above.
+
+   `build` also writes the matching config file — `bae-schedules.toml` (`schedule`) or
+   `bae-api.toml`/`bae-app.toml` (`api`/`webapp`) — in the same shape
+   [`examples/launchers/{schedule,api,webapp}/`](06-launchers.md) uses: one
+   `[[agents]]` entry named after the harness with
+   `command = "/usr/local/bin/<name>"`, and for `api`/`webapp` a one-field
+   `request_schema`/`env_template` keyed on `[harness.launcher].prompt_env`,
+   listening on `0.0.0.0:9090`. `--launcher schedule` additionally requires
+   `[harness.launcher].default_schedule`
+   (`[harness.launcher].default_schedule is required for --launcher schedule`
+   if absent — checked at this point, after the harness build stage has
+   already run). The base image tag follows `--dev` exactly as above.
+3. **Final build.** Runs `docker build -t <id>:latest <dir>/.baectl/builds/<id>/`,
+   then writes `manifest.json` (`kind: "container"`, `image_tag`,
+   `harness_build_image`, `launcher_type`, `port` — `9090` for `api`/`webapp`,
+   absent for `schedule` — and `requires`).
+
+   Engine choice (Docker vs. Apple `container`) follows whichever `setup`
+   already produced in `--dir`; with no prior `setup` at all, `build` defaults
+   to Docker. Unlike `ready`/`run`, **`build` does not require a prior
+   `setup`** — a container-mode build only needs `docker`/`container` and, if
+   `--dev` is passed, the locally built launcher image (`make
+   image-launcher-<type>`).
+
+**Output:** `` built `<id>` `` (or `` rebuilt `<id>` `` on a same-combo
+re-run), then `next: baectl ready <id>`.
+
+**Exit codes:**
+
+| Exit | When |
+|---|---|
+| `0` | Build completed; `manifest.json` written. |
+| `1` | A build-artifact directory or file couldn't be created/read/written; the `docker`/`container` build subprocess failed to start or exited non-zero (its own output streams above the error); the build timestamp couldn't be generated. |
+| `2` | `--dir`/`--harness-dir` doesn't exist or isn't a directory; a bundled `<harness>` couldn't be resolved (`client-<sdk>/` missing); `bae-harness.toml` is missing or malformed (message names the field); `--launcher schedule/api/webapp` was requested for a harness with no `[harness.launcher]` section; `--id` isn't a single non-empty path component; a harness-supplied `dockerfile` is missing, or its `binary_path`/`default_schedule` requirement wasn't met. |
+
+---
+
+### `baectl ready`
+
+```
+baectl ready <id> [--fix] [--dir <path>] [--dev]
+```
+
+Checks whether a build's requirements — client-side tools, MCP servers, env
+vars, a usable client key — are satisfied by the server `setup` scaffolded in
+`--dir`, and, with `--fix`, applies the safe fixes. **Runs on the host**;
+reaches the admin API the same way `setup`'s own launch step does, by
+exec'ing the in-container `baectl` (`docker compose exec -T <service> baectl
+…` / `container exec <name> baectl …`) — never a direct host connection to
+the loopback-only admin port. The global `--admin-addr`/`--admin-token`/
+`--admin-key-file` flags are accepted but unused here.
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `<id>` (positional, required) | The build id to check (`<dir>/.baectl/builds/<id>/manifest.json`, written by `baectl build`). |
+| `--fix` | After printing the report, if any fix is pending, ask **`Apply the N safe fix(es) above? [y/N]`** once and apply on `y`/`yes`. Asked even without a TTY (EOF or anything else → skip) — a state-mutating fix is never silently applied. |
+| `--dir <path>` | Workspace directory holding `.baectl/` and the files `setup` generated. Default `.`. |
+| `--dev` | Consistency guard only — see [`--dev` on `ready`/`run`](#dev-on-ready-and-run). |
+
+**The six checks**, each printed `✓`/`✗`:
+
+1. **Server reachable** — the exec'd `baectl list profiles --json` succeeds.
+   No launcher found at all in `--dir` (no `baectl setup` was ever run there),
+   or the exec itself failing, prints guidance pointing at `baectl setup`.
+   Failing this check aborts the whole pass — nothing else runs.
+2. **Compatible profile** — a profile whose `allowed_tools` and
+   `mcp_servers` are both supersets of the build's `requires`. Prefers the
+   profile from a prior `resolved.json` if it's still compatible, else the
+   first compatible one found. On `✗`, prints the exact `baectl update
+   profile …` (widen an existing profile additively — the union of its
+   current tools/servers with the harness's `requires`, never a drop) or
+   `baectl create profile …` command that would fix it. When the fix is
+   actually applied, the union is recomputed against the profile's body re-read
+   immediately before the write, not the snapshot taken at the top of the
+   check pass. The underlying `update profile` API call is a full replacement
+   and the admin API offers no compare-and-swap, so this is a single-writer
+   guarantee: a genuinely concurrent writer to the same profile (two `baectl
+   run` invocations racing, or an out-of-band `update profile`) can still lose
+   its change. Serialize `ready --fix`/`run` against a shared profile.
+3. **Required MCP servers registered** — every `requires.mcp_servers` name is
+   present among `<dir>/bae-config.toml`'s `[[mcp.servers]]` entries. Distinct
+   from #2: a profile can allow a server name the registry doesn't actually
+   define. **Always print-only** — fixing it needs a config edit *and* a
+   server restart, which `ready`/`--fix` will not do unattended — so `✗`
+   prints the TOML snippet to add plus the restart command
+   (`docker compose restart` / `./bae-setup.sh`), and always gates the pass.
+4. **Client key with a stored secret** — a plaintext-bearing key `baectl` can
+   hand to `run`: either one reused from a prior `resolved.json` (re-validated
+   against the live key list, still bound to the resolved profile), or a
+   freshly created one. This is narrower than "any key bound to the profile" —
+   `baectl` can never recover an existing key's plaintext (the admin API
+   shows it once), so an unrecoverable pre-existing key does not satisfy this
+   check. On `✗`, prints the `baectl create key …` command.
+5. **Required env vars resolvable** — `requires.env` plus the resolved
+   profile's provider auth-token var (looked up via `primary_provider` in
+   `bae-config.toml`). `kind: "local"` builds check the host process
+   environment (what `run` inherits); `kind: "container"` builds check
+   `<dir>/.env` or the host environment (what `run` passes through).
+   **Always print-only** and always gates the pass.
+6. **MAX reachability** — informational `ℹ` line with the dashboard URL, only
+   when `setup`'s image variant was `max`. Never `✗`.
+
+The pass succeeds only when #1 ∧ #2 (resolved) ∧ #3 ∧ #4 (resolved) ∧ #5 all
+hold. `--fix` only ever mutates #2/#4, and only after the single confirmation
+above; #3 and #5 are never auto-applied, with or without `--fix`.
+
+**Output:** on full success, writes
+`<dir>/.baectl/builds/<id>/resolved.json` (mode `0600`):
+
+```json
+{
+  "profile_id": "pro_…",
+  "profile_name": "default",
+  "key_id": "key_…",
+  "client_key_plaintext": "bae_…",
+  "server_url": "http://localhost:8080",
+  "max_url": "http://localhost:3000",
+  "provider_env": "ANTHROPIC_API_KEY"
+}
+```
+
+`client_key_plaintext` is present only when `baectl` legitimately holds the
+secret (just created, or carried forward from a prior `resolved.json`) — it
+is never fabricated for a key `baectl` didn't create, and is **omitted**
+(not `null`) when absent. `max_url` is likewise omitted unless the variant is
+`max`. `provider_env` records the **name** (never the value) of the resolved
+profile's provider auth-token var that check #5 accepted, so a container `run`
+can forward a value that lives only in the host environment; it is omitted when
+no provider var could be resolved. Prints `` ready: '<id>' is good to run — `baectl run <id>` ``. On any
+unresolved check, `resolved.json` is **not** written (a stale one from a
+prior run is left untouched) and `ready` exits non-zero.
+
+**Exit codes:**
+
+| Exit | When |
+|---|---|
+| `0` | All five gating checks resolved; `resolved.json` written. |
+| `1` | One or more checks remain unresolved after this pass — with `--fix`: `some checks are still unresolved (see above)`; without: `some checks failed — re-run with --fix to apply the safe fixes, or follow the guidance above`. Also: `bae-config.toml` exists but fails to parse; an admin-API exec call fails or returns unparseable output; a profile fix is needed but no provider is registered in `bae-config.toml` at all (`cannot create a compatible profile: no providers are registered in bae-config.toml — run \`baectl setup\` to configure one`). |
+| `2` | No build `<id>` found under `--dir`: `` no build '<id>' found under <dir> — run `baectl build …` first (or check --dir) ``. |
+
+<a id="dev-on-ready-and-run"></a>
+**`--dev` on `ready` and `run`.** The artifact a `ready`/`run` invocation acts
+on was already fixed at `build` time — there is nothing left for `--dev` to
+switch on either command. Both still accept it, purely as a **consistency
+guard**: if the target's `manifest.json` records a different `--dev` setting
+than this invocation used, `ready`/`run` print a warning to stderr (never a
+hard failure) naming the mismatch:
+
+```
+baectl: warning — build 'reference-assistant-rust-api' was built --dev but you invoked this without --dev; the artifact is already fixed, so --dev has no functional effect here
+```
+
+---
+
+### `baectl run`
+
+```
+baectl run <id> [--dir <path>] [--no-ready] [--server-url <url>] [--dev]
+```
+
+Launches a built harness. By default `run` first performs the **same six
+checks as `ready`** (re-validating, not just trusting, any existing
+`resolved.json`) and **auto-applies the #2/#4 safe fixes with no prompt** —
+printing `fixed: …` for each — which is what keeps `setup` → `build` → `run`
+a genuinely non-interactive path. An unresolved #3/#5 aborts with the same
+guidance `ready` prints, plus a pointer to `baectl ready <id>` for the full
+report. **Runs on the host**, same admin-API access path as `ready`.
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `<id>` (positional, required) | The build id to launch. |
+| `--dir <path>` | Workspace directory holding `.baectl/` and the files `setup` generated. Default `.`. |
+| `--no-ready` | Skip the check pass entirely and launch straight from the existing `resolved.json`. Fails loudly if it's absent, or present but missing a stored plaintext key (a hand-edited or stale file). |
+| `--server-url <url>` | Override the server URL the harness is given, in place of `resolved.json`'s `server_url` (the auto-derived container address). Does not rewrite `resolved.json`. |
+| `--dev` | Consistency guard only — see [above](#dev-on-ready-and-run). |
+
+**`kind: "local"`** — runs in the **foreground** with inherited stdio (the
+child's output streams live; Ctrl-C reaches it directly). Exports
+`BAE_SERVER_URL`/`BAE_CLIENT_KEY` from the resolved values; every other host
+env var is left exactly as-is. `cd`s to `harness_dir/working_dir` and runs
+`sh -c "<run_command>"`. Prints a header first:
+
+```
+── running reference-assistant (local) ──────────────
+profile:  default (pro_…)
+key:      key_…
+server:   http://localhost:8080
+(Ctrl-C to stop)
+```
+
+`run`'s own process exit code is the **harness's own exit code** — not
+always `0` — since it's propagated directly from the child process.
+
+**`kind: "container"`** — launches **detached** (schedule/api/webapp are
+servers, not one-shot commands; `run` doesn't block on them). Resolves
+`requires.env` **plus `resolved.json`'s `provider_env`** (readiness check #5
+accepts that provider auth-token var from the host environment, so a launch
+that only forwarded `<dir>/.env` would silently drop it) in this order:
+already declared (non-empty) in `<dir>/.env` → left alone, passed through by
+`--env-file`; else present (non-empty) in the host environment → captured;
+else a value saved in a prior `<dir>/.baectl/builds/<id>/harness.env` from an
+earlier run → reused; else prompts (TTY) or fails loudly naming the variable
+(no TTY, e.g. CI) — then (re)writes `harness.env` (mode `0600`, preserving
+previously prompted secrets across runs). Removes any prior container of the
+same name first (`docker rm -f <id>` / Apple `container stop`+`rm`, so a
+re-run never collides on `--name`), then runs, conceptually:
+
+```sh
+docker run -d --name <id> \
+  [--add-host host.docker.internal:host-gateway]   # Docker only
+  [--env-file <dir>/.env]                          # if it exists
+  --env-file <dir>/.baectl/builds/<id>/harness.env \
+  [--publish <port>:<port>]                        # api/webapp only
+  <image_tag>
+```
+
+**No secret ever appears in the launch command line.**
+`BAE_SERVER_URL`/`BAE_CLIENT_KEY` are written into `harness.env` (last, so
+they win over any same-named key in `<dir>/.env` — the engine applies
+`--env-file`s in order) rather than passed as `--env NAME=value` arguments: an
+argv element is readable by any local user through `ps` or
+`/proc/<pid>/cmdline` for the lifetime of the engine client process. The
+whole of `<dir>/.env` is still forwarded as-is, so unrelated variables an
+operator put there do reach the harness container; keep workspace-wide
+secrets that no harness needs out of that file.
+
+Then prints the "where/how" summary:
+
+| `launcher_type` | Printed |
+|---|---|
+| `webapp` | `open the chat UI:  http://localhost:<port>/` |
+| `api` | A ready-to-copy `curl --no-buffer -X POST http://localhost:<port>/agents/<name>/trigger …`, using the actual required prompt field read back from the generated `bae-api.toml` (falls back to the literal field name `prompt` if that file can't be read). |
+| `schedule` | The cron expression read back from `bae-schedules.toml` (falls back to `(see bae-schedules.toml)` if it can't be read). |
+
+— followed in every case by `` logs:  <docker|container> logs -f <id> ``.
+
+**Container→server reachability is a best-effort default, not a guarantee.**
+A `build`-produced image is a standalone container, not joined to `setup`'s
+compose network, so by default it reaches `baesrv` at
+`http://host.docker.internal:<port>` (the host's published client port);
+Docker launches add `--add-host` so this alias also resolves on Linux, not
+just Docker Desktop. If detection guesses wrong for your engine/OS, override
+with `--server-url`.
+
+**Exit codes:**
+
+| Exit | When |
+|---|---|
+| *(the child's own)* | `kind: "local"` only — `run`'s exit code is the harness process's own exit code, propagated directly. |
+| `0` | `kind: "container"` — the container started successfully. |
+| `1` | Readiness checks didn't pass and couldn't be auto-fixed (`readiness checks did not pass (see above) — run \`baectl ready <id>\` for the full report and fix guidance`); `--no-ready` was given with no `resolved.json` for `<id>`, or one missing a stored plaintext key; a required container env var is unresolved with no TTY to prompt; the `docker`/`container run` subprocess failed to start or exited non-zero. |
+| `2` | No build `<id>` found under `--dir`. |
+
+---
+
 ## `--fallback`
 
 `--fallback <NAME>` (on `create profile` / `update profile`) takes a plain
@@ -803,5 +1197,11 @@ baectl: unexpected response from admin API — check that baectl and the server 
   bootstrap key is created, rotated, disabled, and pre-provisioned.
 - [Configuration reference](05-configuration.md) — every `BAE_*` env var,
   including the ones `baectl` reads.
+- [Harness manifest reference](07-harness-manifest.md) — the `bae-harness.toml`
+  schema `build`/`ready`/`run` act on.
+- [Harness launchers reference](06-launchers.md) — the config files `build`
+  generates for `--launcher schedule/api/webapp`.
+- [Quickstart](../guides/00-quickstart.md#fastest-path-three-commands) —
+  `setup` → `build` → `run` end to end.
 - [`aspec/uxui/cli.md`](../../aspec/uxui/cli.md) — CLI design conventions
   shared by `baesrv` and `baectl`.

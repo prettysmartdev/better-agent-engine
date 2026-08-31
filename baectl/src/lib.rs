@@ -20,6 +20,13 @@
 //!   every other command it reads interactive stdin and never links
 //!   [`admin_client`] against the host (the admin port is loopback-only inside
 //!   the container — profile/key creation shells out via `docker exec`).
+//! - [`engine`] — the container-engine plumbing shared by `setup` and the
+//!   `build`/`ready`/`run` harness verbs: the `docker compose exec` /
+//!   `container exec` subprocess wrapper, engine detection, and the
+//!   stdin/stdout prompter behind `${VAR}` secret collection.
+//! - [`harness`] — the `build`/`ready`/`run` verbs plus the `bae-harness.toml`,
+//!   `manifest.json`, and `resolved.json` types they act on. These four verbs
+//!   are host-invoked (like `setup`), driving the local engine from outside.
 //!
 //! `baectl` deliberately does **not** depend on `client-rust`/`bae-rs`: that
 //! crate is the client-port session harness (tool dispatch, hooks, the agent
@@ -28,7 +35,9 @@
 
 pub mod admin_client;
 pub mod cli;
+pub mod engine;
 pub mod error;
+pub mod harness;
 pub mod keygen;
 pub mod output;
 pub mod setup;

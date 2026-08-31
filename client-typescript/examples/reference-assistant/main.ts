@@ -72,7 +72,8 @@ async function main(): Promise<void> {
     process.env.BAE_PROVIDER_KEY_ENV ?? "ANTHROPIC_API_KEY";
   requireEnv(providerKeyEnv);
 
-  const prompt = process.argv[2] ?? "What time is it?";
+  const prompt =
+    process.env.AGENT_PROMPT ?? process.argv[2] ?? "What time is it?";
   const correlationId = randomHex(6); // crypto-random tag for log correlation
 
   const harness = new Harness(

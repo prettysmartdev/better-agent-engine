@@ -278,8 +278,10 @@ struct StdioConn {
 /// file-descriptor exhaustion — which spikes precisely when many sessions (or a
 /// busy test suite) spawn stdio servers at once, especially on a host with a low
 /// `ulimit -n`, and clears on its own moments later as concurrent work releases
-/// the resource. A permanent error such as `ENOENT` ("command not found") must
-/// *not* be retried: the caller relies on those failing fast and non-fatally.
+/// the resource. An interrupted spawn, or an executable momentarily locked by
+/// a concurrent build, is similarly transient. A permanent error such as
+/// `ENOENT` ("command not found") must *not* be retried: the caller relies on
+/// those failing fast and non-fatally.
 fn is_transient_spawn_error(e: &std::io::Error) -> bool {
     // The fork/posix_spawn resource-exhaustion errnos: ENOMEM (12), ENFILE (23,
     // system-wide fd table full) and EMFILE (24, per-process fd limit) share
@@ -287,18 +289,24 @@ fn is_transient_spawn_error(e: &std::io::Error) -> bool {
     // platform (11 on Linux, 35 on macOS), but Rust maps it to the `WouldBlock`
     // kind on both, so match the kind rather than the number for it.
     matches!(e.raw_os_error(), Some(11) | Some(12) | Some(23) | Some(24))
-        || e.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ResourceBusy
+                | std::io::ErrorKind::ExecutableFileBusy
+        )
 }
 
 impl StdioConn {
     /// Spawn `command args...` with piped stdin/stdout (stderr discarded) and
     /// `kill_on_drop` so an abandoned session cannot leak the process.
     ///
-    /// A spawn that fails with a *transient* resource errno (`EAGAIN`/`ENOMEM`)
-    /// is retried a few times with a short backoff: under bursty load many
-    /// sessions open stdio servers at once and `fork` momentarily fails,
-    /// clearing on its own. A permanent error (e.g. `ENOENT`) is returned on
-    /// the first attempt so a mistyped command still fails fast and non-fatally.
+    /// A transient resource or exec error is retried with a bounded backoff:
+    /// under bursty load many sessions can open stdio servers at once, or a
+    /// concurrent build can momentarily lock the executable. A permanent error
+    /// (e.g. `ENOENT`) is returned on the first attempt so a mistyped command
+    /// still fails fast and non-fatally.
     async fn spawn(cfg: &McpServerConfig) -> Result<StdioConn, McpError> {
         let command = cfg
             .command
@@ -318,15 +326,13 @@ impl StdioConn {
             .collect();
         let args = args?;
 
-        // Retry only transient resource failures, over a total wall-time budget
-        // of a few seconds with exponentially-backed-off, capped delays (25ms,
-        // 50ms, ... up to 400ms between tries). A single retry usually rides out
-        // a load spike, but a sustained burst of concurrent spawns on a low
-        // `ulimit` host (the whole test suite starting stdio fixtures at once)
-        // can take longer to drain, so keep retrying until the budget is spent
-        // rather than giving up after ~1s. A permanent error (e.g. ENOENT) still
-        // returns on the first attempt, so a mistyped command fails fast.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        // Retry only transient spawn/exec failures, over a total wall-time
+        // budget with exponentially-backed-off, capped delays (25ms, 50ms, ...
+        // up to 400ms between tries). In particular, a test or deployment can
+        // launch this fixture while a concurrent Cargo build still holds its
+        // executable open. A permanent error (e.g. ENOENT) still returns on the
+        // first attempt, so a mistyped command fails fast.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut backoff = Duration::from_millis(25);
         let mut child = loop {
             let mut cmd = Command::new(&command);
@@ -612,6 +618,18 @@ mod tests {
         assert!(is_transient_spawn_error(&Error::new(
             ErrorKind::WouldBlock,
             "would block"
+        )));
+        assert!(is_transient_spawn_error(&Error::new(
+            ErrorKind::Interrupted,
+            "interrupted"
+        )));
+        assert!(is_transient_spawn_error(&Error::new(
+            ErrorKind::ResourceBusy,
+            "resource busy"
+        )));
+        assert!(is_transient_spawn_error(&Error::new(
+            ErrorKind::ExecutableFileBusy,
+            "executable file busy"
         )));
         // ENOENT ("command not found") must fail fast, never retry — the caller
         // relies on a mistyped command surfacing immediately and non-fatally.

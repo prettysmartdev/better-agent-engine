@@ -124,7 +124,9 @@ async def run() -> int:
     server_url = os.environ.get("BAE_SERVER_URL", "http://localhost:8080")
     client_key = os.environ.get("BAE_CLIENT_KEY")
     provider_key_env = os.environ.get("BAE_PROVIDER_KEY_ENV", "ANTHROPIC_API_KEY")
-    prompt = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROMPT
+    prompt = os.environ.get("AGENT_PROMPT")
+    if prompt is None:
+        prompt = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROMPT
 
     if not client_key:
         print(

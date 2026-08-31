@@ -1,0 +1,14 @@
+[harness]
+name = "reference-assistant"
+sdk = "typescript"
+run = "npm run example"
+working_dir = "../.."
+
+[harness.requires]
+allowed_tools = ["get_current_time", "read_file", "write_file", "explore_files", "run_shell_command"]
+mcp_servers = []
+env = []
+
+[harness.launcher]
+prompt_env = "AGENT_PROMPT"
+default_schedule = "0 0 3 * * *"

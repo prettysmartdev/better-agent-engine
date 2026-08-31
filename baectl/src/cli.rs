@@ -40,6 +40,7 @@ use serde_json::Value;
 
 use crate::admin_client::{page_document, AdminClient, KeyBody, Page, ProfileBody};
 use crate::error::CliError;
+use crate::harness::{self, BuildOptions, Launcher, ReadyOptions, RunOptions, Sdk};
 use crate::{keygen, output};
 
 /// Environment-variable and default constants for auto-configuration.
@@ -99,6 +100,15 @@ enum Command {
     /// optional launch step talks to a server (via `docker exec`, never the
     /// host-side admin port).
     Setup(SetupCmd),
+    /// Package a harness (bundled example or a `--harness-dir` project) into a
+    /// runnable local artifact. Host-invoked, like `setup`.
+    Build(BuildCmd),
+    /// Check a built harness's profile/auth/registry/env are compatible with
+    /// the server, reporting each check and optionally applying safe fixes.
+    Ready(ReadyCmd),
+    /// Launch a built harness (host process for `local`, detached container for
+    /// `schedule/api/webapp`) and print where/how to reach it.
+    Run(RunCmd),
 }
 
 #[derive(Args)]
@@ -269,6 +279,71 @@ struct SetupCmd {
 }
 
 #[derive(Args)]
+struct BuildCmd {
+    /// Harness to build: a bundled example name (`issue-triage` /
+    /// `reference-assistant`) resolved under `--sdk`, or — with
+    /// `--harness-dir` — a label for a directory carrying its own
+    /// `bae-harness.toml`.
+    harness: String,
+    /// SDK directory a bundled example is resolved under (default `rust`).
+    #[arg(long, value_enum, default_value_t = Sdk::Rust)]
+    sdk: Sdk,
+    /// Build an arbitrary directory (containing its own `bae-harness.toml`)
+    /// instead of a bundled example — no repo checkout required.
+    #[arg(long, value_name = "PATH")]
+    harness_dir: Option<PathBuf>,
+    /// How to package the harness: `local` (host process, default),
+    /// `schedule`, `api`, or `webapp` (container images).
+    #[arg(long, value_enum, default_value_t = Launcher::Local)]
+    launcher: Launcher,
+    /// Explicit build id (overrides the derived `<name>-<sdk>-<launcher>`).
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+    /// Use locally built images/binaries throughout, never a published tag.
+    #[arg(long)]
+    dev: bool,
+    /// Workspace directory holding `.baectl/` and the `setup` files
+    /// (default `.`).
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    dir: PathBuf,
+}
+
+#[derive(Args)]
+struct ReadyCmd {
+    /// The build id to check.
+    id: String,
+    /// Apply the safe (profile/key) fixes after confirmation.
+    #[arg(long)]
+    fix: bool,
+    /// Workspace directory holding `.baectl/` and the `setup` files
+    /// (default `.`).
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    dir: PathBuf,
+    /// Consistency guard against the build's recorded `--dev` flag.
+    #[arg(long)]
+    dev: bool,
+}
+
+#[derive(Args)]
+struct RunCmd {
+    /// The build id to launch.
+    id: String,
+    /// Workspace directory holding `.baectl/` and the `setup` files
+    /// (default `.`).
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    dir: PathBuf,
+    /// Skip the readiness re-check and launch straight from `resolved.json`.
+    #[arg(long)]
+    no_ready: bool,
+    /// Override the address a launched container uses to reach `baesrv`.
+    #[arg(long, value_name = "URL")]
+    server_url: Option<String>,
+    /// Consistency guard against the build's recorded `--dev` flag.
+    #[arg(long)]
+    dev: bool,
+}
+
+#[derive(Args)]
 struct AuthCmd {
     #[command(subcommand)]
     action: AuthAction,
@@ -330,6 +405,18 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         return crate::setup::run(*dev, *apple, dir);
     }
 
+    // `build`/`ready`/`run` are host-invoked like `setup`: they drive the local
+    // container engine from outside and reach the admin API via in-container
+    // exec, never a host-side admin client — so they too resolve before
+    // `build_client`. Handled by reference (cloning the small owned option set)
+    // so the shared borrow-then-move ordering with the admin path below holds.
+    match &cli.command {
+        Command::Build(cmd) => return harness::build(build_options(cmd)),
+        Command::Ready(cmd) => return harness::ready(ready_options(cmd)),
+        Command::Run(cmd) => return harness::run(run_options(cmd)),
+        _ => {}
+    }
+
     let client = build_client(&cli)?;
     match cli.command {
         Command::Create(CreateCmd { resource }) => match resource {
@@ -369,9 +456,47 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
                 Ok(())
             }
         },
-        // `auth` and `setup` are fully handled above (before the client build).
+        // `auth`/`setup` and the host-invoked `build`/`ready`/`run` verbs are
+        // fully handled above (before the client build).
         Command::Auth(_) => unreachable!("auth handled before client build"),
         Command::Setup(_) => unreachable!("setup handled before client build"),
+        Command::Build(_) => unreachable!("build handled before client build"),
+        Command::Ready(_) => unreachable!("ready handled before client build"),
+        Command::Run(_) => unreachable!("run handled before client build"),
+    }
+}
+
+/// Map parsed `build` args to the harness module's resolved [`BuildOptions`].
+fn build_options(cmd: &BuildCmd) -> BuildOptions {
+    BuildOptions {
+        harness: cmd.harness.clone(),
+        sdk: cmd.sdk,
+        harness_dir: cmd.harness_dir.clone(),
+        launcher: cmd.launcher,
+        id: cmd.id.clone(),
+        dev: cmd.dev,
+        dir: cmd.dir.clone(),
+    }
+}
+
+/// Map parsed `ready` args to the harness module's resolved [`ReadyOptions`].
+fn ready_options(cmd: &ReadyCmd) -> ReadyOptions {
+    ReadyOptions {
+        id: cmd.id.clone(),
+        fix: cmd.fix,
+        dir: cmd.dir.clone(),
+        dev: cmd.dev,
+    }
+}
+
+/// Map parsed `run` args to the harness module's resolved [`RunOptions`].
+fn run_options(cmd: &RunCmd) -> RunOptions {
+    RunOptions {
+        id: cmd.id.clone(),
+        dir: cmd.dir.clone(),
+        no_ready: cmd.no_ready,
+        server_url: cmd.server_url.clone(),
+        dev: cmd.dev,
     }
 }
 

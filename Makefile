@@ -80,9 +80,10 @@ endif
 # Note: the per-component <verb>-<component> targets are pattern rules and
 # intentionally NOT declared .PHONY — make ignores pattern rules for .PHONY
 # targets.
+
 .PHONY: help engine dev-image ensure-engine ensure-dev-image shell image image-max \
 	image-launcher-schedule image-launcher-api image-launcher-webapp run \
-	run/baesrv run/baemax build build-baectl test lint fmt clean check-static \
+	run/baesrv run/baemax build build-baectl test test-baectl lint fmt clean check-static \
 	image-smoke release
 
 help: ## Show available targets
@@ -240,6 +241,12 @@ build-baectl: ## Build baectl for this host with the local Rust toolchain
 		exit 1; \
 	}
 	$(MAKE) -C baectl build-host
+
+# Kept explicit (rather than relying only on test-%) because this is the
+# documented offline-by-default entry point for baectl's unit/integration
+# tests. It follows the same engine/dev-image fallback as every component test.
+test-baectl: $(DEV_IMAGE_DEP) ## Test baectl (offline by default)
+	$(RUN_IN_DEV) $(MAKE) -C baectl test
 
 # Per-component verbs: make <verb>-<component>, e.g. `make test-client-rust`.
 build-%: $(DEV_IMAGE_DEP)
