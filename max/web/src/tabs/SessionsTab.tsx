@@ -169,6 +169,7 @@ function useSessionStats(
 
   useEffect(() => {
     if (items.length === 0) {
+      // oxlint-disable-next-line react/set-state-in-effect -- clear stale stats after the list empties.
       setStats({});
       return;
     }

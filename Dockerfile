@@ -8,6 +8,8 @@
 #   docker run -p 8080:8080 -v bae-data:/var/lib/bae better-agent-engine
 
 FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 # Two independently-buildable crates share this stage: baesrv (server/) builds
 # for the native gnu target, baectl builds as a static musl binary. They are

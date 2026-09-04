@@ -18,11 +18,11 @@ path = "src/main.rs"
 launcher-core = { path = "../core" }
 # TOML config parsing for bae-schedules.toml.
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 # Tokio owns signal handling, independent invocation tasks, and shutdown timing.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 # Tokio-native six-field cron scheduler. Cron-specific behavior stays here,
 # rather than leaking into launcher-core.
-tokio-cron-scheduler = "0.14"
+tokio-cron-scheduler = "0.15"
 tracing = "0.1"

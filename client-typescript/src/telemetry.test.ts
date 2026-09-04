@@ -177,8 +177,8 @@ describe("client spans — canonical parity fixture (§9)", () => {
       expect(s.attributes["bae.session.id"]).toBe("ses_1");
       expect(s.attributes["bae.rpc.method"]).toBe("session.sendMessage");
       expect(s.kind).toBe(SpanKind.CLIENT);
-      expect(s.instrumentationLibrary.name).toBe("bae.client");
-      expect(s.instrumentationLibrary.version).toBe("0.1.0");
+      expect(s.instrumentationScope.name).toBe("bae.client");
+      expect(s.instrumentationScope.version).toBe("0.1.0");
     }
     expect(
       sends.map((s) => s.attributes["bae.client.iteration"]).sort(),
@@ -193,14 +193,14 @@ describe("client spans — canonical parity fixture (§9)", () => {
     expect(tool.attributes["bae.tool.name"]).toBe("get_current_time");
     expect(tool.attributes["bae.tool.dispatch"]).toBe("client");
     expect(tool.kind).toBe(SpanKind.INTERNAL);
-    expect(tool.instrumentationLibrary.name).toBe("bae.client");
-    expect(tool.instrumentationLibrary.version).toBe("0.1.0");
+    expect(tool.instrumentationScope.name).toBe("bae.client");
+    expect(tool.instrumentationScope.version).toBe("0.1.0");
 
     // Parentage: the tool span is a child of the iteration-0 send span.
     const send0 = sends.find(
       (s) => s.attributes["bae.client.iteration"] === 0,
     )!;
-    expect(tool.parentSpanId).toBe(send0.spanContext().spanId);
+    expect(tool.parentSpanContext?.spanId).toBe(send0.spanContext().spanId);
   });
 });
 
@@ -421,7 +421,9 @@ describe("ambient context — survives the async boundary into hooks/handlers (�
     await session.send("go");
 
     const toolId = named("bae.client.tool")[0]!.spanContext().spanId;
-    expect(named("user.hook.span")[0]!.parentSpanId).toBe(toolId);
-    expect(named("user.handler.span")[0]!.parentSpanId).toBe(toolId);
+    expect(named("user.hook.span")[0]!.parentSpanContext?.spanId).toBe(toolId);
+    expect(named("user.handler.span")[0]!.parentSpanContext?.spanId).toBe(
+      toolId,
+    );
   });
 });

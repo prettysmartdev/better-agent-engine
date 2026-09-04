@@ -26,6 +26,7 @@ export default function AgentPage({ agent }: AgentPageProps) {
   const send = async (text: string) => {
     if (sending || !text.trim()) return;
     const userMessage: ChatMessage = {
+      // oxlint-disable-next-line react/purity -- this event handler does not run during render.
       id: Date.now(),
       sender: "operator",
       text,

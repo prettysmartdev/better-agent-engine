@@ -26,7 +26,7 @@ bae-rs = { path = "../client-rust" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "sync"] }
 # HTTP client for the admin/client REST calls and the readiness poll. Pinned to
 # rustls to match the rest of the workspace (no OpenSSL anywhere).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 # The in-test mock model provider the server is pointed at.
 axum = "0.8"
 serde_json = "1"

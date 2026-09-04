@@ -10,7 +10,7 @@
 //!
 //! - **Entropy.** Both key bodies draw [`KEY_ENTROPY_BYTES`] (24 bytes = 192
 //!   bits, comfortably above the required 128) from the OS CSPRNG
-//!   (`rand::rngs::OsRng`).
+//!   (`rand::rngs::SysRng`).
 //! - **At rest.** Only the lowercase-hex SHA-256 digest of a key is stored,
 //!   never the plaintext. The plaintext is returned to the caller exactly once,
 //!   at creation.
@@ -29,8 +29,8 @@
 //! posture in `aspec/architecture/security.md` without relying on SQL digest
 //! comparison timing.
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -110,9 +110,10 @@ pub fn generate_admin_key() -> GeneratedKey {
 
 fn generate_key(prefix: &str) -> GeneratedKey {
     let mut bytes = [0u8; KEY_ENTROPY_BYTES];
-    // `OsRng` is a cryptographically secure, OS-backed RNG; `fill_bytes` cannot
-    // partially fill or silently fall back.
-    OsRng.fill_bytes(&mut bytes);
+    // `SysRng` is a cryptographically secure, OS-backed RNG.
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS random number generator failed");
     let plaintext = format!("{prefix}{}", to_hex(&bytes));
     let prefix = key_prefix(&plaintext);
     GeneratedKey { plaintext, prefix }
