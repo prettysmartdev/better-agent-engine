@@ -40,7 +40,7 @@ toml = "1.1"
 # drops the optional HTTP/file `$ref` resolvers (which would pull a network
 # stack) — every schema is inline in the config, so remote resolution is never
 # needed and staying offline is a hard requirement.
-jsonschema = { version = "0.53", default-features = false }
+jsonschema = { version = "0.56", default-features = false }
 # Structured logging (startup warnings, request logging). Same `BAE_LOG`
 # env-filter convention as `server/`; the subscriber itself is installed by
 # `launcher-core::init_logging`.
