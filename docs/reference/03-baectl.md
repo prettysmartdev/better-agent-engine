@@ -122,6 +122,7 @@ baectl create profile <name> <primary_provider> [flags]
 | `--fallback <NAME>` | A fallback `[providers]` registry name, repeatable, tried in order after the primary fails. |
 | `--mcp-server <NAME>` | MCP server name to enable, repeatable. Omitted entirely → `mcp_servers: []`. |
 | `--allowed-tool <NAME>` | Client-side tool name to allow, repeatable. Omitted entirely → `allowed_tools: []` (no client-side tools permitted). |
+| `--available-sandbox <IMAGE>` | Sandbox image this profile permits (see [Sandboxes](../guides/03-sandboxes.md)), repeatable. Omitted entirely → `available_sandboxes: []`. |
 | `--json` | Print the raw JSON response instead of a human summary. |
 
 `baectl` does **not** validate `--mcp-server`/`primary_provider`/`--fallback`
@@ -195,8 +196,8 @@ baectl get profile <id> [--json]
 
 **Output (human):** every field of the profile — `id`, `name`,
 `primary_provider` (registry name), `fallback_providers` (registry names),
-`mcp_servers`, `allowed_tools`, `created_at`, `updated_at`. Empty list fields
-print `(none)`.
+`mcp_servers`, `allowed_tools`, `available_sandboxes`, `created_at`,
+`updated_at`. Empty list fields print `(none)`.
 
 **Output (`--json`):** the full Profile object, same shape as a `list`
 item.
@@ -220,7 +221,7 @@ every field.
 | Flag | Description |
 |---|---|
 | `--name <NAME>` | New name. **Optional** — see below. |
-| *(same config flags as `create profile`)* | `--fallback`, `--mcp-server`, `--allowed-tool`, `--json`. |
+| *(same config flags as `create profile`)* | `--fallback`, `--mcp-server`, `--allowed-tool`, `--available-sandbox`, `--json`. |
 
 > **`--name` is optional, filling a gap in the admin API.** `PUT
 > /admin/v1/profiles/{id}` always requires a `name` in its body, but
@@ -231,9 +232,12 @@ every field.
 > the same replace.
 
 Any repeatable flag left unset (`--fallback`, `--mcp-server`,
-`--allowed-tool`) serializes as an explicit empty array in the `PUT` body —
-a full replacement clears fields that aren't re-specified, exactly like a
-direct `PUT` call would.
+`--allowed-tool`, `--available-sandbox`) serializes as an explicit empty
+array in the `PUT` body — a full replacement clears fields that aren't
+re-specified, exactly like a direct `PUT` call would. This is why
+`baectl ready --fix`/`run` always re-send a profile's **entire** existing
+list for every list field (unioned with whatever the harness declares) when
+they widen it — see [`baectl ready`](#baectl-ready) below.
 
 **Output:** same as `get profile` (human full summary, or `--json` the
 replaced Profile object).
@@ -372,7 +376,7 @@ handling guidance for each file.
 ### `baectl setup`
 
 ```
-baectl setup [--dev] [--apple] [--dir <DIR>]
+baectl setup [--dev] [--apple] [--yes|-y] [--dir <DIR>]
 ```
 
 The interactive quickstart wizard: a short series of defaulted stdin/stdout
@@ -416,10 +420,58 @@ baectl/target/host/release/baectl setup
 | `--dev` | Use the image tags a local `make image`/`make image-max` produces (`better-agent-engine:latest` / `:max`) instead of the published GHCR tags (`ghcr.io/prettysmartdev/better-agent-engine:latest` / `:max`). For contributors iterating on a local build. |
 | `--apple` | Emit `bae-setup.sh` (a shell script driving Apple's `container` CLI) instead of `docker-compose.yml`. Both output modes read the same `.env`. |
 | `--dir <DIR>` | Directory to read/write the three generated files in. Default `.` (current directory), mirroring `auth create key`'s `--out-dir` convention. |
+| `--yes` / `-y` | Non-interactive: accept every wizard default (even on a TTY) and pick the provider from the environment. See below. |
 
 No flag is required — `baectl setup` with no arguments still produces a
 complete, working setup, consistent with every other `baectl`/`baesrv`
 command's "no required flags" convention.
+
+#### `--yes` (non-interactive quickstart)
+
+`baectl setup --yes` (or `-y`) is the form the [Quickstart](../guides/00-quickstart.md)
+uses: no prompts at all, suitable for a script or a first-run copy-paste.
+
+- Every wizard question takes its default, exactly as if you'd pressed Enter
+  through the whole interactive wizard — `--dev`/`--apple` keep their normal
+  flag semantics (unasked; default `false` unless passed).
+- The provider is picked from the environment, first match wins: **`ANTHROPIC_API_KEY`**,
+  then **`OPENAI_API_KEY`** — the wizard's own detection order. The winner
+  becomes the single registry entry, using the wizard's defaults for that
+  kind (name `anthropic-default`/`openai-default`, default model, auth env
+  var = that variable). Stdout prints which one was picked, e.g.
+  `using provider anthropic (ANTHROPIC_API_KEY is set)` — **key values are
+  never printed**, only the variable name.
+- If neither variable is set (or both are empty), `setup --yes` exits `1`
+  before writing anything, with exactly:
+  ```
+  baectl: no provider API key found in the environment.
+          export ANTHROPIC_API_KEY="sk-ant-…"   # or OPENAI_API_KEY="sk-…"
+          then re-run `baectl setup --yes`
+  ```
+- Launch is implied (as if you'd answered **Launch now?** yes), and the
+  first profile/key are created exactly as on the interactive fresh-setup
+  path (see [Launch step](#setup-launch)). A missing engine binary on `PATH`
+  still produces the existing exit-`1` message.
+- **Idempotent:** if `--dir` already has a complete setup (all three files
+  present), `--yes` skips the Edit/Launch question — it always relaunches
+  the saved configuration verbatim, printing
+  `already set up in <dir> — server launched from the saved configuration`,
+  and exits `0`. It never edits or overwrites a working setup.
+- **Partial/corrupted state** (one or two of the three files present) is
+  *not* silently overwritten by `--yes`: the "Overwrite and run a fresh
+  setup?" question resolves to its default **No** under `--yes` too, so
+  `setup --yes` exits `1` with `baectl: aborted; no files were changed.`
+  rather than guessing at a fresh setup over unreviewed leftover state.
+- `--yes --apple` writes `bae-setup.sh`, exactly as `--apple` alone does.
+- The generated `docker-compose.yml` (both `--yes` and the interactive path)
+  now includes, on the server service:
+  ```yaml
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+  ```
+  harmless on Docker Desktop, required for the container to reach a
+  host-side service (e.g. a mock provider, or another local server) via
+  `host.docker.internal` on Linux.
 
 #### Wizard question list
 
@@ -626,6 +678,8 @@ services:
       - ./bae-config.toml:/etc/bae/config.toml:ro
     ports:
       - "${BAE_ADDR_PORT:-8080}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 volumes:
   bae-data:
@@ -668,12 +722,14 @@ hands every variable to the container through `--env-file .env` (which the
 non-default `BAE_ADDR`, the publish/health-check port above is that address's
 port rather than `8080`.
 
-None of these four files are excluded by `.gitignore` **except** `.env`
-(matched by the existing `.env`/`.env.*` entries — it holds live secrets).
-`docker-compose.yml`, `bae-setup.sh`, and `bae-config.toml` are ordinary,
-trackable files: a team that wants to commit its generated deployment
-alongside the repo (or a subdirectory of it) can do so; `setup` does not
-force that choice either way.
+Inside this repository's checkout (any directory of it), the root
+`.gitignore` already ignores `.env` (it holds live secrets), `bae-config.toml`
+and `bae-setup.sh`. `docker-compose.yml` is the only generated file it does
+**not** ignore, so after a Docker-mode `setup` in the checkout `git status`
+shows it as untracked until you remove it (an Apple-mode `setup` leaves no
+untracked file). Outside this repo nothing is ignored for you: a team that
+wants to commit its generated deployment can do so (keep `.env` out of it);
+`setup` does not force that choice either way.
 
 <a id="setup-launch"></a>
 #### Launch step
@@ -727,7 +783,7 @@ error verbatim. Run `make image`/`make image-max` first if you pass `--dev`.
 | Exit | When |
 |---|---|
 | `0` | Wizard completed (files written, launched or not); or the user declined an overwrite/fresh-setup confirmation (no files changed). |
-| `1` | `--dir` doesn't exist, isn't a directory, or isn't writable (checked before any prompt); an existing `bae-config.toml`/`.env`/launcher fails to parse on the Edit/summary path; the engine binary is missing from `PATH`; the engine exits non-zero while launching; the server never becomes healthy within the timeout; the in-container `baectl create profile`/`create key` call fails. |
+| `1` | `--dir` doesn't exist, isn't a directory, or isn't writable (checked before any prompt); an existing `bae-config.toml`/`.env`/launcher fails to parse on the Edit/summary path; the engine binary is missing from `PATH`; the engine exits non-zero while launching; the server never becomes healthy within the timeout; the in-container `baectl create profile`/`create key` call fails; `--yes` found no provider key in the environment; `--yes` hit partial/corrupted existing state (declined overwrite). |
 | `2` | An unknown flag or invalid flag value (clap-level usage error, e.g. a non-existent flag). |
 
 **Errors:** every failure prints `baectl: <message>` to stderr, matching
@@ -833,6 +889,33 @@ on `PATH` for a container-mode build — only `docker`/`container`:
    (`[harness.launcher].binary_path is required when dockerfile is set`) —
    `baectl` has no way to know a custom Dockerfile's output path without
    invoking Docker itself.
+   **`.dockerignore` in the build context.** Docker only honours
+   `<context>/.dockerignore`, and the generated stage does `COPY . .`, so
+   when `baectl` synthesizes the build Dockerfile it also makes sure the
+   build context has one. If `<context>/.dockerignore` is absent it writes
+   one with exactly these six lines and prints
+   `wrote <context>/.dockerignore (build-context excludes)`:
+
+   ```
+   target/
+   node_modules/
+   .venv/
+   __pycache__/
+   .baectl/
+   .git/
+   ```
+
+   An existing `.dockerignore` is **never** overwritten or edited. If it does
+   not exclude the directory that matters for the harness's SDK (`target/`
+   for Rust, `node_modules/` for TypeScript, `.venv/` for Python), `build`
+   warns on stderr — `baectl: warning: <context>/.dockerignore does not
+   exclude <dir>/ — host build output will be sent to the image build` — and
+   carries on. The bundled SDK directories commit this same file. If your
+   harness directory is a git repository, the written file shows up as a new
+   untracked file; commit it or add it to your ignore list. Nothing is written
+   when the manifest sets its own `[harness.launcher].dockerfile`, or for
+   `--launcher local`.
+
 2. **Launcher packaging.** Writes `<dir>/.baectl/builds/<id>/Dockerfile`:
    ```dockerfile
    FROM <base image tag>
@@ -918,52 +1001,87 @@ the loopback-only admin port. The global `--admin-addr`/`--admin-token`/
 | `--dir <path>` | Workspace directory holding `.baectl/` and the files `setup` generated. Default `.`. |
 | `--dev` | Consistency guard only — see [`--dev` on `ready`/`run`](#dev-on-ready-and-run). |
 
-**The six checks**, each printed `✓`/`✗`:
+**The six checks**, each printed as one line, `` `✓ <label>` ``,
+`` `⚠ <label> — will be fixed by run` ``, or `` `✗ <label>` ``:
+
+- `✓` — passed.
+- `⚠` — failing, but `baectl run` (or `ready --fix`) resolves it
+  automatically, with no prompt. Only checks **#2** and **#4** can print
+  `⚠`, and only when their fix is actually applicable (a profile that can be
+  additively widened, or a key that can be freshly created) — an
+  irreconcilable #2 (e.g. no provider registered at all) is `✗` instead, not
+  `⚠`.
+- `✗` — failing and **blocking**: neither `run` nor `--fix` can resolve it
+  unattended. Checks **#1**, **#3**, and **#5** are always `✗` on failure,
+  never `⚠`.
+- `ℹ` — informational only (check #6); never `✓`/`⚠`/`✗`.
 
 1. **Server reachable** — the exec'd `baectl list profiles --json` succeeds.
    No launcher found at all in `--dir` (no `baectl setup` was ever run there),
    or the exec itself failing, prints guidance pointing at `baectl setup`.
    Failing this check aborts the whole pass — nothing else runs.
-2. **Compatible profile** — a profile whose `allowed_tools` and
-   `mcp_servers` are both supersets of the build's `requires`. Prefers the
-   profile from a prior `resolved.json` if it's still compatible, else the
-   first compatible one found. On `✗`, prints the exact `baectl update
-   profile …` (widen an existing profile additively — the union of its
-   current tools/servers with the harness's `requires`, never a drop) or
-   `baectl create profile …` command that would fix it. When the fix is
-   actually applied, the union is recomputed against the profile's body re-read
-   immediately before the write, not the snapshot taken at the top of the
-   check pass. The underlying `update profile` API call is a full replacement
-   and the admin API offers no compare-and-swap, so this is a single-writer
+2. **Compatible profile** — a profile whose `allowed_tools`, `mcp_servers`,
+   and `available_sandboxes` (see [Sandboxes](../guides/03-sandboxes.md) and
+   [Harness manifest — `[harness.requires]`](07-harness-manifest.md#harnessrequires))
+   are all supersets of the build's `requires`. Prefers the profile from a
+   prior `resolved.json` if it's still compatible, else the first compatible
+   one found. On `⚠`/`✗`, prints the exact `baectl update profile …` (widen
+   an existing profile additively — the union of its current tools/servers/
+   sandboxes with the harness's `requires`, never a drop) or
+   `baectl create profile …` command that would fix it, in the exec form
+   matching how `setup` launched — `docker compose exec -T <service>
+   baectl …` or `container exec <bae|bae-max> baectl …` — so the hint is
+   copy-pasteable as printed even though the admin port is loopback-only
+   inside the container. `⚠` when the fix is `Update`/`Create` (applicable);
+   `✗` when it's impossible (e.g. no provider is registered at all — see the
+   exit-code table below). When the fix is actually applied, the union is
+   recomputed against the profile's body re-read immediately before the
+   write, not the snapshot taken at the top of the check pass — every list
+   field is re-sent in full, since the underlying `update profile` call is a
+   full replacement (see [`baectl update profile`](#baectl-update-profile)).
+   The admin API offers no compare-and-swap, so this is a single-writer
    guarantee: a genuinely concurrent writer to the same profile (two `baectl
    run` invocations racing, or an out-of-band `update profile`) can still lose
    its change. Serialize `ready --fix`/`run` against a shared profile.
 3. **Required MCP servers registered** — every `requires.mcp_servers` name is
    present among `<dir>/bae-config.toml`'s `[[mcp.servers]]` entries. Distinct
    from #2: a profile can allow a server name the registry doesn't actually
-   define. **Always print-only** — fixing it needs a config edit *and* a
-   server restart, which `ready`/`--fix` will not do unattended — so `✗`
-   prints the TOML snippet to add plus the restart command
-   (`docker compose restart` / `./bae-setup.sh`), and always gates the pass.
+   define. **Always print-only, always `✗` on failure** — fixing it needs a
+   config edit *and* a server restart, which `ready`/`--fix` will not do
+   unattended — so `✗` prints the TOML snippet to add plus the restart
+   command (`docker compose restart` / `./bae-setup.sh`), and always gates
+   the pass.
 4. **Client key with a stored secret** — a plaintext-bearing key `baectl` can
    hand to `run`: either one reused from a prior `resolved.json` (re-validated
    against the live key list, still bound to the resolved profile), or a
    freshly created one. This is narrower than "any key bound to the profile" —
    `baectl` can never recover an existing key's plaintext (the admin API
    shows it once), so an unrecoverable pre-existing key does not satisfy this
-   check. On `✗`, prints the `baectl create key …` command.
+   check. `⚠` on a fresh build (no key needed yet, `run` mints one silently);
+   the printed `baectl create key …` hint ends with
+   `` (--fix also records the key for `run`) `` in report mode (no `--fix`),
+   since applying the fix does more than the bare command shown.
 5. **Required env vars resolvable** — `requires.env` plus the resolved
    profile's provider auth-token var (looked up via `primary_provider` in
-   `bae-config.toml`). `kind: "local"` builds check the host process
-   environment (what `run` inherits); `kind: "container"` builds check
-   `<dir>/.env` or the host environment (what `run` passes through).
-   **Always print-only** and always gates the pass.
+   `bae-config.toml`, the same variable `run` exports as
+   `BAE_PROVIDER_KEY_ENV` — see [`baectl run`](#baectl-run)). `kind: "local"`
+   builds check the host process environment (what `run` inherits);
+   `kind: "container"` builds check `<dir>/.env`, a prior run's
+   `<dir>/.baectl/builds/<id>/harness.env`, or the host environment (what
+   `run` passes through). **Always print-only and always `✗` on failure** —
+   except that an interactive `run` (a TTY, container build, #5 the only
+   blocking failure) reaches an env-var prompt instead of aborting; see
+   [`baectl run`](#baectl-run).
 6. **MAX reachability** — informational `ℹ` line with the dashboard URL, only
-   when `setup`'s image variant was `max`. Never `✗`.
+   when `setup`'s image variant was `max`. Never `✓`/`⚠`/`✗`.
 
 The pass succeeds only when #1 ∧ #2 (resolved) ∧ #3 ∧ #4 (resolved) ∧ #5 all
 hold. `--fix` only ever mutates #2/#4, and only after the single confirmation
-above; #3 and #5 are never auto-applied, with or without `--fix`.
+above; #3 and #5 are never auto-applied, with or without `--fix`. Every check
+runs and prints before any mutation happens, in every mode — a blocking `✗`
+on #1/#3/#5, or an impossible #2, aborts before `ready --fix`/`run` ever
+touches the admin API, so a run that can't succeed never creates an orphaned
+client key.
 
 **Output:** on full success, writes
 `<dir>/.baectl/builds/<id>/resolved.json` (mode `0600`):
@@ -989,15 +1107,22 @@ profile's provider auth-token var that check #5 accepted, so a container `run`
 can forward a value that lives only in the host environment; it is omitted when
 no provider var could be resolved. Prints `` ready: '<id>' is good to run — `baectl run <id>` ``. On any
 unresolved check, `resolved.json` is **not** written (a stale one from a
-prior run is left untouched) and `ready` exits non-zero.
+prior run is left untouched) and `ready` exits `3` (only auto-fixable `⚠`
+checks remain) or `1` (something is blocking) — see the table below.
 
 **Exit codes:**
 
 | Exit | When |
 |---|---|
-| `0` | All five gating checks resolved; `resolved.json` written. |
-| `1` | One or more checks remain unresolved after this pass — with `--fix`: `some checks are still unresolved (see above)`; without: `some checks failed — re-run with --fix to apply the safe fixes, or follow the guidance above`. Also: `bae-config.toml` exists but fails to parse; an admin-API exec call fails or returns unparseable output; a profile fix is needed but no provider is registered in `bae-config.toml` at all (`cannot create a compatible profile: no providers are registered in bae-config.toml — run \`baectl setup\` to configure one`). |
+| `0` | All six checks resolved (every `✓`, or `⚠` already fixed by `--fix`); `resolved.json` written. |
+| `3` | **Every** failing check is auto-fixable (`⚠` only — #2/#4, no `✗`): `` baectl: all remaining issues are auto-fixable — run `baectl run <id>` (fixes them without prompting) or `baectl ready <id> --fix` ``. A fresh `setup --yes` followed immediately by `ready` on the bundled `reference-assistant` hits exactly this: two `⚠` (profile needs widening, key needs creating), no `✗`, exit `3` — `run` then succeeds with no further prompting. With `--fix`, declining the confirmation when only `⚠` checks remain also exits `3` with this same message (nothing was mutated). |
+| `1` | At least one check is blocking (`✗`, or #2 with no fixable resolution) — without `--fix`: `` baectl: some checks are blocking — follow the guidance above, then re-run `baectl ready <id>` ``; with `--fix` (after applying #2/#4, `✗` checks remain): `baectl: some checks are still unresolved (see above)`. Also: `bae-config.toml` exists but fails to parse; an admin-API exec call fails or returns unparseable output; a profile fix is needed but no provider is registered in `bae-config.toml` at all (check #2 prints `✗ compatible profile` with the hint line ``    no providers are registered in bae-config.toml; run `baectl setup` to configure one first``, and the command exits with the blocking message above). |
 | `2` | No build `<id>` found under `--dir`: `` no build '<id>' found under <dir> — run `baectl build …` first (or check --dir) ``. |
+
+All checks are evaluated, and every line printed, **before** any admin-API
+mutation — in every mode, including `--fix`'s Prompt mode and `run`'s Auto
+mode. A blocking failure never leaves a half-created key or widened profile
+behind: `ready`/`run` either fix #2 then #4 together, or fix neither.
 
 <a id="dev-on-ready-and-run"></a>
 **`--dev` on `ready` and `run`.** The artifact a `ready`/`run` invocation acts
@@ -1039,9 +1164,30 @@ report. **Runs on the host**, same admin-API access path as `ready`.
 
 **`kind: "local"`** — runs in the **foreground** with inherited stdio (the
 child's output streams live; Ctrl-C reaches it directly). Exports
-`BAE_SERVER_URL`/`BAE_CLIENT_KEY` from the resolved values; every other host
-env var is left exactly as-is. `cd`s to `harness_dir/working_dir` and runs
-`sh -c "<run_command>"`. Prints a header first:
+`BAE_SERVER_URL`/`BAE_CLIENT_KEY` from the resolved values, plus
+`BAE_PROVIDER_KEY_ENV=<name of the resolved provider's auth-token env var>`
+(e.g. `BAE_PROVIDER_KEY_ENV=OPENAI_API_KEY` for an OpenAI-backed profile) —
+the same variable name readiness check #5 validated — whenever it's known;
+every other host env var is left exactly as-is. This is what lets a harness
+built against a non-Anthropic provider find its key under the right name
+instead of only ever looking for `ANTHROPIC_API_KEY`.
+
+**`prepare`** (`[harness] prepare` in `bae-harness.toml`, local launcher
+only — see [Harness manifest reference](07-harness-manifest.md#harness)) runs
+once before `<run_command>`, only when needed, printing
+`` prepare: <cmd>   (in <workdir>) `` first. For an `npm `/`npx ` command,
+"needed" means `node_modules/` is missing under the harness's working
+directory, or `package-lock.json` is newer than it; any other command is
+needed when `.baectl/builds/<id>/prepared` is missing or older than
+`bae-harness.toml` (and is touched after success either way, so a `run`
+right after `build` never installs twice). A non-zero exit aborts `run`
+before the harness ever starts, with the child's own exit code and
+`` baectl: prepare command failed (exit N): <cmd> ``. Container launchers
+never run `prepare` — the generated (or harness-supplied) Dockerfile already
+installs whatever the image needs at build time.
+
+`cd`s to `harness_dir/working_dir` and runs `sh -c "<run_command>"`. Prints a
+header first:
 
 ```
 ── running reference-assistant (local) ──────────────
@@ -1078,14 +1224,28 @@ docker run -d --name <id> \
 ```
 
 **No secret ever appears in the launch command line.**
-`BAE_SERVER_URL`/`BAE_CLIENT_KEY` are written into `harness.env` (last, so
-they win over any same-named key in `<dir>/.env` — the engine applies
-`--env-file`s in order) rather than passed as `--env NAME=value` arguments: an
-argv element is readable by any local user through `ps` or
-`/proc/<pid>/cmdline` for the lifetime of the engine client process. The
-whole of `<dir>/.env` is still forwarded as-is, so unrelated variables an
-operator put there do reach the harness container; keep workspace-wide
-secrets that no harness needs out of that file.
+`BAE_SERVER_URL`/`BAE_CLIENT_KEY`, plus `BAE_PROVIDER_KEY_ENV` (see above)
+when known, are written into `harness.env` — `BAE_PROVIDER_KEY_ENV` first,
+then `BAE_SERVER_URL`/`BAE_CLIENT_KEY` last, so the latter two win over any
+same-named key in `<dir>/.env` (the engine applies `--env-file`s in order) —
+rather than passed as `--env NAME=value` arguments: an argv element is
+readable by any local user through `ps` or `/proc/<pid>/cmdline` for the
+lifetime of the engine client process. The whole of `<dir>/.env` is still
+forwarded as-is, so unrelated variables an operator put there do reach the
+harness container; keep workspace-wide secrets that no harness needs out of
+that file.
+
+Readiness check #5 also counts a non-empty value already saved in
+`<dir>/.baectl/builds/<id>/harness.env` as satisfying a required env var (not
+just `<dir>/.env` or the host environment) — a value captured on an earlier
+`run` keeps satisfying `ready`/`run` on later ones without re-prompting. On
+an interactive TTY, if check #5 is the **only** blocking failure, `run`
+prompts `Value for required env var <VAR>?` for each missing one, appends the
+answer to `harness.env` (mode `0600`), and re-evaluates #5 before continuing
+— an empty answer aborts with
+`` baectl: no value provided for required env var <VAR> ``. Without a TTY
+(e.g. CI), a missing #5 var still aborts immediately as `✗`, with no prompt
+attempted.
 
 Then prints the "where/how" summary:
 
@@ -1141,8 +1301,9 @@ Per `aspec/uxui/cli.md`'s convention (shared with `baesrv`):
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | Runtime error — connection failure, or any admin API error response (all RFC 7807 bodies), or an unexpected/unparseable response body. |
+| `1` | Runtime error — connection failure, or any admin API error response (all RFC 7807 bodies), an unexpected/unparseable response body, an invalid `--dir` on `build`/`ready`/`run` (`` --dir <path> does not exist or is not a directory ``, checked once by canonicalizing it), or (`ready` only) one or more **blocking** (`✗`) checks. |
 | `2` | Usage error — a missing required positional or unknown flag (clap reports these itself). |
+| `3` | **`baectl ready` only** — every failing check is auto-fixable (`⚠` only, no `✗`): `baectl run <id>` or `ready <id> --fix` resolves them without prompting. Nothing but `ready` ever produces this code. |
 
 All errors print `baectl: <message>` to **stderr**; stdout carries only
 command results, so it stays scriptable.

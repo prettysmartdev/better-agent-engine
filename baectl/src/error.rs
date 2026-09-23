@@ -6,6 +6,8 @@
 //!   response shape).
 //! - exit `2` — usage error (a malformed argument value we validate ourselves;
 //!   clap already exits `2` for missing positionals / unknown flags).
+//! - exit `3` — `baectl ready` only: every failing check is auto-fixable (⚠);
+//!   `baectl run` or `ready --fix` resolves them.
 //!
 //! Diagnostics go to stderr; command results go to stdout. This type never
 //! surfaces a raw `reqwest` error or a JSON backtrace to the user — transport
@@ -23,6 +25,9 @@ pub enum CliError {
     Runtime(String),
     /// A usage/argument-validation failure — exit `2`.
     Usage(String),
+    /// `ready` without `--fix` (or with the confirmation declined): only
+    /// auto-fixable (⚠) checks remain — exit `3`.
+    Fixable(String),
 }
 
 impl CliError {
@@ -36,18 +41,24 @@ impl CliError {
         CliError::Usage(msg.into())
     }
 
+    /// Construct an "only auto-fixable issues remain" (exit `3`) error.
+    pub fn fixable(msg: impl Into<String>) -> Self {
+        CliError::Fixable(msg.into())
+    }
+
     /// The process exit code for this error.
     pub fn exit_code(&self) -> u8 {
         match self {
             CliError::Runtime(_) => 1,
             CliError::Usage(_) => 2,
+            CliError::Fixable(_) => 3,
         }
     }
 
     /// The stderr message for this error.
     pub fn message(&self) -> &str {
         match self {
-            CliError::Runtime(m) | CliError::Usage(m) => m,
+            CliError::Runtime(m) | CliError::Usage(m) | CliError::Fixable(m) => m,
         }
     }
 }
@@ -197,5 +208,6 @@ mod tests {
     fn usage_and_runtime_exit_codes() {
         assert_eq!(CliError::usage("x").exit_code(), 2);
         assert_eq!(CliError::runtime("x").exit_code(), 1);
+        assert_eq!(CliError::fixable("x").exit_code(), 3);
     }
 }

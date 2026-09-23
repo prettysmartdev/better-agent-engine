@@ -54,7 +54,11 @@ instructions to follow**, and to use only a fixed label vocabulary.
    `baesrv` at `examples/bae-config/github.toml` or
    `examples/bae-config/github-local.toml` (both declare `name = "github"`).
    For `remote-sandbox`, the profile must list the image named by
-   `TRIAGE_SANDBOX_IMAGE` in `available_sandboxes`.
+   `TRIAGE_SANDBOX_IMAGE` in `available_sandboxes` — e.g.
+   `baectl create profile … --available-sandbox <image>` (repeatable), or
+   `baectl update profile <id> … --available-sandbox <image>` to widen an
+   existing profile (re-list every image you want kept — it's a full
+   replacement).
 3. A client key for that profile (`POST /admin/v1/keys`).
 4. A `GITHUB_TOKEN` in the environment of whichever process calls the GitHub
    MCP server (the server, for the http/stdio transports).

@@ -492,8 +492,9 @@ fn load_prefill(dir: &Path, apple: bool) -> Result<Prefill, CliError> {
 }
 
 /// Best-effort recovery of the MAX host port from a launcher's `<port>:3000`
-/// publish entry; defaults to `3000` if not found.
-fn parse_max_port(launcher_text: &str) -> u16 {
+/// publish entry; defaults to `3000` if not found. Shared with the harness
+/// verbs' server resolution (`harness::checks::resolve_server`).
+pub(crate) fn parse_max_port(launcher_text: &str) -> u16 {
     for token in launcher_text.split(|c: char| !c.is_ascii_digit() && c != ':') {
         if let Some((host, "3000")) = token.split_once(':') {
             if let Ok(p) = host.parse::<u16>() {
@@ -506,12 +507,84 @@ fn parse_max_port(launcher_text: &str) -> u16 {
 
 // -- Wizard flow ------------------------------------------------------------
 
+/// The stderr message (after `baectl: `) when `setup --yes` finds no provider
+/// key in the environment.
+pub(crate) const NO_PROVIDER_KEY_MESSAGE: &str = "no provider API key found in the environment.
+        export ANTHROPIC_API_KEY=\"sk-ant-…\"   # or OPENAI_API_KEY=\"sk-…\"
+        then re-run `baectl setup --yes`";
+
+/// `setup --yes`'s provider detection, in the wizard's order: the first of
+/// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` that is set and non-empty. `lookup`
+/// is the environment (injected for tests). Only the *name* is returned.
+fn provider_from_env(lookup: impl Fn(&str) -> Option<String>) -> Option<ProviderKind> {
+    [ProviderKind::Anthropic, ProviderKind::OpenAi]
+        .into_iter()
+        .find(|kind| lookup(kind.default_auth_env()).is_some_and(|v| !v.is_empty()))
+}
+
+/// The wizard pre-fill `--yes` answers from: the detected provider with the
+/// wizard's own defaults for that kind (`<kind>-default`, default model, auth
+/// env var = the detected variable); everything else at its default.
+fn yes_prefill(kind: ProviderKind) -> Prefill {
+    Prefill {
+        variant: Variant::Standard,
+        providers: vec![Provider {
+            name: format!("{}-default", kind.as_str()),
+            model: kind.default_model().to_string(),
+            auth_env: kind.default_auth_env().to_string(),
+            kind,
+        }],
+        mcp: Vec::new(),
+        bae_overrides: BTreeMap::new(),
+        secrets: BTreeMap::new(),
+        max_port: None,
+    }
+}
+
+/// Resolve `--yes`'s provider from the process environment, printing which one
+/// was chosen (never its value), or fail with the single `export …` hint.
+fn yes_provider() -> Result<ProviderKind, CliError> {
+    let kind = provider_from_env(|var| std::env::var(var).ok())
+        .ok_or_else(|| CliError::runtime(NO_PROVIDER_KEY_MESSAGE))?;
+    println!(
+        "using provider {} ({} is set)",
+        kind.as_str(),
+        kind.default_auth_env()
+    );
+    Ok(kind)
+}
+
+/// Run the wizard for a fresh (or confirmed-overwrite) setup: interactively,
+/// or — under `--yes` — entirely from defaults plus the detected provider.
+fn fresh_wizard(
+    prompt: &Prompter,
+    dev: bool,
+    apple: bool,
+    yes: bool,
+) -> Result<SetupConfig, CliError> {
+    let prefill = if yes {
+        Some(yes_prefill(yes_provider()?))
+    } else {
+        None
+    };
+    run_wizard(prompt, dev, apple, prefill)
+}
+
 /// Entry point routed from `cli::dispatch`.
-pub fn run(dev_flag: bool, apple_flag: bool, dir: &Path) -> Result<(), CliError> {
+///
+/// `yes` (`--yes`): accept every default without asking (even on a TTY), take
+/// the provider from the environment, launch, and create the first profile +
+/// key; an already complete setup is relaunched as-is (exit 0), while partial
+/// or mismatched state aborts (exit 1) rather than being overwritten.
+pub fn run(dev_flag: bool, apple_flag: bool, yes: bool, dir: &Path) -> Result<(), CliError> {
     // `--dir` must exist and be writable *before* any prompting (exit 1).
     validate_dir(dir)?;
 
-    let prompt = Prompter::new();
+    let prompt = if yes {
+        Prompter::non_interactive()
+    } else {
+        Prompter::new()
+    };
 
     // `--dev`/`--apple` are answerable interactively (per WI 0012): a passed
     // flag pre-fills and skips its question, while omitting the flag asks a
@@ -549,6 +622,7 @@ pub fn run(dev_flag: bool, apple_flag: bool, dir: &Path) -> Result<(), CliError>
             dir,
             dev,
             apple,
+            yes,
             &format!(
                 "found {other_launcher} but this run uses {launcher_name} \
                  (launcher/flag mismatch)"
@@ -556,7 +630,7 @@ pub fn run(dev_flag: bool, apple_flag: bool, dir: &Path) -> Result<(), CliError>
         );
     }
     if present == 3 {
-        return handle_existing(&prompt, dir, dev, apple);
+        return handle_existing(&prompt, dir, dev, apple, yes);
     }
     if present != 0 {
         let missing: Vec<&str> = [
@@ -573,14 +647,15 @@ pub fn run(dev_flag: bool, apple_flag: bool, dir: &Path) -> Result<(), CliError>
             dir,
             dev,
             apple,
+            yes,
             &format!("incomplete setup — missing {}", missing.join(", ")),
         );
     }
 
-    // Fresh setup: no pre-fill.
-    let config = run_wizard(&prompt, dev, apple, None)?;
+    // Fresh setup: no pre-fill (or, under --yes, the detected provider).
+    let config = fresh_wizard(&prompt, dev, apple, yes)?;
     write_all_files(dir, &config)?;
-    finish(&prompt, dir, &config, true)
+    finish(&prompt, dir, &config, true, yes)
 }
 
 /// Resolve a `--dev`/`--apple`-style boolean: a passed flag forces `true` and
@@ -591,9 +666,26 @@ fn resolve_flag(prompt: &Prompter, passed: bool, question: &str) -> bool {
 }
 
 /// Existing (all three files) → Launch-or-Edit.
-fn handle_existing(prompt: &Prompter, dir: &Path, dev: bool, apple: bool) -> Result<(), CliError> {
+fn handle_existing(
+    prompt: &Prompter,
+    dir: &Path,
+    dev: bool,
+    apple: bool,
+    yes: bool,
+) -> Result<(), CliError> {
     let prefill = load_prefill(dir, apple)?;
     print_summary(&prefill);
+
+    // `--yes` is idempotent: relaunch the saved configuration, never Edit.
+    if yes {
+        let config = config_from_prefill(prefill, dev, apple);
+        finish(prompt, dir, &config, false, true)?;
+        println!(
+            "already set up in {} — server launched from the saved configuration",
+            dir.display()
+        );
+        return Ok(());
+    }
 
     // Two choices only. Non-interactive resolves to Launch (reuse verbatim) —
     // never a wizard, never an overwrite.
@@ -604,14 +696,14 @@ fn handle_existing(prompt: &Prompter, dir: &Path, dev: bool, apple: bool) -> Res
     if !edit {
         // Launch path: reuse files verbatim, no profile/key creation.
         let config = config_from_prefill(prefill, dev, apple);
-        return finish(prompt, dir, &config, false);
+        return finish(prompt, dir, &config, false, false);
     }
 
     // Edit path: back up, re-run the wizard pre-filled, regenerate, launch.
     backup_existing(dir, apple)?;
     let config = run_wizard(prompt, dev, apple, Some(prefill))?;
     write_all_files(dir, &config)?;
-    finish(prompt, dir, &config, true)
+    finish(prompt, dir, &config, true, false)
 }
 
 /// Partial / mismatched state → warn, require confirmation, then fresh overwrite.
@@ -620,6 +712,7 @@ fn handle_partial(
     dir: &Path,
     dev: bool,
     apple: bool,
+    yes: bool,
     reason: &str,
 ) -> Result<(), CliError> {
     eprintln!("baectl: {reason}.");
@@ -628,13 +721,28 @@ fn handle_partial(
          overwrite whatever partial state is present in {}.",
         dir.display()
     );
+    // Under --yes this defaults to No: a corrupted dir is never silently
+    // overwritten by a non-interactive flag, and the abort is an error (exit 1).
     if !prompt.ask_yes_no("Overwrite and run a fresh setup?", false) {
+        if yes {
+            let present: Vec<&str> = [COMPOSE_FILE, APPLE_SCRIPT, ENV_FILE, CONFIG_FILE]
+                .into_iter()
+                .filter(|name| dir.join(name).exists())
+                .collect();
+            eprintln!(
+                "        To start over, remove {} from {} and re-run, or run \
+                 `baectl setup` without --yes to choose interactively.",
+                present.join(", "),
+                dir.display()
+            );
+            return Err(CliError::runtime("aborted; no files were changed."));
+        }
         eprintln!("baectl: aborted; no files were changed.");
         return Ok(());
     }
-    let config = run_wizard(prompt, dev, apple, None)?;
+    let config = fresh_wizard(prompt, dev, apple, yes)?;
     write_all_files(dir, &config)?;
-    finish(prompt, dir, &config, true)
+    finish(prompt, dir, &config, true, yes)
 }
 
 /// Print the saved-configuration summary shown before the Launch/Edit choice.
@@ -1298,6 +1406,11 @@ fn write_compose_file(dir: &Path, config: &SetupConfig) -> Result<(), CliError> 
     if config.variant == Variant::Max {
         out.push_str(&format!("      - \"{}:3000\"\n", config.max_port));
     }
+    // `host.docker.internal` resolves on Linux too (Docker Desktop provides it
+    // already), so the server can reach host-side services such as a local
+    // provider mock — the same mapping `run` adds for launcher containers.
+    out.push_str("    extra_hosts:\n");
+    out.push_str("      - \"host.docker.internal:host-gateway\"\n");
     out.push_str("    restart: unless-stopped\n");
     out.push_str("volumes:\n");
     out.push_str(&format!("  {DATA_VOLUME}:\n"));
@@ -1454,11 +1567,12 @@ fn finish(
     dir: &Path,
     config: &SetupConfig,
     fresh: bool,
+    launch_implied: bool,
 ) -> Result<(), CliError> {
     warn_unresolved(config);
 
-    let launch_default = prompt.interactive;
-    let launch = prompt.ask_yes_no("Launch now?", launch_default);
+    // `--yes` implies Launch; otherwise ask (defaulting to yes on a TTY).
+    let launch = launch_implied || prompt.ask_yes_no("Launch now?", prompt.interactive);
     if !launch {
         print_manual_launch(config);
         return Ok(());
@@ -2119,7 +2233,7 @@ mod tests {
     #[test]
     fn idempotency_detects_fresh_existing_partial_and_launcher_mismatch() {
         let fresh = TempDir::new("fresh");
-        run(false, false, fresh.path()).unwrap();
+        run(false, false, false, fresh.path()).unwrap();
         for name in [COMPOSE_FILE, ENV_FILE, CONFIG_FILE] {
             assert!(
                 fresh.path().join(name).exists(),
@@ -2131,7 +2245,7 @@ mod tests {
             .iter()
             .map(|name| std::fs::read(fresh.path().join(name)).unwrap())
             .collect();
-        run(false, false, fresh.path()).unwrap();
+        run(false, false, false, fresh.path()).unwrap();
         let after: Vec<Vec<u8>> = [COMPOSE_FILE, ENV_FILE, CONFIG_FILE]
             .iter()
             .map(|name| std::fs::read(fresh.path().join(name)).unwrap())
@@ -2140,14 +2254,14 @@ mod tests {
 
         let partial = TempDir::new("partial");
         std::fs::write(partial.path().join(ENV_FILE), "BAE_LOG=debug\n").unwrap();
-        run(false, false, partial.path()).unwrap();
+        run(false, false, false, partial.path()).unwrap();
         assert!(partial.path().join(ENV_FILE).exists());
         assert!(!partial.path().join(COMPOSE_FILE).exists());
         assert!(!partial.path().join(CONFIG_FILE).exists());
 
         let mismatch = TempDir::new("mismatch");
         std::fs::write(mismatch.path().join(COMPOSE_FILE), "services: {}\n").unwrap();
-        run(false, true, mismatch.path()).unwrap();
+        run(false, true, false, mismatch.path()).unwrap();
         assert!(mismatch.path().join(COMPOSE_FILE).exists());
         assert!(!mismatch.path().join(APPLE_SCRIPT).exists());
         assert!(!mismatch.path().join(ENV_FILE).exists());
@@ -2460,5 +2574,56 @@ mod tests {
         compose_max.max_password_blank = false;
         assert!(max_password_hint(&compose_max).is_none());
         assert!(max_password_hint(&config(Variant::Standard, false, false)).is_none());
+    }
+
+    /// C1: `--yes` provider detection — `ANTHROPIC_API_KEY` first, then
+    /// `OPENAI_API_KEY`; an empty value does not count.
+    #[test]
+    fn yes_provider_detection_order() {
+        let detect = |pairs: &[(&str, &str)]| {
+            provider_from_env(|var: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == var)
+                    .map(|(_, v)| v.to_string())
+            })
+            .map(|kind| kind.as_str())
+        };
+        assert_eq!(
+            detect(&[("ANTHROPIC_API_KEY", "a"), ("OPENAI_API_KEY", "o")]),
+            Some("anthropic")
+        );
+        assert_eq!(detect(&[("OPENAI_API_KEY", "o")]), Some("openai"));
+        assert_eq!(
+            detect(&[("ANTHROPIC_API_KEY", ""), ("OPENAI_API_KEY", "o")]),
+            Some("openai")
+        );
+        assert_eq!(detect(&[("ANTHROPIC_API_KEY", "")]), None);
+        assert_eq!(detect(&[]), None);
+    }
+
+    /// C1: the `--yes` pre-fill is a single `<kind>-default` provider using that
+    /// kind's default model and the detected variable, and no secret values.
+    #[test]
+    fn yes_prefill_is_the_single_detected_provider() {
+        for (kind, name, var) in [
+            (
+                ProviderKind::Anthropic,
+                "anthropic-default",
+                "ANTHROPIC_API_KEY",
+            ),
+            (ProviderKind::OpenAi, "openai-default", "OPENAI_API_KEY"),
+        ] {
+            let model = kind.default_model();
+            let p = yes_prefill(kind);
+            assert_eq!(p.providers.len(), 1);
+            assert_eq!(p.providers[0].name, name);
+            assert_eq!(p.providers[0].auth_env, var);
+            assert_eq!(p.providers[0].model, model);
+            assert!(p.variant == Variant::Standard);
+            assert!(p.mcp.is_empty() && p.secrets.is_empty());
+        }
+        assert!(NO_PROVIDER_KEY_MESSAGE.contains("export ANTHROPIC_API_KEY=\"sk-ant-…\""));
+        assert!(NO_PROVIDER_KEY_MESSAGE.ends_with("then re-run `baectl setup --yes`"));
     }
 }

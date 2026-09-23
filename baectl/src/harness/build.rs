@@ -3,13 +3,15 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{detect_engine, EngineKind};
 use crate::error::CliError;
 use crate::harness::manifest::{
-    derive_id, load_harness_manifest, BuildManifest, ContainerManifest, Harness, Launcher,
+    derive_id, load_harness_manifest, validate_derived_id, validate_explicit_id,
+    validate_harness_name, BuildManifest, ContainerManifest, ContainerOverrides, Harness, Launcher,
     LauncherConfig, LocalManifest, Sdk,
 };
 
@@ -47,6 +49,10 @@ pub fn build(opts: BuildOptions) -> Result<(), CliError> {
     let harness_dir = resolve_harness_dir(&opts, &dir)?;
     let harness_manifest = load_harness_manifest(&harness_dir.join("bae-harness.toml"))?;
     let harness = &harness_manifest.harness;
+    validate_harness_name(&harness.name)?;
+    if let Some(id) = opts.id.as_deref() {
+        validate_explicit_id(id)?;
+    }
 
     if opts.launcher.is_container() && harness.launcher.is_none() {
         return Err(CliError::usage(format!(
@@ -63,7 +69,9 @@ pub fn build(opts: BuildOptions) -> Result<(), CliError> {
         ))
     })?;
     let id = resolve_id(&builds_dir, harness, opts.launcher, opts.id.as_deref())?;
-    validate_id(&id)?;
+    if opts.id.is_none() {
+        validate_derived_id(&id)?;
+    }
     let artifact_dir = builds_dir.join(&id);
     let rebuilt = artifact_dir.exists();
     fs::create_dir_all(&artifact_dir).map_err(|e| {
@@ -135,8 +143,9 @@ fn build_local(
         harness_dir: harness_dir.to_path_buf(),
         run_command: harness.run.clone(),
         working_dir: harness.working_dir.clone(),
+        prepare: harness.prepare.clone(),
         requires: harness.requires.clone(),
-        created_at: rfc3339_now()?,
+        created_at: rfc3339_now(),
     }))
 }
 
@@ -173,12 +182,26 @@ fn build_container(
     } else {
         harness_dir.to_path_buf()
     };
+    let overrides = harness.container.clone().unwrap_or_default();
+    if generated_build_dockerfile {
+        validate_overrides(&overrides)?;
+        // Docker only honours `<context>/.dockerignore`; without one, the
+        // generated `COPY . .` ships host `target/`/`node_modules`/`.venv` into
+        // the build stage (and risks a host-linked binary in the image).
+        ensure_dockerignore(&build_context, harness.sdk)?;
+    } else if harness.container.is_some() {
+        eprintln!(
+            "baectl: warning: [harness.container] is ignored because \
+             [harness.launcher].dockerfile is set (that Dockerfile owns the build)"
+        );
+    }
     let build_dockerfile = resolve_build_dockerfile(
         harness_dir,
         artifact_dir,
         &launcher_config.dockerfile,
         harness.sdk,
         &harness.name,
+        &overrides,
     )?;
 
     let mut harness_build_args = vec![
@@ -198,7 +221,9 @@ fn build_container(
     let config_file = launcher_config_filename(launcher)?;
     let binary_path = match &launcher_config.binary_path {
         Some(path) => path.clone(),
-        None if generated_build_dockerfile => default_binary_path(harness.sdk, &harness.name),
+        None if generated_build_dockerfile => {
+            generated_binary_path(harness.sdk, &harness.name, &overrides)
+        }
         None => {
             return Err(CliError::usage(
                 "[harness.launcher].binary_path is required when dockerfile is set",
@@ -252,7 +277,7 @@ fn build_container(
             Launcher::Local => unreachable!("container builder is not called for local"),
         },
         requires: harness.requires.clone(),
-        created_at: rfc3339_now()?,
+        created_at: rfc3339_now(),
     }))
 }
 
@@ -268,6 +293,7 @@ fn resolve_build_dockerfile(
     dockerfile: &Option<String>,
     sdk: Sdk,
     name: &str,
+    overrides: &ContainerOverrides,
 ) -> Result<PathBuf, CliError> {
     match dockerfile {
         Some(path) => {
@@ -283,7 +309,7 @@ fn resolve_build_dockerfile(
         }
         None => {
             let path = artifact_dir.join("Dockerfile.build.generated");
-            fs::write(&path, default_build_dockerfile(sdk, name)).map_err(|e| {
+            fs::write(&path, generated_build_dockerfile(sdk, name, overrides)).map_err(|e| {
                 CliError::runtime(format!(
                     "could not write generated build Dockerfile {}: {e}",
                     path.display()
@@ -383,15 +409,81 @@ fn same_build_combo(manifest: &BuildManifest, harness: &Harness, launcher: Launc
     }
 }
 
-fn validate_id(id: &str) -> Result<(), CliError> {
-    let path = Path::new(id);
-    if id.is_empty()
-        || path.components().count() != 1
-        || !matches!(path.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(CliError::usage(
-            "--id must be a non-empty single path component",
-        ));
+/// The build-context excludes `build` writes when a generated build's context
+/// has no `.dockerignore` of its own. The same list is committed as
+/// `client-{rust,typescript,python}/.dockerignore`.
+pub(crate) const DOCKERIGNORE: &str =
+    "target/\nnode_modules/\n.venv/\n__pycache__/\n.baectl/\n.git/\n";
+
+/// The host directory whose absence from `.dockerignore` matters most for each
+/// SDK: its build output / installed dependencies, which `COPY . .` would
+/// otherwise ship into the build stage.
+fn sdk_host_artifact_dir(sdk: Sdk) -> &'static str {
+    match sdk {
+        Sdk::Rust => "target",
+        Sdk::Typescript => "node_modules",
+        Sdk::Python => ".venv",
+    }
+}
+
+/// Create `<context>/.dockerignore` with [`DOCKERIGNORE`] when absent; leave an
+/// existing one untouched (warning when it does not exclude the SDK's host
+/// artifact directory — `target/`, `node_modules/` or `.venv/`).
+/// Returns whether a file was written.
+pub(crate) fn ensure_dockerignore(context: &Path, sdk: Sdk) -> Result<bool, CliError> {
+    let path = context.join(".dockerignore");
+    match fs::read_to_string(&path) {
+        Ok(existing) => {
+            let dir = sdk_host_artifact_dir(sdk);
+            if !dockerignore_excludes(&existing, dir) {
+                eprintln!(
+                    "baectl: warning: {} does not exclude {dir}/ — host build output will be \
+                     sent to the image build",
+                    path.display()
+                );
+            }
+            Ok(false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::write(&path, DOCKERIGNORE).map_err(|e| {
+                CliError::runtime(format!("could not write {}: {e}", path.display()))
+            })?;
+            println!("wrote {} (build-context excludes)", path.display());
+            Ok(true)
+        }
+        Err(e) => Err(CliError::runtime(format!(
+            "could not read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Whether a `.dockerignore` body has a pattern excluding a top-level (or any)
+/// directory called `dir`.
+fn dockerignore_excludes(text: &str, dir: &str) -> bool {
+    text.lines().any(|line| {
+        let pattern = line.trim().trim_start_matches('/').trim_end_matches('/');
+        pattern == "*"
+            || pattern == dir
+            || pattern.strip_prefix("**/") == Some(dir)
+            || pattern.strip_suffix("/**") == Some(dir)
+    })
+}
+
+/// `[harness.container]` values are spliced into single Dockerfile lines, so
+/// they must be single-line.
+fn validate_overrides(overrides: &ContainerOverrides) -> Result<(), CliError> {
+    for (field, value) in [
+        ("build", &overrides.build),
+        ("entrypoint", &overrides.entrypoint),
+    ] {
+        if let Some(v) = value {
+            if v.trim().is_empty() || v.contains('\n') || v.contains('\r') {
+                return Err(CliError::usage(format!(
+                    "[harness.container].{field} must be a non-empty single-line command"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -469,22 +561,40 @@ const BUILD_WORKDIR: &str = "/build";
 /// executable. Copying bare `main.ts`/`main.py` into the Debian-slim launcher
 /// base — which carries neither Node nor Python — would produce an image whose
 /// every trigger fails to spawn its harness.
+#[cfg(test)]
 fn default_build_dockerfile(sdk: Sdk, name: &str) -> String {
+    generated_build_dockerfile(sdk, name, &ContainerOverrides::default())
+}
+
+/// [`default_build_dockerfile`] with the `[harness.container]` overrides
+/// applied: `build` replaces the SDK build command, `entrypoint` the command the
+/// TypeScript/Python shim execs (Rust's `entrypoint` is a binary path, applied
+/// by [`generated_binary_path`] instead).
+fn generated_build_dockerfile(sdk: Sdk, name: &str, overrides: &ContainerOverrides) -> String {
+    let build = overrides.build.as_deref();
     match sdk {
-        Sdk::Rust => format!(
-            "FROM rust:1-bookworm AS build\n\
-             WORKDIR {BUILD_WORKDIR}\n\
-             COPY . .\n\
-             RUN cargo build --release --example {name}\n"
-        ),
-        Sdk::Typescript => format!(
+        Sdk::Rust => {
+            let default_build = format!("cargo build --release --example {name}");
+            let build = build.unwrap_or(&default_build);
+            format!(
+                "FROM rust:1-bookworm AS build\n\
+                 WORKDIR {BUILD_WORKDIR}\n\
+                 COPY . .\n\
+                 RUN {build}\n"
+            )
+        }
+        Sdk::Typescript => {
+            let build = build.unwrap_or("npm ci && npm run build");
+            let default_entry = format!("./node_modules/.bin/tsx examples/{name}/main.ts");
+            let entry = printf_sq_escape(overrides.entrypoint.as_deref().unwrap_or(&default_entry));
+            format!(
             "FROM node:22-bookworm AS build\n\
              WORKDIR {BUILD_WORKDIR}\n\
              COPY . .\n\
              # `npm ci` deletes any node_modules that arrived with the build\n\
              # context (installed on the developer's own OS/arch, possibly with\n\
              # incompatible native binaries) and reinstalls from the lockfile.\n\
-             RUN npm ci && npm run build\n\
+             RUN {build}\n\
              # Stage a self-contained project tree (sources, build output and\n\
              # node_modules) plus the shim the launcher image executes. The\n\
              # launcher bases are debian:bookworm-slim and carry no Node, so the\n\
@@ -492,14 +602,19 @@ fn default_build_dockerfile(sdk: Sdk, name: &str) -> String {
              RUN set -eu \\\n\
              \x20&& mkdir -p {HARNESS_TREE} \\\n\
              \x20&& cp -a {BUILD_WORKDIR}/. {HARNESS_TREE}/ \\\n\
-             \x20&& printf '#!/bin/sh\\nset -e\\ncd {HARNESS_TREE}\\nexec ./node_modules/.bin/tsx examples/{name}/main.ts \"$@\"\\n' > {HARNESS_SHIM} \\\n\
+             \x20&& printf '#!/bin/sh\\nset -e\\ncd {HARNESS_TREE}\\nexec {entry} \"$@\"\\n' > {HARNESS_SHIM} \\\n\
              \x20&& chmod 0755 {HARNESS_SHIM}\n"
-        ),
+            )
+        }
         // Debian bookworm's own python3 rather than the python:3.12 image: the
         // launcher base is debian:bookworm-slim, and installing the *same*
         // interpreter on both sides keeps the staged virtualenv's interpreter
         // symlink and any compiled wheel valid after the COPY --from.
-        Sdk::Python => format!(
+        Sdk::Python => {
+            let build = build.unwrap_or("pip install --no-cache-dir .");
+            let default_entry = format!("{HARNESS_TREE}/venv/bin/python examples/{name}/main.py");
+            let entry = printf_sq_escape(overrides.entrypoint.as_deref().unwrap_or(&default_entry));
+            format!(
             "FROM debian:bookworm-slim AS build\n\
              RUN apt-get update && apt-get install -y --no-install-recommends \\\n\
              \x20       ca-certificates python3 python3-venv \\\n\
@@ -507,15 +622,18 @@ fn default_build_dockerfile(sdk: Sdk, name: &str) -> String {
              WORKDIR {BUILD_WORKDIR}\n\
              COPY . .\n\
              # A virtualenv keeps the harness's dependencies self-contained, so\n\
-             # the launcher image needs only the interpreter — never pip.\n\
+             # the launcher image needs only the interpreter — never pip. The\n\
+             # build command runs with the venv activated.\n\
              RUN set -eu \\\n\
              \x20&& python3 -m venv {HARNESS_TREE}/venv \\\n\
-             \x20&& {HARNESS_TREE}/venv/bin/pip install --no-cache-dir . \\\n\
+             \x20&& export VIRTUAL_ENV={HARNESS_TREE}/venv PATH={HARNESS_TREE}/venv/bin:$PATH \\\n\
+             \x20&& ( {build} ) \\\n\
              \x20&& mkdir -p {HARNESS_TREE}/app \\\n\
              \x20&& cp -a {BUILD_WORKDIR}/. {HARNESS_TREE}/app/ \\\n\
-             \x20&& printf '#!/bin/sh\\nset -e\\ncd {HARNESS_TREE}/app\\nexec {HARNESS_TREE}/venv/bin/python examples/{name}/main.py \"$@\"\\n' > {HARNESS_SHIM} \\\n\
+             \x20&& printf '#!/bin/sh\\nset -e\\ncd {HARNESS_TREE}/app\\nexport PATH={HARNESS_TREE}/venv/bin:$PATH\\nexec {entry} \"$@\"\\n' > {HARNESS_SHIM} \\\n\
              \x20&& chmod 0755 {HARNESS_SHIM}\n"
-        ),
+            )
+        }
     }
 }
 
@@ -527,6 +645,24 @@ fn default_binary_path(sdk: Sdk, name: &str) -> String {
         Sdk::Rust => format!("{BUILD_WORKDIR}/target/release/{name}"),
         Sdk::Typescript | Sdk::Python => HARNESS_SHIM.to_string(),
     }
+}
+
+/// [`default_binary_path`] honouring a Rust `[harness.container].entrypoint`
+/// (the image path of the built binary). TypeScript/Python always land at the
+/// shim; their `entrypoint` changes what the shim execs.
+fn generated_binary_path(sdk: Sdk, name: &str, overrides: &ContainerOverrides) -> String {
+    match (sdk, &overrides.entrypoint) {
+        (Sdk::Rust, Some(path)) => path.clone(),
+        _ => default_binary_path(sdk, name),
+    }
+}
+
+/// Escape `s` for embedding in the generated shim's single-quoted `printf`
+/// format: `'` closes/reopens the quote, and `\` / `%` are printf escapes.
+fn printf_sq_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "%%")
+        .replace('\'', "'\\''")
 }
 
 /// The lines the generated final Dockerfile needs so the packaged harness can
@@ -672,15 +808,33 @@ fn remove_if_exists(path: &Path) -> Result<(), CliError> {
     }
 }
 
-fn rfc3339_now() -> Result<String, CliError> {
-    let output = Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .map_err(|e| CliError::runtime(format!("could not create build timestamp: {e}")))?;
-    if !output.status.success() {
-        return Err(CliError::runtime("could not create build timestamp"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// The current UTC time as `YYYY-MM-DDTHH:MM:SSZ`, computed in-process (no
+/// `date` subprocess, so `build` works with a minimal `PATH`).
+pub(crate) fn rfc3339_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    rfc3339_from_unix(secs)
+}
+
+/// Format Unix seconds as RFC 3339 UTC. Uses Howard Hinnant's
+/// civil-from-days algorithm (proleptic Gregorian calendar).
+fn rfc3339_from_unix(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 #[cfg(test)]
@@ -696,6 +850,16 @@ mod tests {
             prompt_env: "AGENT_PROMPT".to_string(),
             default_schedule: Some("0 0 3 * * *".to_string()),
         }
+    }
+
+    /// `created_at` is computed in-process (no `date` subprocess).
+    #[test]
+    fn rfc3339_from_unix_matches_known_instants() {
+        assert_eq!(rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_from_unix(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_from_unix(1_790_000_000), "2026-09-21T14:13:20Z");
+        assert_eq!(rfc3339_from_unix(4_102_444_799), "2099-12-31T23:59:59Z");
+        assert_eq!(rfc3339_now().len(), "2026-01-01T00:00:00Z".len());
     }
 
     #[test]
@@ -860,8 +1024,10 @@ mod tests {
             sdk: Sdk::Rust,
             run: "true".to_string(),
             working_dir: ".".to_string(),
+            prepare: None,
             requires: Requires::default(),
             launcher: None,
+            container: None,
         };
         let manifest = BuildManifest::Local(LocalManifest {
             id: "assistant-rust-local".to_string(),
@@ -871,6 +1037,7 @@ mod tests {
             harness_dir: PathBuf::from("/tmp/assistant"),
             run_command: "true".to_string(),
             working_dir: ".".to_string(),
+            prepare: None,
             requires: Requires::default(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         });
@@ -955,49 +1122,95 @@ mod tests {
             .any(|line| line.trim_start().starts_with(directive))
     }
 
-    /// The generated `bae-api.toml`/`bae-app.toml` bodies parse under
-    /// launcher-api's own `ApiConfig` deserializer — the same one `baeapi`
-    /// loads at startup, `deny_unknown_fields` and all — and its JSON Schema
-    /// compiles, proving the generated `request_schema`/`env_template` shape is
-    /// genuinely loadable, not merely valid TOML. Mirrors WI 0012's
-    /// `BaeConfig`-deserializer round-trip-test posture.
+    /// The generated `bae-api.toml`/`bae-app.toml` bodies are pinned
+    /// byte-for-byte to `tests/fixtures/generated/`. That directory is the
+    /// contract with `launchers/api`: its `baectl_generated` test loads these
+    /// exact files through `baeapi`'s real config parser (`deny_unknown_fields`
+    /// and JSON-Schema compile included). The dependency points from the
+    /// launcher to baectl's fixtures, never the other way, so baectl's image
+    /// build needs nothing but `server/` and `baectl/`.
+    ///
+    /// A deliberate generator change regenerates the fixtures with
+    /// `BAECTL_UPDATE_FIXTURES=1 cargo test generated_launcher_configs`.
     #[test]
-    fn api_and_webapp_configs_round_trip_through_launcher_api_config() {
-        // The real example files must themselves be valid `ApiConfig` documents
-        // — establishes that baectl's generated shape is being checked against
-        // the same schema the example demonstrates, not a stale copy of it.
-        for example in [
-            include_str!("../../../examples/launchers/api/bae-api.toml"),
-            include_str!("../../../examples/launchers/webapp/bae-app.toml"),
+    fn generated_launcher_configs_match_checked_in_fixtures() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generated");
+        for (kind, file) in [
+            (Launcher::Api, "bae-api.toml"),
+            (Launcher::Webapp, "bae-app.toml"),
         ] {
-            toml::from_str::<launcher_api::config::ApiConfig>(example)
-                .expect("example config must match the launcher's own schema");
+            let generated = launcher_config_toml(kind, "reference-assistant", &launcher()).unwrap();
+            let path = fixtures.join(file);
+            if std::env::var_os("BAECTL_UPDATE_FIXTURES").is_some() {
+                fs::create_dir_all(&fixtures).unwrap();
+                fs::write(&path, &generated).unwrap();
+            }
+            let fixture = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+            assert_eq!(
+                generated,
+                fixture,
+                "generated {file} drifted from {} — if intended, regenerate with \
+                 BAECTL_UPDATE_FIXTURES=1 and re-run launchers/api's tests",
+                path.display()
+            );
         }
+    }
 
-        for kind in [Launcher::Api, Launcher::Webapp] {
-            let config = launcher();
-            let generated = launcher_config_toml(kind, "reference-assistant", &config).unwrap();
+    /// The generated api/webapp configs have the same shape as the example
+    /// launcher configs (checked-in copies under `tests/fixtures/launcher-config/`,
+    /// themselves pinned to `examples/launchers/`): `[server].addr`, one
+    /// `[[agents]]` with `name`/`command`, `request_schema.required`, and an
+    /// `env_template` `{field, env}` entry.
+    #[test]
+    fn generated_launcher_configs_share_the_example_shape() {
+        let cases = [
+            (
+                Launcher::Api,
+                include_str!("../../tests/fixtures/launcher-config/bae-api.toml"),
+                include_str!("../../../examples/launchers/api/bae-api.toml"),
+            ),
+            (
+                Launcher::Webapp,
+                include_str!("../../tests/fixtures/launcher-config/bae-app.toml"),
+                include_str!("../../../examples/launchers/webapp/bae-app.toml"),
+            ),
+        ];
+        for (kind, fixture, example) in cases {
+            assert_eq!(
+                fixture, example,
+                "tests/fixtures/launcher-config is a byte copy of examples/launchers"
+            );
+            let fixture: toml::Value = toml::from_str(fixture).unwrap();
+            let generated_text =
+                launcher_config_toml(kind, "reference-assistant", &launcher()).unwrap();
+            let generated: toml::Value = toml::from_str(&generated_text).unwrap();
 
-            let path = std::env::temp_dir().join(format!(
-                "baectl-build-launcher-config-{kind}-{}.toml",
-                std::process::id()
-            ));
-            fs::write(&path, &generated).unwrap();
-            let loaded = launcher_api::config::load(path.to_str().unwrap())
-                .expect("generated config must load through baeapi's real config parser");
-            let _ = fs::remove_file(&path);
-
-            assert_eq!(loaded.addr.as_deref(), Some("0.0.0.0:9090"));
-            assert_eq!(loaded.agents.len(), 1);
-            let agent = &loaded.agents[0];
-            assert_eq!(agent.config.name, "reference-assistant");
-            assert_eq!(agent.config.command, "/usr/local/bin/reference-assistant");
-            assert_eq!(agent.config.env_template.len(), 1);
-            assert_eq!(agent.config.env_template[0].field, "AGENT_PROMPT");
-            assert_eq!(agent.config.env_template[0].env, "AGENT_PROMPT");
-            // The compiled validator confirms the generated request_schema is
-            // not just parseable JSON but an actually-valid JSON Schema.
-            assert!(agent.validator.is_some());
+            let top_keys = |v: &toml::Value| {
+                v.as_table()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            assert_eq!(top_keys(&generated), top_keys(&fixture), "{kind}");
+            for v in [&fixture, &generated] {
+                assert!(v["server"]["addr"].is_str());
+                let agent = &v["agents"].as_array().unwrap()[0];
+                assert!(agent["name"].is_str());
+                assert!(agent["command"].is_str());
+                assert!(agent["request_schema"]["required"].is_array());
+                let template = &agent["env_template"].as_array().unwrap()[0];
+                assert!(template["field"].is_str());
+                assert!(template["env"].is_str());
+            }
+            let agent = &generated["agents"].as_array().unwrap()[0];
+            assert_eq!(agent["name"].as_str(), Some("reference-assistant"));
+            assert_eq!(
+                agent["command"].as_str(),
+                Some("/usr/local/bin/reference-assistant")
+            );
+            assert_eq!(generated["server"]["addr"].as_str(), Some("0.0.0.0:9090"));
         }
     }
 
@@ -1044,9 +1257,15 @@ mod tests {
     #[test]
     fn resolve_build_dockerfile_writes_default_when_harness_has_none() {
         let (harness_dir, artifact_dir) = temp_dirs("default");
-        let path =
-            resolve_build_dockerfile(&harness_dir, &artifact_dir, &None, Sdk::Python, "assistant")
-                .unwrap();
+        let path = resolve_build_dockerfile(
+            &harness_dir,
+            &artifact_dir,
+            &None,
+            Sdk::Python,
+            "assistant",
+            &ContainerOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(path, artifact_dir.join("Dockerfile.build.generated"));
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("python3 -m venv"));
@@ -1068,6 +1287,7 @@ mod tests {
             &dockerfile,
             Sdk::Rust,
             "assistant",
+            &ContainerOverrides::default(),
         )
         .unwrap();
 
@@ -1077,5 +1297,151 @@ mod tests {
             "the harness's own dockerfile is used verbatim; no default should be generated"
         );
         let _ = fs::remove_dir_all(harness_dir.parent().unwrap());
+    }
+
+    fn overrides(build: Option<&str>, entrypoint: Option<&str>) -> ContainerOverrides {
+        ContainerOverrides {
+            build: build.map(str::to_string),
+            entrypoint: entrypoint.map(str::to_string),
+        }
+    }
+
+    /// Regression (B10): `[harness.container]` replaces each SDK's generated
+    /// build command and entrypoint, so a harness outside the bundled
+    /// `examples/<name>/main.*` layout can be packaged.
+    #[test]
+    fn container_overrides_replace_each_sdks_build_and_entrypoint() {
+        // Rust: `build` replaces the cargo line; `entrypoint` is the binary path.
+        let o = overrides(
+            Some("cargo build --release --bin agent"),
+            Some("/build/target/release/agent"),
+        );
+        let df = generated_build_dockerfile(Sdk::Rust, "probe", &o);
+        assert!(
+            df.lines()
+                .any(|l| l == "RUN cargo build --release --bin agent"),
+            "{df}"
+        );
+        assert!(!df.contains("--example probe"), "{df}");
+        assert_eq!(
+            generated_binary_path(Sdk::Rust, "probe", &o),
+            "/build/target/release/agent"
+        );
+
+        // TypeScript: `build` replaces `npm ci && npm run build`; the shim execs
+        // `entrypoint` (quoted for the printf format).
+        let o = overrides(Some("npm ci && npx tsc"), Some("node dist/it's.js"));
+        let df = generated_build_dockerfile(Sdk::Typescript, "probe", &o);
+        assert!(df.lines().any(|l| l == "RUN npm ci && npx tsc"), "{df}");
+        assert!(!df.contains("npm run build"), "{df}");
+        assert!(df.contains("exec node dist/it'\\''s.js \"$@\""), "{df}");
+        assert!(!df.contains("examples/probe/main.ts"), "{df}");
+        assert_eq!(
+            generated_binary_path(Sdk::Typescript, "probe", &o),
+            HARNESS_SHIM
+        );
+
+        // Python: `build` runs in a subshell with the venv active.
+        let o = overrides(Some("pip install -e ."), Some("python -m agent"));
+        let df = generated_build_dockerfile(Sdk::Python, "probe", &o);
+        assert!(df.contains("&& ( pip install -e . ) \\"), "{df}");
+        assert!(!df.contains("pip install --no-cache-dir ."), "{df}");
+        assert!(df.contains("exec python -m agent \"$@\""), "{df}");
+        assert!(!df.contains("examples/probe/main.py"), "{df}");
+
+        // Each field is optional on its own.
+        let only_entry = overrides(None, Some("node x.js"));
+        let df = generated_build_dockerfile(Sdk::Typescript, "probe", &only_entry);
+        assert!(df.contains("RUN npm ci && npm run build"), "{df}");
+        assert_eq!(
+            generated_build_dockerfile(Sdk::Rust, "probe", &overrides(None, None)),
+            default_build_dockerfile(Sdk::Rust, "probe")
+        );
+    }
+
+    #[test]
+    fn container_overrides_must_be_single_line_and_non_empty() {
+        assert!(validate_overrides(&overrides(Some("make"), Some("/bin/x"))).is_ok());
+        assert!(validate_overrides(&ContainerOverrides::default()).is_ok());
+        for (o, field) in [
+            (overrides(Some("a\nb"), None), "build"),
+            (overrides(Some("   "), None), "build"),
+            (overrides(None, Some("a\r\nb")), "entrypoint"),
+        ] {
+            let e = validate_overrides(&o).unwrap_err();
+            assert_eq!(e.exit_code(), 2);
+            assert_eq!(
+                e.message(),
+                format!("[harness.container].{field} must be a non-empty single-line command")
+            );
+        }
+    }
+
+    /// Regression (B6): the generated build's context gets the excludes when it
+    /// has none; an existing file is never touched.
+    #[test]
+    fn ensure_dockerignore_writes_only_when_absent() {
+        let (context, _) = temp_dirs("dockerignore");
+        assert!(ensure_dockerignore(&context, Sdk::Rust).unwrap());
+        let written = fs::read_to_string(context.join(".dockerignore")).unwrap();
+        assert_eq!(written, DOCKERIGNORE);
+        for entry in [
+            "target/",
+            "node_modules/",
+            ".venv/",
+            "__pycache__/",
+            ".baectl/",
+            ".git/",
+        ] {
+            assert!(written.lines().any(|l| l == entry), "{entry}");
+        }
+
+        fs::write(context.join(".dockerignore"), "custom\n").unwrap();
+        assert!(!ensure_dockerignore(&context, Sdk::Rust).unwrap());
+        assert_eq!(
+            fs::read_to_string(context.join(".dockerignore")).unwrap(),
+            "custom\n"
+        );
+        let _ = fs::remove_dir_all(context.parent().unwrap());
+    }
+
+    #[test]
+    fn dockerignore_target_detection() {
+        for yes in [
+            "target/\n",
+            "/target\n",
+            "**/target\n",
+            "  target  \n",
+            "*\n",
+        ] {
+            assert!(dockerignore_excludes(yes, "target"), "{yes:?}");
+        }
+        for no in [
+            "",
+            "targets/\n",
+            "# target\n",
+            "src/target/x\n",
+            "node_modules/\n",
+        ] {
+            assert!(!dockerignore_excludes(no, "target"), "{no:?}");
+        }
+    }
+
+    /// Regression (RF-8): the warning checks the directory that matters for the
+    /// harness's SDK, not always `target/`.
+    #[test]
+    fn dockerignore_check_is_per_sdk() {
+        assert_eq!(sdk_host_artifact_dir(Sdk::Rust), "target");
+        assert_eq!(sdk_host_artifact_dir(Sdk::Typescript), "node_modules");
+        assert_eq!(sdk_host_artifact_dir(Sdk::Python), ".venv");
+        let python_only_target = "target/\n";
+        assert!(!dockerignore_excludes(python_only_target, ".venv"));
+        assert!(dockerignore_excludes(".venv/\n", ".venv"));
+        assert!(dockerignore_excludes("**/node_modules\n", "node_modules"));
+        assert!(dockerignore_excludes("node_modules/**\n", "node_modules"));
+        assert!(!dockerignore_excludes(
+            "node_modules_old/\n",
+            "node_modules"
+        ));
     }
 }

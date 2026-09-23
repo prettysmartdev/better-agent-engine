@@ -10,7 +10,8 @@ mirrors the Rust and TypeScript SDKs conceptually:
 * :class:`Harness` — holds the config, tool registry, and hooks; ``connect()``
   opens a :class:`Session`.
 * :class:`Session` — ``send(message)`` drives the full tool-call round-trip;
-  ``close()`` ends the session.
+  ``compact(prompt)`` summarizes the history on demand; ``close()`` ends the
+  session.
 * :class:`Hooks` — optional ``before_send`` / ``after_receive`` /
   ``before_tool_call`` / ``after_tool_call`` callbacks.
 
@@ -78,6 +79,11 @@ from .subagent import (
 )
 from .tool import Tool, ToolHandler, ToolRegistry
 from .types import (
+    SYNTHETIC_ABANDONED_TOOL_RESULTS,
+    SYNTHETIC_COMPACTION_PREAMBLE,
+    AutoCompaction,
+    ClientCompaction,
+    CompactionConfig,
     Content,
     ContentBlock,
     EventType,
@@ -88,6 +94,11 @@ from .types import (
     Message,
     Profile,
     SendMessageResult,
+    ServerMessagePayload,
+    SessionCompactionCompleted,
+    SessionCompactionCompletedPayload,
+    SessionCompactionStarted,
+    SessionCompactionStartedPayload,
     SessionEvent,
     SessionJoinPayload,
     TextBlock,
@@ -176,6 +187,17 @@ __all__ = [
     "SessionJoinPayload",
     "McpRequestPayload",
     "McpResponsePayload",
+    # compaction
+    "AutoCompaction",
+    "ClientCompaction",
+    "CompactionConfig",
+    "ServerMessagePayload",
+    "SessionCompactionStarted",
+    "SessionCompactionStartedPayload",
+    "SessionCompactionCompleted",
+    "SessionCompactionCompletedPayload",
+    "SYNTHETIC_COMPACTION_PREAMBLE",
+    "SYNTHETIC_ABANDONED_TOOL_RESULTS",
     # security primitives
     "random_hex",
     "constant_time_equal",

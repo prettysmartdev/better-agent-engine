@@ -21,6 +21,37 @@ baectl: invalid bae-harness.toml: missing field `run`
 baectl: invalid bae-harness.toml: unknown variant `golang`, expected one of `rust`, `typescript`, `python`
 ```
 
+Every `bae-harness.toml` struct (`[harness]`, `[harness.requires]`,
+`[harness.launcher]`, `[harness.container]`) is strict —
+`#[serde(deny_unknown_fields)]` — so a typo such as `allowed_tool` (missing
+the trailing `s`) is this same exit-`2` usage error naming the unknown key,
+never a silently ignored requirement, one line, with the offending line
+number and its source text appended:
+
+```
+baectl: invalid bae-harness.toml: unknown field `allowed_tool`, expected one of `allowed_tools`, `mcp_servers`, `env`, `sandboxes` (line 6: `allowed_tool = ["x"]`)
+```
+
+(`manifest.json`/`resolved.json`, the files `baectl` itself writes, stay
+lenient for forward compatibility — this strictness is only for the
+hand-authored `bae-harness.toml`.)
+
+**`name` and `--id` must be valid Docker tag/container-name components** —
+lowercase `^[a-z0-9][a-z0-9_.-]*$`, at most 128 characters — since both end
+up in image tags (`<id>:latest`) and container names (`--name <id>`):
+
+```
+baectl: invalid harness name "My Agent": must match [a-z0-9][a-z0-9_.-]* (Docker tag/container-name rules)
+baectl: invalid --id "Bad/Id": must match [a-z0-9][a-z0-9_.-]* (Docker tag/container-name rules)
+```
+
+`--id` is only named in the message when `--id` was actually passed on the
+command line; a derived `<name>-<sdk>-<launcher>` id that ends up too long
+gets its own message naming the derivation:
+`` invalid build id "…" derived from the harness name: … — shorten the harness name or pass --id ``.
+An over-length name or id appends `, at most 128 characters` to the same
+message.
+
 ---
 
 ## Schema
@@ -31,20 +62,48 @@ The file has one top-level table, `[harness]`.
 
 | Field | Type | Required | Default | Consumed by |
 |---|---|---|---|---|
-| `name` | string | **yes** | — | `build` (the id stem, the packaged binary name, the `[[agents]]` entry name in generated launcher config); `ready`/`run` (display, key naming). |
+| `name` | string | **yes** | — | `build` (the id stem, the packaged binary name, the `[[agents]]` entry name in generated launcher config); `ready`/`run` (display, key naming). Must be a valid Docker tag/container-name component — see above. |
 | `sdk` | string enum: `"rust"` \| `"typescript"` \| `"python"` | **yes** | — | `build` (selects the default build toolchain for `--launcher schedule/api/webapp`; recorded in the build id and `manifest.json`). |
 | `run` | string | **yes** | — | `build --launcher local` records it verbatim; `run` executes it as `sh -c "<run>"`. **Required even for a harness that only supports container launchers** — the field has no default in the parser regardless of which `--launcher` you actually intend to use. |
-| `working_dir` | string | no | `"."` | `build`/`run`, resolved relative to this file's own directory — both for `--launcher local`'s `cd` before running, and (when `baectl` synthesizes the build Dockerfile) as the generated Dockerfile's build context. |
+| `working_dir` | string | no | `"."` | `build`/`run`, resolved relative to this file's own directory — both for `--launcher local`'s `cd` before running, and (when `baectl` synthesizes the build Dockerfile) as the generated Dockerfile's build context, where `build` also writes a `.dockerignore` if none exists (see [`baectl build` — harness build stage](03-baectl.md#baectl-build)). |
+| `prepare` | string | no | none | `run --launcher local` only (see below) — a command executed before `run`, only when needed. Never used for a container launcher. |
 | `[harness.requires]` | table | no | all fields empty | `ready`/`run`'s six compatibility checks. May be omitted entirely for a harness with no requirements. |
 | `[harness.launcher]` | table | no | absent (`None`) | `build`'s container-packaging step. **Omitting this table restricts the harness to `--launcher local`** — see below. |
+| `[harness.container]` | table | no | absent (`None`) | `build`'s *generated* per-SDK Dockerfile only — overrides its build command and entrypoint. See below. |
+
+### `prepare` (local launcher only)
+
+An optional shell command `baectl run` (`--launcher local` only) executes via
+`sh -c` in `working_dir`, before `run`, and **only when needed** — e.g.
+`prepare = "npm install"` for the bundled TypeScript examples, which have no
+other install step. Never runs for a container launcher (its generated or
+harness-supplied Dockerfile already installs dependencies at build time), and
+never for Rust/Python examples, which prepare themselves (`cargo run`
+compiles, `uv run` syncs the virtualenv).
+
+"Needed" is decided by the command's own shape:
+
+- A command starting with `npm ` or `npx `: needed when `node_modules/` is
+  missing under `working_dir`, or `package-lock.json` is newer (by mtime)
+  than `node_modules/`.
+- Any other command: needed when `<dir>/.baectl/builds/<id>/prepared` is
+  missing, or older (by mtime) than this `bae-harness.toml`.
+
+The marker (or, for `npm`/`npx`, `node_modules/`'s own mtime) is
+touched/updated after a successful run, so a `run` immediately after `build`
+doesn't reinstall on every invocation. `run` prints
+`` prepare: <cmd>   (in <workdir>) `` before running it; a non-zero exit
+aborts `run` with the child's own exit code and
+`` baectl: prepare command failed (exit N): <cmd> ``.
 
 ### `[harness.requires]`
 
 | Field | Type | Required | Default | Consumed by |
 |---|---|---|---|---|
-| `allowed_tools` | array of string | no | `[]` | `ready` check #2 — the resolved profile's `allowed_tools` must be a superset. |
+| `allowed_tools` | array of string | no | `[]` | `ready` check #2 — the resolved profile's `allowed_tools` must be a superset. List every tool the harness declares in the session's `tools`, **including** a sandbox tool with a *local* target (for example the bundled examples' `run_shell_command`): the harness dispatches it itself, so the server checks it against `allowed_tools` like any client tool. A *remote* sandbox tool does not belong here — it is declared in `sandbox_tools`, which the server does not check against `allowed_tools`; list its image under `sandboxes` instead. |
 | `mcp_servers` | array of string | no | `[]` | `ready` check #2 (profile's `mcp_servers` superset) **and** check #3 (each name must also exist in `bae-config.toml`'s `[[mcp.servers]]` — a distinct, always-print-only check, since a name missing from the registry can't be fixed by any profile edit). |
 | `env` | array of string | no | `[]` | `ready`/`run` check #5, **in addition to** the resolved profile's own provider auth-token env var (which `ready`/`run` resolve automatically — do not list it here). Do not list `BAE_SERVER_URL`/`BAE_CLIENT_KEY` either; `run` sets both itself. |
+| `sandboxes` | array of string | no | `[]` | `ready` check #2 — the resolved profile's `available_sandboxes` (see [Sandboxes](../guides/03-sandboxes.md)) must also be a superset. A harness that declares no sandbox image here still keeps whatever `available_sandboxes` the widened profile already had — `ready --fix`/`run` union, never replace, that list (see [`baectl create/update profile --available-sandbox`](03-baectl.md#baectl-create-profile)). The fix runs the **server image's** own `baectl` (via `docker compose exec`/`container exec`), so widening a profile that has, or needs, sandbox images requires a server image whose `baectl` supports `--available-sandbox`. Against an older image the in-container command fails with an `unexpected argument '--available-sandbox'` error; pull a current image (`docker compose pull`) and re-run. |
 
 ### `[harness.launcher]`
 
@@ -66,6 +125,43 @@ baectl: harness 'issue-triage' has no [harness.launcher] section; --launcher api
 | `binary_path` | string | conditionally — **required whenever `dockerfile` is set**; optional (and defaulted) when it isn't | a per-SDK default when `dockerfile` is omitted (see [`baectl build`](03-baectl.md#baectl-build)) | `build`'s generated launcher Dockerfile, as the `COPY --from=<harness-build image>` source path. |
 | `prompt_env` | string | **yes, whenever `[harness.launcher]` is present at all** | — | `build`'s generated `bae-api.toml`/`bae-app.toml` (`request_schema`/`env_template` are keyed on this name). Required even if you only ever intend `--launcher schedule`, which doesn't itself use it — the struct has no default. |
 | `default_schedule` | string (six-field cron expression) | no in the schema, but **`build` fails if it's absent and you request `--launcher schedule`** | none | `build`'s generated `bae-schedules.toml`. Validated at build time (after the harness build stage has already run), not at manifest-parse time. |
+
+### `[harness.container]`
+
+Optional overrides for **`baectl`'s own generated** per-SDK build Dockerfile
+(the one it synthesizes when `[harness.launcher].dockerfile` is *not* set —
+see [`baectl build`](03-baectl.md#baectl-build)). **Ignored, with a stderr
+warning, whenever `[harness.launcher].dockerfile` is set** — a harness that
+supplies its own build Dockerfile already owns these decisions.
+
+| Field | Type | Required | Default | Consumed by |
+|---|---|---|---|---|
+| `build` | string | no | the per-SDK default (`cargo build --release --example <name>` / `npm ci && npm run build` / `pip install --no-cache-dir .`) | `build`'s generated Dockerfile's build `RUN` line. Must be a non-empty, single-line command. |
+| `entrypoint` | string | no | the per-SDK default (see below) | `build`'s generated launcher shim/Dockerfile. Must be a non-empty, single-line command. |
+
+Both fields are optional individually. A multi-line or blank value for
+either is a usage error, exit `2`:
+`` [harness.container].<field> must be a non-empty single-line command ``.
+
+**`entrypoint`'s meaning is SDK-specific:**
+
+- **Rust:** the image path of the already-built binary, replacing
+  `/build/target/release/<name>` in the `COPY --from=<harness-build>`
+  instruction.
+- **TypeScript:** the command the generated shim `exec`s in place of
+  `./node_modules/.bin/tsx examples/<name>/main.ts`, run from
+  `/opt/bae-harness`.
+- **Python:** the command the generated shim `exec`s in place of
+  `/opt/bae-harness/venv/bin/python examples/<name>/main.py`, run from
+  `/opt/bae-harness/app` with the venv's `bin/` prepended to `PATH`.
+
+**A harness outside the bundled `examples/<name>/main.*` layout must set
+these** (or supply its own `[harness.launcher].dockerfile`) — `baectl`'s
+generated defaults assume the bundled examples' exact directory and entry-file
+conventions, and have no way to discover an arbitrary harness's real build
+command or entry point. See [Interpreted SDKs in a
+container](#interpreted-sdks-in-a-container) below for what the TypeScript/
+Python defaults actually do, so you know what you're overriding.
 
 ### `binary_path`/`dockerfile`/`target` are Docker-image concepts, never host paths
 
@@ -143,6 +239,7 @@ name = "reference-assistant"
 sdk = "typescript"
 run = "npm run example"
 working_dir = "../.."
+prepare = "npm install"
 
 [harness.requires]
 allowed_tools = ["get_current_time", "read_file", "write_file", "explore_files", "run_shell_command"]
@@ -155,7 +252,9 @@ default_schedule = "0 0 3 * * *"
 ```
 
 Same shape as the Rust manifest, `run` naming the package's existing `npm run
-example` script. Omitting `dockerfile`/`binary_path` here means `build`
+example` script. `prepare = "npm install"` is what lets `baectl run` work
+from a clean checkout with no manual `npm install` step first — Rust/Python
+prepare themselves, so their manifests omit it. Omitting `dockerfile`/`binary_path` here means `build`
 generates a `node:22-bookworm` build stage (`npm ci && npm run build`) that
 also stages the whole project — sources, build output and `node_modules` —
 under `/opt/bae-harness` and writes an executable shim at
@@ -214,7 +313,8 @@ env = ["GITHUB_TOKEN", "TRIAGE_REPO", "TRIAGE_EXEC_MODE"]
 
 The TypeScript and Python `issue-triage` manifests are the same shape, with
 `sdk`/`run` adjusted per SDK (`npx tsx examples/issue-triage/main.ts` /
-`uv run python examples/issue-triage/main.py`).
+`uv run python examples/issue-triage/main.py`); the TypeScript one also adds
+`prepare = "npm install"`, same as its `reference-assistant` sibling.
 
 ### Authoring your own build Dockerfile (the escape hatch)
 
@@ -273,17 +373,30 @@ generated default splits the work across the two builds it already runs:
    `/opt/bae-harness` in `--chown`ed to `bae`, then copies the shim to
    `/usr/local/bin/<name>` and drops back to `USER bae`.
 
-Nothing extra is required of the harness author: all six bundled examples use
-this default with no committed Dockerfile. Two consequences are worth knowing:
+Nothing extra is required of the harness author **for a harness that matches
+the bundled `examples/<name>/main.*` layout**: all six bundled examples use
+this default with no committed Dockerfile. A harness that doesn't match that
+layout — a different entry-file path, a different build command, a monorepo
+with its own script names — **does** need to say so, one of two ways:
+
+- Set `[harness.container].build`/`entrypoint` (see above) to override just
+  the generated Dockerfile's build command and entry point, keeping
+  `baectl`'s interpreter provisioning.
+- Or supply its own `[harness.launcher].dockerfile` (with an explicit
+  `binary_path`) for full control. `baectl` injects **no** interpreter
+  provisioning in that case — a harness that owns its build Dockerfile owns
+  its runtime requirements too.
+
+Two further consequences are worth knowing, regardless of which override you
+use:
 
 - The generated launcher build needs **network access** for its `apt-get`/
   NodeSource step, on top of the network the build stage already needs for
   dependency installation.
 - A harness that needs a different interpreter version, a private package
-  registry, or native dependencies should supply its own
-  `[harness.launcher].dockerfile` (with an explicit `binary_path`). `baectl`
-  injects **no** interpreter provisioning in that case — a harness that owns
-  its build Dockerfile owns its runtime requirements too.
+  registry, or native dependencies still needs the `dockerfile` escape
+  hatch above — `[harness.container]` only swaps the build/entry
+  *commands*, not the base image or its installed packages.
 
 `--launcher local` is unaffected for all three SDKs: it runs `harness.run` on
 the host, against whatever toolchain is already installed there.

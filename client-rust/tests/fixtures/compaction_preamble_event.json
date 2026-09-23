@@ -1,0 +1,14 @@
+{
+  "id": "evt_01preamble",
+  "session_id": "ses_01example",
+  "client_key_id": "key_01example",
+  "event_type": "server.message.send",
+  "payload": {
+    "role": "user",
+    "content": [
+      { "type": "text", "text": "The earlier part of this conversation was compacted. A summary follows." }
+    ],
+    "synthetic": "compaction_preamble"
+  },
+  "created_at": "2026-09-23T18:26:09.998Z"
+}

@@ -3,6 +3,9 @@ name = "reference-assistant"
 sdk = "typescript"
 run = "npm run example"
 working_dir = "../.."
+# `baectl run` (--launcher local only) runs this first when node_modules/ is
+# missing or package-lock.json is newer than it.
+prepare = "npm install"
 
 [harness.requires]
 allowed_tools = ["get_current_time", "read_file", "write_file", "explore_files", "run_shell_command"]

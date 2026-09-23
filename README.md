@@ -193,20 +193,38 @@ the [Harness Launchers guide](docs/guides/11-harness-launchers.md).
 
 ## Quickstart
 
-The fastest path is the **`baectl setup`** wizard: build the host `baectl` with
-`make build-baectl` (a one-line `curl | sh` installer is coming) and run it to
-scaffold `docker-compose.yml`, `.env`, and `bae-config.toml`, launch the server,
-and mint your first profile and client key. Prefer to start the server by hand?
+Export a provider key, build the host `baectl` (a one-line `curl | sh`
+installer is coming — for now, a source build), then run three commands:
+
+```sh
+export ANTHROPIC_API_KEY="sk-ant-…"
+
+make build-baectl
+export PATH="$PWD/baectl/target/host/release:$PATH"
+
+baectl setup --yes
+baectl build reference-assistant
+baectl run reference-assistant-rust-local
+```
+
+On Apple's `container` CLI, make the first command `baectl setup --yes --apple`.
+
+No prompts, no manual profile/key/env wiring — `setup --yes` scaffolds and
+launches the server, `build` packages the bundled Rust example, and `run`
+resolves a profile/key and prints the assistant's reply. Swap in TypeScript
+or Python, or serve the same agent behind a browser chat UI instead of your
+host: the full walkthrough, with what you'll see at each step, is
+[`docs/guides/00-quickstart.md`](docs/guides/00-quickstart.md).
+
+Just want the server, no `baectl`?
 
 ```sh
 docker run -p 8080:8080 -v bae-data:/var/lib/bae ghcr.io/prettysmartdev/better-agent-engine:latest
 curl http://localhost:8080/healthz
 ```
 
-Then create a profile and client key (with `baectl` or the admin API) and drive
-it. The full walkthrough takes you from the running server through a client
-harness example in the language of your choice to serving an agent in the
-browser with the webapp launcher: [`docs/guides/00-quickstart.md`](docs/guides/00-quickstart.md).
+Then create a profile and client key by hand — see
+[Quickstart: step by step](docs/guides/00a-quickstart-step-by-step.md).
 
 Want the dashboard? Run the `bae-max` variant instead —
 `ghcr.io/prettysmartdev/better-agent-engine:max` — and open MAX in your browser.

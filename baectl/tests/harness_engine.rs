@@ -246,10 +246,32 @@ fn compose_baectl_json(dir: &Path, resource: &str) -> String {
     String::from_utf8(output.stdout).expect("admin JSON is UTF-8")
 }
 
-fn admin_snapshot(dir: &Path) -> (String, String) {
+/// The mutable admin resources a fully provisioned `run` must not touch.
+/// Profiles are compared whole (an unnecessary `update profile` bumps
+/// `updated_at`); keys are projected to `{id, profile_id, name}` because
+/// `last_used_at` legitimately advances whenever a harness authenticates.
+fn admin_snapshot(dir: &Path) -> (String, serde_json::Value) {
     (
         compose_baectl_json(dir, "profiles"),
-        compose_baectl_json(dir, "keys"),
+        project_keys(&compose_baectl_json(dir, "keys")),
+    )
+}
+
+/// Project `list keys --json` output to `[{id, profile_id, name}]`.
+fn project_keys(keys_json: &str) -> serde_json::Value {
+    let keys: serde_json::Value = serde_json::from_str(keys_json).expect("keys JSON");
+    let items = keys.as_array().cloned().unwrap_or_default();
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "id": k.get("id"),
+                    "profile_id": k.get("profile_id"),
+                    "name": k.get("name"),
+                })
+            })
+            .collect(),
     )
 }
 
@@ -584,4 +606,27 @@ fn repository_ignores_baectl_local_state() {
         gitignore.lines().any(|line| line.trim() == ".baectl/"),
         ".gitignore must cover plaintext-key-bearing .baectl/ state"
     );
+}
+
+/// Regression (B11): the mutation-free snapshot must ignore `last_used_at`,
+/// which the server advances every time the harness authenticates — the
+/// engine-gated second-`run` assertion compared it and failed spuriously.
+/// Pure, so it runs without the engine gate.
+#[test]
+fn key_snapshot_projection_ignores_last_used_at_but_not_identity() {
+    let before = r#"[{"id":"key_1","profile_id":"pro_1","name":"default","prefix":"bae_a","created_at":"t0","last_used_at":null}]"#;
+    let used = r#"[{"id":"key_1","profile_id":"pro_1","name":"default","prefix":"bae_a","created_at":"t0","last_used_at":"2026-09-23T10:00:00Z"}]"#;
+    assert_eq!(project_keys(before), project_keys(used));
+    assert_eq!(
+        project_keys(before),
+        serde_json::json!([{"id": "key_1", "profile_id": "pro_1", "name": "default"}])
+    );
+
+    // A new key, a rebinding or a rename is still a mutation.
+    let added = r#"[{"id":"key_1","profile_id":"pro_1","name":"default"},{"id":"key_2","profile_id":"pro_1","name":"x"}]"#;
+    let rebound = r#"[{"id":"key_1","profile_id":"pro_2","name":"default"}]"#;
+    let renamed = r#"[{"id":"key_1","profile_id":"pro_1","name":"other"}]"#;
+    for changed in [added, rebound, renamed] {
+        assert_ne!(project_keys(before), project_keys(changed), "{changed}");
+    }
 }

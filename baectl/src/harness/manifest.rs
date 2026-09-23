@@ -90,13 +90,20 @@ impl std::fmt::Display for Launcher {
 
 /// A parsed `bae-harness.toml`. The file has a single top-level `[harness]`
 /// table, so this is a thin wrapper whose only field is that table.
+///
+/// Every `bae-harness.toml` struct is `deny_unknown_fields`: a typo such as
+/// `allowed_tool` is a usage error naming the key, never a silently ignored
+/// requirement. (The `manifest.json`/`resolved.json` structs below stay
+/// lenient for forward compatibility.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessManifest {
     pub harness: Harness,
 }
 
 /// The `[harness]` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Harness {
     /// Harness name — the id stem and the packaged binary/agent name.
     pub name: String,
@@ -108,6 +115,12 @@ pub struct Harness {
     /// (defaults to `.`).
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
+    /// Optional host command `run` executes (via `sh -c`, in `working_dir`)
+    /// before `run` for `--launcher local` only, and only when needed — e.g.
+    /// `npm install` for the TypeScript examples. Never used by container
+    /// launchers, whose generated Dockerfile installs dependencies itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare: Option<String>,
     /// What the harness needs from the server to run correctly.
     #[serde(default)]
     pub requires: Requires,
@@ -116,12 +129,35 @@ pub struct Harness {
     /// prompt) — parses to `None` without error.
     #[serde(default)]
     pub launcher: Option<LauncherConfig>,
+    /// `[harness.container]` — optional overrides for baectl's generated
+    /// per-SDK build Dockerfile. A harness outside the bundled
+    /// `examples/<name>/main.*` layout must set these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerOverrides>,
+}
+
+/// `[harness.container]` — overrides for the generated build Dockerfile. Both
+/// fields are optional individually, and the table is ignored entirely when
+/// `[harness.launcher].dockerfile` is set (that Dockerfile owns its build).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerOverrides {
+    /// Replaces the SDK build `RUN` command (`cargo build --release --example
+    /// <name>` / `npm ci && npm run build` / the venv `pip install .`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// TypeScript/Python: the command the generated shim `exec`s, run from the
+    /// staged harness tree. Rust: the image path of the built binary,
+    /// replacing `/build/target/release/<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
 }
 
 /// `[harness.requires]` — the compatibility surface `ready` checks a profile /
 /// registry / environment against. Every field defaults to empty, so a harness
 /// with no requirements may omit the whole table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Requires {
     /// Client-side tools the profile must allow.
     #[serde(default)]
@@ -133,12 +169,16 @@ pub struct Requires {
     /// the provider's auth-token var.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Sandbox images the profile's `available_sandboxes` must include.
+    #[serde(default)]
+    pub sandboxes: Vec<String>,
 }
 
 /// `[harness.launcher]` — used only when packaging with `--launcher
 /// schedule/api/webapp`. Present only for harnesses that support container
 /// packaging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LauncherConfig {
     /// Optional harness-supplied build Dockerfile (relative to the harness
     /// dir). Omitted → `baectl` synthesizes a per-SDK default.
@@ -166,8 +206,26 @@ fn default_working_dir() -> String {
 /// Parse a `bae-harness.toml`'s text. A missing required field or malformed
 /// TOML is a fatal usage error (exit 2) whose message names the offending
 /// field, matching the posture WI 0014 set for `bae-schedules.toml` etc.
+///
+/// The message is serde's own one-line text (e.g. ``unknown field
+/// `allowed_tool`, expected one of `allowed_tools`, …``) followed by the line
+/// number and source line it was found on, rather than the TOML crate's
+/// multi-line snippet.
 pub fn parse_harness_manifest(text: &str) -> Result<HarnessManifest, CliError> {
-    toml::from_str(text).map_err(|e| CliError::usage(format!("invalid bae-harness.toml: {e}")))
+    toml::from_str(text).map_err(|e| {
+        let line = e
+            .span()
+            .map(|span| {
+                let line_no = text[..span.start].matches('\n').count() + 1;
+                let source = text.lines().nth(line_no - 1).unwrap_or("").trim();
+                format!(" (line {line_no}: `{source}`)")
+            })
+            .unwrap_or_default();
+        CliError::usage(format!(
+            "invalid bae-harness.toml: {}{line}",
+            e.message().trim_end()
+        ))
+    })
 }
 
 /// Read and parse the `bae-harness.toml` at `path`. A file that cannot be read
@@ -240,6 +298,9 @@ pub struct LocalManifest {
     pub run_command: String,
     /// Working directory for `run`, relative to `harness_dir`.
     pub working_dir: String,
+    /// `harness.prepare`, run before `run_command` only when needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare: Option<String>,
     pub requires: Requires,
     /// RFC 3339 build timestamp, stamped by the caller.
     pub created_at: String,
@@ -293,6 +354,75 @@ pub struct Resolved {
     /// `setup`'s network would otherwise never receive it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_env: Option<String>,
+}
+
+// -- Name / id validation ----------------------------------------------------
+
+/// The longest harness name / build id accepted (Docker's tag length limit).
+pub const MAX_NAME_LEN: usize = 128;
+
+/// Whether `s` is a valid Docker tag / container-name component under the
+/// lowercase subset baectl accepts: `^[a-z0-9][a-z0-9_.-]*$`, at most
+/// [`MAX_NAME_LEN`] characters. Both the harness name and the build id end up
+/// in image tags (`<id>:latest`) and container names (`--name <id>`).
+pub fn is_valid_docker_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    s.len() <= MAX_NAME_LEN
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'))
+}
+
+const DOCKER_NAME_RULE: &str = "must match [a-z0-9][a-z0-9_.-]* (Docker tag/container-name rules)";
+
+/// Validate a `bae-harness.toml` `name` (exit 2 naming the offending value).
+pub fn validate_harness_name(name: &str) -> Result<(), CliError> {
+    if is_valid_docker_name(name) {
+        Ok(())
+    } else {
+        Err(CliError::usage(format!(
+            "invalid harness name {name:?}: {DOCKER_NAME_RULE}{}",
+            too_long_note(name)
+        )))
+    }
+}
+
+/// Validate an explicit `--id` (exit 2). Only called when `--id` was given, so
+/// the message names the flag only then.
+pub fn validate_explicit_id(id: &str) -> Result<(), CliError> {
+    if is_valid_docker_name(id) {
+        Ok(())
+    } else {
+        Err(CliError::usage(format!(
+            "invalid --id {id:?}: {DOCKER_NAME_RULE}{}",
+            too_long_note(id)
+        )))
+    }
+}
+
+/// Validate a derived `<name>-<sdk>-<launcher>[-N]` id. The name already
+/// passed [`validate_harness_name`], so only the length can fail here.
+pub fn validate_derived_id(id: &str) -> Result<(), CliError> {
+    if is_valid_docker_name(id) {
+        Ok(())
+    } else {
+        Err(CliError::usage(format!(
+            "invalid build id {id:?} derived from the harness name: {DOCKER_NAME_RULE}{} \
+             — shorten the harness name or pass --id",
+            too_long_note(id)
+        )))
+    }
+}
+
+fn too_long_note(s: &str) -> String {
+    if s.len() > MAX_NAME_LEN {
+        format!(", at most {MAX_NAME_LEN} characters")
+    } else {
+        String::new()
+    }
 }
 
 // -- Id derivation -----------------------------------------------------------
@@ -490,6 +620,7 @@ prompt_env = \"AGENT_PROMPT\"
             harness_dir: PathBuf::from("/abs/path"),
             run_command: "cargo run".to_string(),
             working_dir: ".".to_string(),
+            prepare: None,
             requires: Requires::default(),
             created_at: "2026-08-28T00:00:00Z".to_string(),
         });
@@ -548,5 +679,123 @@ prompt_env = \"AGENT_PROMPT\"
         };
         let v2 = serde_json::to_value(&r2).unwrap();
         assert_eq!(v2["client_key_plaintext"], "bae_sk_live");
+    }
+
+    /// Regression (B9): a typo'd key in any `bae-harness.toml` table is a
+    /// usage error naming the key and its line — never a silently ignored
+    /// requirement.
+    #[test]
+    fn unknown_key_in_any_table_is_a_usage_error_naming_it() {
+        let base = "[harness]\nname = \"probe\"\nsdk = \"rust\"\nrun = \"true\"\n";
+        for (extra, key) in [
+            ("[other]\nx = 1\n", "other"),
+            ("runn = \"x\"\n", "runn"),
+            (
+                "[harness.requires]\nallowed_tool = [\"x\"]\n",
+                "allowed_tool",
+            ),
+            (
+                "[harness.launcher]\nprompt_env = \"P\"\nschedule = \"x\"\n",
+                "schedule",
+            ),
+            ("[harness.container]\nbuld = \"make\"\n", "buld"),
+        ] {
+            let text = format!("{base}{extra}");
+            let err = parse_harness_manifest(&text).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{extra}");
+            assert!(
+                err.message()
+                    .starts_with(&format!("invalid bae-harness.toml: unknown field `{key}`")),
+                "{}",
+                err.message()
+            );
+            assert!(err.message().contains("(line "), "{}", err.message());
+            assert!(!err.message().contains('\n'), "one line: {}", err.message());
+        }
+        let err = parse_harness_manifest(&format!(
+            "{base}\n[harness.requires]\nallowed_tool = [\"x\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.message()
+                .ends_with("(line 7: `allowed_tool = [\"x\"]`)"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("expected one of `allowed_tools`"));
+    }
+
+    /// B9/B10/C2: the new optional fields parse.
+    #[test]
+    fn new_optional_fields_parse() {
+        let m = parse_harness_manifest(
+            "[harness]\nname = \"probe\"\nsdk = \"typescript\"\nrun = \"npm start\"\n\
+             prepare = \"npm install\"\n\n[harness.requires]\nsandboxes = [\"alpine\"]\n\n\
+             [harness.container]\nbuild = \"npm ci\"\nentrypoint = \"node dist/main.js\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.harness.prepare.as_deref(), Some("npm install"));
+        assert_eq!(m.harness.requires.sandboxes, vec!["alpine"]);
+        let c = m.harness.container.unwrap();
+        assert_eq!(c.build.as_deref(), Some("npm ci"));
+        assert_eq!(c.entrypoint.as_deref(), Some("node dist/main.js"));
+        let bare = parse_harness_manifest("[harness]\nname = \"p\"\nsdk = \"rust\"\nrun = \"x\"\n")
+            .unwrap();
+        assert!(bare.harness.prepare.is_none());
+        assert!(bare.harness.container.is_none());
+        assert!(bare.harness.requires.sandboxes.is_empty());
+    }
+
+    #[test]
+    fn docker_name_rule() {
+        for ok in ["a", "0", "reference-assistant", "a.b_c-d", "x9"] {
+            assert!(is_valid_docker_name(ok), "{ok}");
+        }
+        for bad in [
+            "", "My Agent", "Upper", "-lead", ".lead", "_lead", "a/b", "a b", "é",
+        ] {
+            assert!(!is_valid_docker_name(bad), "{bad:?}");
+        }
+        assert!(is_valid_docker_name(&"a".repeat(MAX_NAME_LEN)));
+        assert!(!is_valid_docker_name(&"a".repeat(MAX_NAME_LEN + 1)));
+    }
+
+    /// Regression (B9): only an explicit `--id` is blamed on `--id`.
+    #[test]
+    fn name_and_id_validation_messages() {
+        let e = validate_harness_name("My Agent").unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert_eq!(
+            e.message(),
+            "invalid harness name \"My Agent\": must match [a-z0-9][a-z0-9_.-]* \
+             (Docker tag/container-name rules)"
+        );
+        assert!(!e.message().contains("--id"));
+
+        let e = validate_explicit_id("Bad/Id").unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert_eq!(
+            e.message(),
+            "invalid --id \"Bad/Id\": must match [a-z0-9][a-z0-9_.-]* \
+             (Docker tag/container-name rules)"
+        );
+
+        let long = "a".repeat(MAX_NAME_LEN + 1);
+        let e = validate_explicit_id(&long).unwrap_err();
+        assert!(
+            e.message().ends_with(", at most 128 characters"),
+            "{}",
+            e.message()
+        );
+
+        let e = validate_derived_id(&format!("{}-rust-local", "a".repeat(120))).unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert!(e.message().starts_with("invalid build id \""));
+        assert!(e
+            .message()
+            .ends_with("— shorten the harness name or pass --id"));
+
+        assert!(validate_harness_name("reference-assistant").is_ok());
+        assert!(validate_explicit_id("reference-assistant-rust-local").is_ok());
     }
 }

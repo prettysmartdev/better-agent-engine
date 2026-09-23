@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -160,9 +161,37 @@ pub struct CreateSession {
     /// Optional session-level compaction settings, fixed at creation time.
     /// Absent (or JSON `null`) means no auto compaction — equivalent to
     /// `{"mode":"client"}` — and is normalized to
-    /// [`CompactionConfig::default`] before persistence.
+    /// [`CompactionConfig::default`] before persistence. Not accepted on
+    /// `join` at all: there the key's mere presence (even `null`) is rejected
+    /// before this struct is parsed (see [`parse_session_body`]).
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
+}
+
+/// Parse a `create`/`join` request body into [`CreateSession`], mapping every
+/// malformed input to the standard `400 bad_request` envelope instead of axum's
+/// default JSON rejection. A malformed `compaction` object (bad `mode`, missing
+/// or non-integer `size`) is reported as `invalid compaction config: <serde
+/// error>`; with `reject_compaction` (join) any `compaction` key — including
+/// `"compaction": null` — is rejected outright.
+fn parse_session_body(
+    body: Result<Json<Value>, JsonRejection>,
+    reject_compaction: bool,
+) -> Result<CreateSession, ApiError> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    if let Some(compaction) = body.get("compaction") {
+        if reject_compaction {
+            return Err(ApiError::bad_request(
+                "compaction is a session-level setting fixed at creation and cannot be set on join",
+            ));
+        }
+        if !compaction.is_null() {
+            serde_json::from_value::<CompactionConfig>(compaction.clone())
+                .map_err(|e| ApiError::bad_request(format!("invalid compaction config: {e}")))?;
+        }
+    }
+    serde_json::from_value(body)
+        .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))
 }
 
 /// Client-safe projection of a profile (no `auth_token`, no env var names).
@@ -331,9 +360,10 @@ fn declared_subagent_tools_json(tools: &[SubagentToolDef]) -> Value {
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateSession>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let client_key = auth_client(&state, &headers)?;
+    let body = parse_session_body(body, false)?;
     let profile_id = client_key
         .profile_id
         .clone()
@@ -502,20 +532,16 @@ pub async fn join(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(body): Json<CreateSession>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let client_key = auth_client(&state, &headers)?;
 
     // Compaction is a session-level setting fixed at creation, exactly like the
     // profile. A joining client may not add or change it — reject rather than
     // silently ignore, since a joiner believing it altered the mode would be a
-    // silent correctness bug. An absent/`null` field is indistinguishable from
-    // "not supplied" by the `Option` wire type and is treated as absent.
-    if body.compaction.is_some() {
-        return Err(ApiError::bad_request(
-            "compaction is a session-level setting fixed at creation and cannot be set on join",
-        ));
-    }
+    // silent correctness bug. The key's presence is the error, even as
+    // `"compaction": null`.
+    let body = parse_session_body(body, true)?;
 
     let session = state
         .store
@@ -1218,9 +1244,13 @@ mod tests {
         ));
 
         let (state, token) = session_test_state();
-        let (_, Json(response)) = create(State(state.clone()), auth_headers(&token), Json(body))
-            .await
-            .unwrap();
+        let (_, Json(response)) = create(
+            State(state.clone()),
+            auth_headers(&token),
+            Ok(Json(json!({}))),
+        )
+        .await
+        .unwrap();
         let session_id = response["session_id"].as_str().unwrap();
         let session = state
             .store
@@ -1244,19 +1274,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_compaction_is_a_bad_request_envelope() {
+        for (compaction, needle) in [
+            (json!({ "mode": "auto" }), "missing field `size`"),
+            (json!({ "mode": "server" }), "unknown variant"),
+        ] {
+            let (state, token) = session_test_state();
+            let error = create(
+                State(state),
+                auth_headers(&token),
+                Ok(Json(json!({ "compaction": compaction }))),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, 400);
+            assert_eq!(error.type_slug, "bad_request");
+            assert!(
+                error.detail.starts_with("invalid compaction config: ")
+                    && error.detail.contains(needle),
+                "{}",
+                error.detail
+            );
+        }
+    }
+
+    #[test]
+    fn join_rejects_a_null_compaction_key() {
+        let error = parse_session_body(Ok(Json(json!({ "compaction": null }))), true).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.detail.contains("cannot be set on join"));
+        assert!(parse_session_body(Ok(Json(json!({ "compaction": null }))), false).is_ok());
+    }
+
+    #[tokio::test]
     async fn create_rejects_auto_compaction_size_below_minimum() {
         let (state, token) = session_test_state();
-        let body = CreateSession {
-            client_version: None,
-            tools: vec![],
-            sandbox_tools: vec![],
-            subagent_tools: vec![],
-            compaction: Some(CompactionConfig::Auto {
-                size: MIN_AUTO_COMPACTION_TOKENS - 1,
-            }),
-        };
+        let body = json!({
+            "compaction": { "mode": "auto", "size": MIN_AUTO_COMPACTION_TOKENS - 1 },
+        });
 
-        let error = create(State(state), auth_headers(&token), Json(body))
+        let error = create(State(state), auth_headers(&token), Ok(Json(body)))
             .await
             .unwrap_err();
         assert_eq!(error.status, 400);

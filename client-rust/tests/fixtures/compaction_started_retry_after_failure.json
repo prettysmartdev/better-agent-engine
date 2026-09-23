@@ -1,0 +1,13 @@
+{
+  "id": "evt_01started",
+  "session_id": "ses_01example",
+  "client_key_id": "key_01example",
+  "event_type": "session.compaction.started",
+  "payload": {
+    "trigger": "auto",
+    "reason": "retry_after_failure",
+    "token_count": 140010,
+    "threshold_tokens": 128000
+  },
+  "created_at": "2026-09-23T18:26:08.000Z"
+}

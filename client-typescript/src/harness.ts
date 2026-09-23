@@ -37,12 +37,14 @@ import {
   messageToWire,
   toMessage,
   toolUses,
+  type CompactionConfig,
   type ContentBlock,
   type JsonRpcRequest,
   type Message,
   type Profile,
   type RpcMethod,
   type SendMessageResult,
+  type SessionCompactionCompleted,
   type SessionEvent,
   type ToolResult,
   type ToolUse,
@@ -52,6 +54,12 @@ import {
 export interface HarnessOptions {
   /** Override the HTTP transport (used by tests to run offline). */
   transport?: Transport;
+  /**
+   * Session-level compaction, sent on {@link Harness.connect} only (fixed at
+   * creation; never sent on {@link Harness.join}). Omitted → the server
+   * default (no compaction settings are sent).
+   */
+  compaction?: CompactionConfig;
 }
 
 /** Body returned by `POST /api/v1/sessions`. */
@@ -79,10 +87,23 @@ export class Harness {
   private readonly subagentDefs: SubagentToolDef[] = [];
   /** Late-bound local subagent handle shared with registered tools and Session. */
   private readonly subagent = new SubagentSession(this.sandbox);
+  /** Session-open compaction setting; sent by `connect()` only. */
+  private compaction: CompactionConfig | undefined;
 
   constructor(config: Config, options: HarnessOptions = {}) {
     this.config = config;
     this.transport = options.transport ?? new FetchTransport(config.serverUrl);
+    this.compaction = options.compaction;
+  }
+
+  /**
+   * Set the session-level compaction mode sent by {@link connect}. Compaction
+   * is fixed at session creation, so {@link join} never sends it. Returns
+   * `this` for chaining.
+   */
+  setCompaction(compaction: CompactionConfig | undefined): this {
+    this.compaction = compaction;
+    return this;
   }
 
   /** Register a client-side tool. Returns `this` for chaining. */
@@ -143,7 +164,7 @@ export class Harness {
    * permitted. Returns a {@link Session} bound to that session key.
    */
   async connect(): Promise<Session> {
-    return this.open("/api/v1/sessions");
+    return this.open("/api/v1/sessions", this.compaction);
   }
 
   /**
@@ -158,16 +179,21 @@ export class Harness {
    * Like {@link connect}, registers this connection as a driver before returning.
    */
   async join(sessionId: string): Promise<Session> {
-    return this.open(`/api/v1/sessions/${sessionId}/join`);
+    // Never forward `compaction`: the server rejects the key on join.
+    return this.open(`/api/v1/sessions/${sessionId}/join`, undefined);
   }
 
   /**
    * Shared body of {@link connect} and {@link join}: POST the declared tools to
    * `path` with client-key auth, build the {@link Session}, then register it as
    * a driver before handing it back. Both endpoints return the identical
-   * `{session_id, session_key, profile}` shape.
+   * `{session_id, session_key, profile}` shape. `compaction` is included in the
+   * body only when set (the key is omitted entirely otherwise).
    */
-  private async open(path: string): Promise<Session> {
+  private async open(
+    path: string,
+    compaction: CompactionConfig | undefined,
+  ): Promise<Session> {
     const body = {
       client_version: this.config.clientVersion,
       tools: [...this.tools.values()].map((t) => ({
@@ -182,6 +208,9 @@ export class Harness {
         : {}),
       ...(this.subagentDefs.length > 0
         ? { subagent_tools: this.subagentDefs.map((d) => ({ ...d })) }
+        : {}),
+      ...(compaction !== undefined
+        ? { compaction: compactionToWire(compaction) }
         : {}),
     };
     const res = await this.transport.request({
@@ -476,6 +505,46 @@ export class Session implements SandboxRpc, SubagentRpc {
   }
 
   /**
+   * Compact the session's history now (`session.compact`). `prompt` overrides
+   * the summarization prompt for this call; omitted, the server uses the
+   * session's configured client-mode prompt or its default. Live
+   * `session.event` notifications (`session.compaction.started`, the provider
+   * pair, the preamble/summary messages, …) are handed to the `on_event` hook.
+   * Resolves with the terminal `session.compaction.completed` event; rejects
+   * with an {@link RpcError} on failure (e.g. `-32020` while a paused turn is
+   * unresolved, `-32000` `compaction failed: …`).
+   */
+  async compact(prompt?: string): Promise<SessionCompactionCompleted> {
+    const params = prompt !== undefined ? { prompt } : {};
+    const frames = this.transport.stream({
+      method: "POST",
+      path: `/api/v1/sessions/${this.id}/rpc`,
+      token: this.sessionKey,
+      body: this.rpcRequest("session.compact", params),
+    });
+    const notifications: SessionEvent[] = [];
+    let result: SessionCompactionCompleted | undefined;
+    for await (const frame of frames) {
+      if (frame.error) {
+        throw new RpcError(frame.error.code, frame.error.message);
+      }
+      if (isTerminalFrame(frame)) {
+        result = frame.result as SessionCompactionCompleted;
+        break;
+      }
+      const event = eventFromFrame(frame);
+      if (event !== null) notifications.push(event);
+    }
+    if (result === undefined) {
+      throw new RpcError(-32603, "stream ended without a terminal response");
+    }
+    for (const event of notifications) {
+      await this.runHook("on_event", (h) => h(event));
+    }
+    return result;
+  }
+
+  /**
    * Subscribe to this session's live `session.event` feed via
    * `session.subscribe`, invoking `handler` for each event in order. With
    * `sinceEventId`, the server first replays persisted events after that id,
@@ -680,6 +749,18 @@ export class Session implements SandboxRpc, SubagentRpc {
       throw new HookError(name, cause);
     }
   }
+}
+
+/**
+ * Serialize a {@link CompactionConfig} exactly as the server's mode-tagged
+ * enum: `{mode:"auto",size}` or `{mode:"client"}` / `{mode:"client",prompt}`
+ * (never `"prompt": null`).
+ */
+function compactionToWire(c: CompactionConfig): Record<string, unknown> {
+  if (c.mode === "auto") return { mode: "auto", size: c.size };
+  return c.prompt !== undefined && c.prompt !== null
+    ? { mode: "client", prompt: c.prompt }
+    : { mode: "client" };
 }
 
 /**

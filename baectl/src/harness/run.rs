@@ -6,7 +6,8 @@
 //! non-interactive fast path that keeps the "2–3 commands" promise. `--no-ready`
 //! skips straight to launch from the existing `resolved.json`.
 //!
-//! - `kind: "local"` runs `run_command` on the host in the foreground with
+//! - `kind: "local"` runs the optional `prepare` command when needed (e.g.
+//!   `npm install`), then `run_command` on the host in the foreground with
 //!   inherited stdio (Ctrl-C reaches the child) and propagates its exit code.
 //! - `kind: "container"` launches a detached container off `setup`'s network,
 //!   reaching `baesrv` via the published host port, and prints the launcher's
@@ -21,7 +22,7 @@ use crate::harness::artifact::{
     artifact_dir, harness_env_path, load_manifest, load_resolved, warn_dev_mismatch, write_private,
     write_resolved,
 };
-use crate::harness::checks::{evaluate, FixMode};
+use crate::harness::checks::{evaluate, FixMode, Outcome, PROVIDER_KEY_ENV};
 use crate::harness::manifest::{
     BuildManifest, ContainerManifest, Launcher, LocalManifest, Resolved,
 };
@@ -62,12 +63,21 @@ pub fn run(opts: RunOptions) -> Result<(), CliError> {
         })?
     } else {
         let prior = load_resolved(&opts.dir, &opts.id);
-        match evaluate(&opts.dir, &manifest, prior.as_ref(), FixMode::Auto)? {
-            Some(resolved) => {
+        // B8: a container launch in a TTY prompts for missing env vars instead
+        // of aborting on check #5 (non-interactive stdin keeps the abort).
+        let prompt = Prompter::new();
+        match evaluate(
+            &opts.dir,
+            &manifest,
+            prior.as_ref(),
+            FixMode::Auto,
+            Some(&prompt),
+        )? {
+            Outcome::Ready(resolved) => {
                 write_resolved(&opts.dir, &opts.id, &resolved)?;
                 resolved
             }
-            None => {
+            Outcome::Fixable | Outcome::Blocked => {
                 return Err(CliError::runtime(format!(
                     "readiness checks did not pass (see above) — run `baectl ready {}` for the \
                      full report and fix guidance",
@@ -93,6 +103,10 @@ fn run_local(opts: &RunOptions, m: &LocalManifest, resolved: &Resolved) -> Resul
         .unwrap_or_else(|| resolved.server_url.clone());
     let workdir = m.harness_dir.join(&m.working_dir);
 
+    if let Some(prepare) = &m.prepare {
+        run_prepare(opts, m, prepare, &workdir)?;
+    }
+
     println!("── running {} (local) ──────────────", m.name);
     println!(
         "profile:  {} ({})",
@@ -106,20 +120,24 @@ fn run_local(opts: &RunOptions, m: &LocalManifest, resolved: &Resolved) -> Resul
     println!("(Ctrl-C to stop)\n");
 
     // Inherited stdio (the default) streams the child's output live and lets
-    // Ctrl-C reach it directly; `.env` adds only the two BAE_* vars, leaving
-    // every other host env var exactly as it was.
-    let status = Command::new("sh")
-        .args(["-c", &m.run_command])
+    // Ctrl-C reach it directly; `.env` adds only the BAE_* vars, leaving every
+    // other host env var exactly as it was.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &m.run_command])
         .current_dir(&workdir)
         .env("BAE_SERVER_URL", &server_url)
-        .env("BAE_CLIENT_KEY", key)
-        .status()
-        .map_err(|e| {
-            CliError::runtime(format!(
-                "failed to launch harness in {}: {e}",
-                workdir.display()
-            ))
-        })?;
+        .env("BAE_CLIENT_KEY", key);
+    // B5: name the provider's auth-token variable (the one check #5 verified),
+    // so a harness talking to e.g. OpenAI does not look for ANTHROPIC_API_KEY.
+    if let Some(var) = &resolved.provider_env {
+        cmd.env(PROVIDER_KEY_ENV, var);
+    }
+    let status = cmd.status().map_err(|e| {
+        CliError::runtime(format!(
+            "failed to launch harness in {}: {e}",
+            workdir.display()
+        ))
+    })?;
 
     // Propagate the child's exit code as our own (128 for a signal death).
     std::process::exit(status.code().unwrap_or(1));
@@ -145,7 +163,12 @@ fn run_container(
     // Resolve every required env var → harness.env, prompting for what is
     // missing (failing loudly, naming the var, when there is no TTY).
     let captured = resolve_container_env(dir, m, resolved.provider_env.as_deref())?;
-    let env_body = harness_env_body(&captured, &server_url, key);
+    let env_body = harness_env_body(
+        &captured,
+        &server_url,
+        key,
+        resolved.provider_env.as_deref(),
+    );
     let env_path = harness_env_path(dir, &m.id);
     write_private(&env_path, &env_body)?;
 
@@ -177,7 +200,8 @@ fn run_container(
 }
 
 /// The body written to the `0600` `harness.env`: every value resolved for this
-/// launch, including `BAE_SERVER_URL`/`BAE_CLIENT_KEY`.
+/// launch, including `BAE_SERVER_URL`/`BAE_CLIENT_KEY` and (when the provider's
+/// auth-token variable is known) `BAE_PROVIDER_KEY_ENV`.
 ///
 /// The client key deliberately travels in this file rather than as a
 /// `--env BAE_CLIENT_KEY=<secret>` argument: an argv element is readable by any
@@ -185,11 +209,111 @@ fn run_container(
 /// client process, so a plaintext key must never appear there. The two `BAE_*`
 /// entries are written last so they win over any same-named key in `<dir>/.env`
 /// (the engine applies `--env-file`s in the order they are given).
-fn harness_env_body(captured: &[(String, String)], server_url: &str, key: &str) -> String {
-    let mut body: String = captured.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+fn harness_env_body(
+    captured: &[(String, String)],
+    server_url: &str,
+    key: &str,
+    provider_env: Option<&str>,
+) -> String {
+    let mut body: String = captured
+        .iter()
+        .filter(|(k, _)| k != PROVIDER_KEY_ENV)
+        .map(|(k, v)| format!("{k}={v}\n"))
+        .collect();
+    if let Some(var) = provider_env {
+        body.push_str(&format!("{PROVIDER_KEY_ENV}={var}\n"));
+    }
     body.push_str(&format!("BAE_SERVER_URL={server_url}\n"));
     body.push_str(&format!("BAE_CLIENT_KEY={key}\n"));
     body
+}
+
+/// C2: run `harness.prepare` (via `sh -c`, in the harness working dir) when
+/// [`prepare_needed`] says so. A non-zero exit aborts `run` with the child's
+/// exit code, after its own output (inherited stdio) and one stderr line.
+fn run_prepare(
+    opts: &RunOptions,
+    m: &LocalManifest,
+    prepare: &str,
+    workdir: &Path,
+) -> Result<(), CliError> {
+    let marker = artifact_dir(&opts.dir, &m.id).join(PREPARED_MARKER);
+    let harness_toml = m.harness_dir.join("bae-harness.toml");
+    if !prepare_needed(prepare, workdir, &marker, &harness_toml) {
+        return Ok(());
+    }
+    println!("prepare: {prepare}   (in {})", workdir.display());
+    let status = Command::new("sh")
+        .args(["-c", prepare])
+        .current_dir(workdir)
+        .status()
+        .map_err(|e| {
+            CliError::runtime(format!(
+                "failed to run prepare command in {}: {e}",
+                workdir.display()
+            ))
+        })?;
+    if !status.success() {
+        let code = status.code().unwrap_or(1);
+        eprintln!("baectl: prepare command failed (exit {code}): {prepare}");
+        std::process::exit(if code == 0 { 1 } else { code });
+    }
+    // `npm install` may rewrite package-lock.json; re-stamp node_modules so an
+    // unchanged tree is not re-installed on every run.
+    if is_npm_command(prepare) {
+        touch(&workdir.join("node_modules"));
+    }
+    write_private(&marker, "")?;
+    Ok(())
+}
+
+/// The marker file (under the build's artifact dir) recording a successful
+/// non-npm `prepare`.
+pub(crate) const PREPARED_MARKER: &str = "prepared";
+
+/// Whether `prepare` starts with `npm ` or `npx `.
+fn is_npm_command(prepare: &str) -> bool {
+    let p = prepare.trim_start();
+    p.starts_with("npm ") || p.starts_with("npx ")
+}
+
+/// The C2 "only when needed" rule, pure over the filesystem:
+/// - an `npm …`/`npx …` command is needed when `<workdir>/node_modules/` is
+///   missing, or `<workdir>/package-lock.json` is newer than it;
+/// - any other command is needed when `marker` is missing or older than the
+///   harness's `bae-harness.toml`.
+pub(crate) fn prepare_needed(
+    prepare: &str,
+    workdir: &Path,
+    marker: &Path,
+    harness_toml: &Path,
+) -> bool {
+    if is_npm_command(prepare) {
+        let Some(modules) = mtime(&workdir.join("node_modules")) else {
+            return true;
+        };
+        match mtime(&workdir.join("package-lock.json")) {
+            Some(lock) => lock > modules,
+            None => false,
+        }
+    } else {
+        match (mtime(marker), mtime(harness_toml)) {
+            (None, _) => true,
+            (Some(done), Some(toml)) => toml > done,
+            (Some(_), None) => false,
+        }
+    }
+}
+
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Best-effort: set `path`'s mtime to now.
+fn touch(path: &Path) {
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// The engine argv for a detached container launch. Pure, so the "no secret
@@ -430,6 +554,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 mcp_servers: Vec::new(),
                 env: env.iter().map(|s| s.to_string()).collect(),
+                sandboxes: Vec::new(),
             },
             created_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -493,6 +618,7 @@ mod tests {
             &[("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],
             "http://host.docker.internal:8080",
             "bae_secret",
+            None,
         );
         assert_eq!(
             body,
@@ -614,6 +740,102 @@ mod tests {
         };
         assert_eq!(read_schedule(&dir, &sched).as_deref(), Some("0 0 3 * * *"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (B5): the provider's auth-token variable is named to the
+    /// container via `BAE_PROVIDER_KEY_ENV`, before the two `BAE_*` values; a
+    /// stale captured copy is not duplicated.
+    #[test]
+    fn harness_env_body_names_the_provider_key_env() {
+        let body = harness_env_body(
+            &[
+                ("OPENAI_API_KEY".to_string(), "sk-x".to_string()),
+                (PROVIDER_KEY_ENV.to_string(), "STALE".to_string()),
+            ],
+            "http://host.docker.internal:8080",
+            "bae_secret",
+            Some("OPENAI_API_KEY"),
+        );
+        assert_eq!(
+            body,
+            "OPENAI_API_KEY=sk-x\n\
+             BAE_PROVIDER_KEY_ENV=OPENAI_API_KEY\n\
+             BAE_SERVER_URL=http://host.docker.internal:8080\n\
+             BAE_CLIENT_KEY=bae_secret\n"
+        );
+    }
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// C2: the exact "only when needed" rule for `npm`/`npx` commands.
+    #[test]
+    fn prepare_needed_for_npm_follows_node_modules_and_the_lockfile() {
+        use std::time::{Duration, SystemTime};
+        let dir =
+            std::env::temp_dir().join(format!("baectl-run-prepare-npm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (marker, toml) = (dir.join("marker"), dir.join("bae-harness.toml"));
+        let t0 = SystemTime::now();
+
+        for cmd in ["npm install", "npx pnpm i", "  npm ci"] {
+            assert!(
+                prepare_needed(cmd, &dir, &marker, &toml),
+                "no node_modules: {cmd}"
+            );
+        }
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        assert!(
+            !prepare_needed("npm install", &dir, &marker, &toml),
+            "no lockfile"
+        );
+
+        std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        set_mtime(&dir.join("package-lock.json"), t0);
+        set_mtime(&dir.join("node_modules"), t0 + Duration::from_secs(10));
+        assert!(
+            !prepare_needed("npm install", &dir, &marker, &toml),
+            "lock older"
+        );
+        set_mtime(&dir.join("package-lock.json"), t0 + Duration::from_secs(20));
+        assert!(
+            prepare_needed("npm install", &dir, &marker, &toml),
+            "lock newer"
+        );
+        // `npmx` is not `npm `: it falls under the marker rule.
+        assert!(prepare_needed("npmx build", &dir, &marker, &toml));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2: any other command follows the build's `prepared` marker vs the
+    /// harness's `bae-harness.toml`.
+    #[test]
+    fn prepare_needed_for_other_commands_follows_the_marker() {
+        use std::time::{Duration, SystemTime};
+        let dir =
+            std::env::temp_dir().join(format!("baectl-run-prepare-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (marker, toml) = (dir.join(PREPARED_MARKER), dir.join("bae-harness.toml"));
+        let t0 = SystemTime::now();
+        std::fs::write(&toml, "").unwrap();
+        set_mtime(&toml, t0);
+
+        assert!(prepare_needed("uv sync", &dir, &marker, &toml), "no marker");
+        std::fs::write(&marker, "").unwrap();
+        set_mtime(&marker, t0 + Duration::from_secs(10));
+        assert!(
+            !prepare_needed("uv sync", &dir, &marker, &toml),
+            "marker newer"
+        );
+        set_mtime(&toml, t0 + Duration::from_secs(20));
+        assert!(
+            prepare_needed("uv sync", &dir, &marker, &toml),
+            "manifest edited"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

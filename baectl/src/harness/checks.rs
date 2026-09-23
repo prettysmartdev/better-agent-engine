@@ -7,29 +7,39 @@
 //! and — on full success — produces the [`Resolved`] record the caller persists
 //! to `resolved.json`.
 //!
+//! Each check prints one line: `✓ <label>`, `⚠ <label> — will be fixed by run`
+//! (a failing #2/#4 that `run` / `--fix` resolves on its own), or `✗ <label>`
+//! (blocking). Fix hints print in the exec form matching how `setup` launched
+//! the server (`docker compose exec -T baesrv baectl …` / `container exec bae
+//! baectl …`), so they are copy-pasteable as printed.
+//!
 //! The three [`FixMode`]s are the only behavioural difference between the two
 //! verbs' check passes:
-//! - [`FixMode::Report`] — `baectl ready` with no `--fix`: print ✓/✗ and the
-//!   command that *would* fix #2/#4, mutate nothing.
+//! - [`FixMode::Report`] — `baectl ready` with no `--fix`: print the report and
+//!   the command that *would* fix #2/#4, mutate nothing.
 //! - [`FixMode::Prompt`] — `baectl ready --fix`: same report, then a single
 //!   `Apply the N safe fix(es) above? [y/N]` confirmation (asked even without a
 //!   TTY) before applying #2/#4.
 //! - [`FixMode::Auto`] — `baectl run`: apply the #2/#4 fixes with no prompt,
 //!   printing exactly what was fixed. This is the non-interactive fast path.
 //!
-//! Checks #3 (MCP registry) and #5 (env vars) are always print-only — they
-//! require a server restart or a host/​`.env` edit that these verbs will not do
-//! unattended — so an unresolved #3/#5 makes the whole pass fail in every mode.
+//! Every check is evaluated before anything is mutated: checks #3 (MCP
+//! registry) and #5 (env vars) are print-only — they need a server restart or a
+//! host/`.env` edit these verbs will not do unattended — so an unresolved
+//! #3/#5 fails the pass in every mode **before** any #2/#4 fix is applied.
+//! (`run` of a container build on a TTY is the one exception for #5: it prompts
+//! for the missing values instead.)
 
 use std::io::{self, Write};
 use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::engine::{detect_engine, Engine, EngineKind, APPLE_SCRIPT, COMPOSE_FILE};
+use crate::engine::{detect_engine, Engine, EngineKind, Prompter, APPLE_SCRIPT, COMPOSE_FILE};
 use crate::error::CliError;
+use crate::harness::artifact::{artifact_dir, harness_env_path, resolved_path, write_private};
 use crate::harness::manifest::{BuildManifest, Requires, Resolved};
-use crate::setup::{parse_config_registry, ConfigRegistry, CONFIG_FILE, ENV_FILE};
+use crate::setup::{parse_config_registry, parse_max_port, ConfigRegistry, CONFIG_FILE, ENV_FILE};
 
 /// How the check pass may mutate server state to resolve checks #2 and #4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,19 +95,6 @@ pub(crate) fn resolve_server(dir: &Path) -> Option<ServerTarget> {
     })
 }
 
-/// Best-effort recovery of the MAX host port from a launcher's `<port>:3000`
-/// publish entry; defaults to `3000` if not found.
-fn parse_max_port(launcher_text: &str) -> u16 {
-    for token in launcher_text.split(|c: char| !c.is_ascii_digit() && c != ':') {
-        if let Some((host, "3000")) = token.split_once(':') {
-            if let Ok(p) = host.parse::<u16>() {
-                return p;
-            }
-        }
-    }
-    3000
-}
-
 /// The host port `baesrv`'s client port is published on — `BAE_ADDR_PORT` from
 /// `.env` if the operator remapped it, else the image default `8080`.
 fn host_client_port(dir: &Path) -> u16 {
@@ -125,47 +122,91 @@ pub(crate) fn default_server_url(manifest: &BuildManifest, port: u16) -> String 
     }
 }
 
+/// The result of a check pass.
+#[derive(Debug)]
+pub(crate) enum Outcome {
+    /// Every gating check passed (after any applied fixes): persist/launch.
+    Ready(Resolved),
+    /// Only auto-fixable (⚠) checks failed and they were not applied — `ready`
+    /// without `--fix`, or `--fix` with the confirmation declined. Exit 3.
+    Fixable,
+    /// At least one blocking (✗) check failed. Nothing was mutated. Exit 1.
+    Blocked,
+}
+
+/// The ⚠ line suffix for a check `run` / `ready --fix` resolves on its own.
+pub(crate) const WILL_BE_FIXED_MARKER: &str = "will be fixed by run";
+
+/// The env var `run` exports naming the provider's auth-token variable, so a
+/// harness reads the right key for a non-Anthropic provider. Check #5 validates
+/// the variable it names ([`Resolved::provider_env`]); both sides derive it
+/// from [`provider_key_env`].
+pub(crate) const PROVIDER_KEY_ENV: &str = "BAE_PROVIDER_KEY_ENV";
+
+/// The auth-token env var of the registry provider named `primary` (from
+/// `bae-config.toml`'s `auth_token = "${VAR}"`), if known.
+pub(crate) fn provider_key_env(registry: Option<&ConfigRegistry>, primary: &str) -> Option<String> {
+    registry.and_then(|r| {
+        r.providers
+            .iter()
+            .find(|(n, _)| n == primary)
+            .and_then(|(_, e)| e.clone())
+    })
+}
+
 /// Run the six checks against `manifest`, applying the #2/#4 fixes per `mode`.
-/// Returns `Some(Resolved)` when every gating check passed (the caller then
-/// persists it / launches), or `None` when an unresolved check means exit 1.
+///
+/// Order (B3): every check is evaluated first; if any **blocking** check (#1,
+/// #3, #5, or a #2 that cannot be fixed) fails, the pass returns
+/// [`Outcome::Blocked`] **before any admin mutation**, in every mode. Only then
+/// are the #2/#4 fixes applied (or, in `Report` mode / on a declined confirm,
+/// reported as [`Outcome::Fixable`]). A key is never created unless its secret
+/// can be persisted to `resolved.json`.
 ///
 /// `prior` is any existing `resolved.json`: a still-valid profile/key reference
 /// in it is *re-validated and reused* (not trusted blindly), so a second
 /// `ready`/`run` against a fully provisioned target makes zero admin mutations.
+///
+/// `env_prompt` (B8): `run` passes an interactive [`Prompter`] for container
+/// builds so a check #5 failure prompts for the missing values (saved to the
+/// `0600` `harness.env`) instead of aborting. `None`, or a non-interactive
+/// prompter, keeps #5 print-only.
 pub(crate) fn evaluate(
     dir: &Path,
     manifest: &BuildManifest,
     prior: Option<&Resolved>,
     mode: FixMode,
-) -> Result<Option<Resolved>, CliError> {
+    env_prompt: Option<&Prompter>,
+) -> Result<Outcome, CliError> {
     let requires = manifest.requires();
 
     // -- Check #1: server reachable ----------------------------------------
     let server = match resolve_server(dir) {
         Some(s) => s,
         None => {
-            print_check(false, "server reachable");
+            print_check(Mark::Fail, "server reachable");
             println!(
                 "    no `baectl setup` has been run in {} — run `baectl setup` first",
                 dir.display()
             );
-            return Ok(None);
+            return Ok(Outcome::Blocked);
         }
     };
     let profiles = match list_json(&server.engine, dir, "profiles") {
         Ok(p) => {
-            print_check(true, "server reachable");
+            print_check(Mark::Ok, "server reachable");
             p
         }
         Err(_) => {
-            print_check(false, "server reachable");
+            print_check(Mark::Fail, "server reachable");
             println!(
                 "    could not reach the admin API through the container — is the server \
                  running? launch it with `baectl setup` (choose Launch), then retry"
             );
-            return Ok(None);
+            return Ok(Outcome::Blocked);
         }
     };
+    let exec = exec_prefix(&server.engine, dir);
 
     let registry = load_registry(dir)?;
 
@@ -196,10 +237,11 @@ pub(crate) fn evaluate(
             None => Some(ProfileFix::Impossible),
         }
     };
+    let profile_impossible = matches!(profile_fix, Some(ProfileFix::Impossible));
 
     match (&resolved_profile, &profile_fix) {
         (Some(p), _) => print_check(
-            true,
+            Mark::Ok,
             &format!(
                 "compatible profile ({}, {})",
                 field(p, "id"),
@@ -207,8 +249,13 @@ pub(crate) fn evaluate(
             ),
         ),
         (None, Some(fix)) => {
-            print_check(false, "compatible profile");
-            print_profile_fix_hint(fix, requires, manifest, mode);
+            let mark = if profile_impossible {
+                Mark::Fail
+            } else {
+                Mark::Fixable
+            };
+            print_check(mark, "compatible profile");
+            print_profile_fix_hint(fix, requires, manifest, mode, &exec);
         }
         (None, None) => unreachable!("no profile and no fix is not constructed"),
     }
@@ -226,10 +273,10 @@ pub(crate) fn evaluate(
         .collect();
     let mcp_ok = missing_servers.is_empty();
     if mcp_ok {
-        print_check(true, "required MCP servers registered");
+        print_check(Mark::Ok, "required MCP servers registered");
     } else {
         print_check(
-            false,
+            Mark::Fail,
             &format!(
                 "required MCP servers registered (missing: {})",
                 missing_servers.join(", ")
@@ -263,15 +310,21 @@ pub(crate) fn evaluate(
     let key_needs_create = key_reuse.is_none();
     if let Some((key_id, _)) = &key_reuse {
         print_check(
-            true,
+            Mark::Ok,
             &format!("client key ({key_id}) — reusing saved credential"),
         );
     } else {
-        print_check(false, "client key with a stored secret");
-        print_key_fix_hint(anticipated_pid.as_deref(), manifest, mode);
+        // A key can only be created once a profile exists for it.
+        let mark = if profile_impossible {
+            Mark::Fail
+        } else {
+            Mark::Fixable
+        };
+        print_check(mark, "client key with a stored secret");
+        print_key_fix_hint(anticipated_pid.as_deref(), manifest, mode, &exec);
     }
 
-    // -- Check #5: required env vars resolvable (always print-only) ---------
+    // -- Check #5: required env vars resolvable (print-only; `run` may prompt)
     let anticipated_primary: Option<String> = resolved_profile
         .as_ref()
         .map(|p| field(p, "primary_provider").to_string())
@@ -282,21 +335,28 @@ pub(crate) fn evaluate(
             Some(ProfileFix::Create { primary }) => Some(primary.clone()),
             _ => None,
         });
-    let provider_env = anticipated_primary.as_ref().and_then(|primary| {
-        registry.as_ref().and_then(|r| {
-            r.providers
-                .iter()
-                .find(|(n, _)| n == primary)
-                .and_then(|(_, e)| e.clone())
-        })
-    });
-    let missing_env = missing_env_vars(dir, manifest, requires, provider_env.as_deref());
+    let provider_env = anticipated_primary
+        .as_deref()
+        .and_then(|primary| provider_key_env(registry.as_ref(), primary));
+    let mut missing_env = missing_env_vars(dir, manifest, requires, provider_env.as_deref());
+    // B8: an interactive container `run` prompts for what is missing rather
+    // than aborting — but only when nothing else blocks, so a secret is never
+    // requested for a launch that will not happen anyway.
+    let others_block = profile_impossible || !mcp_ok;
+    if !missing_env.is_empty() && !others_block {
+        if let (Some(prompt), BuildManifest::Container(_)) = (env_prompt, manifest) {
+            if prompt.interactive {
+                prompt_missing_env(dir, manifest.id(), &missing_env, prompt)?;
+                missing_env = missing_env_vars(dir, manifest, requires, provider_env.as_deref());
+            }
+        }
+    }
     let env_ok = missing_env.is_empty();
     if env_ok {
-        print_check(true, "required env vars resolvable");
+        print_check(Mark::Ok, "required env vars resolvable");
     } else {
         print_check(
-            false,
+            Mark::Fail,
             &format!(
                 "required env vars resolvable (missing: {})",
                 missing_env.join(", ")
@@ -310,54 +370,49 @@ pub(crate) fn evaluate(
         println!("ℹ MAX dashboard: {url}");
     }
 
+    // -- Gate (B3): any blocking failure aborts BEFORE any mutation ---------
+    if profile_impossible || !mcp_ok || !env_ok {
+        return Ok(Outcome::Blocked);
+    }
+
     // -- Apply the safe (#2/#4) fixes per mode -----------------------------
-    let fix_count = profile_fix
-        .as_ref()
-        .map(|f| matches!(f, ProfileFix::Update { .. } | ProfileFix::Create { .. }) as usize)
-        .unwrap_or(0)
-        + key_needs_create as usize;
-
-    let apply = match mode {
-        FixMode::Report => false,
-        FixMode::Auto => fix_count > 0,
-        FixMode::Prompt => {
-            if fix_count == 0 {
-                false
-            } else {
-                confirm_apply(fix_count)
-            }
+    let fix_count = profile_fix.is_some() as usize + key_needs_create as usize;
+    if fix_count > 0 {
+        let apply = match mode {
+            FixMode::Report => false,
+            FixMode::Auto => true,
+            FixMode::Prompt => confirm_apply(fix_count),
+        };
+        if !apply {
+            return Ok(Outcome::Fixable);
         }
-    };
+        // Never mint a key whose one-time plaintext could not then be saved.
+        if key_needs_create {
+            ensure_resolved_writable(dir, manifest.id())?;
+        }
 
-    if apply {
-        // #2: create/update the profile (additive). An Impossible fix cannot be
-        // applied — surface it and fail.
-        if let Some(fix) = &profile_fix {
-            match fix {
-                ProfileFix::Update { target } => {
-                    let updated = apply_update(&server.engine, dir, target, requires)?;
-                    println!(
-                        "fixed: widened profile {} — allowed_tools/mcp_servers now cover the harness",
-                        field(&updated, "id")
-                    );
-                    resolved_profile = Some(updated);
-                }
-                ProfileFix::Create { primary } => {
-                    let created = apply_create(&server.engine, dir, manifest, primary, requires)?;
-                    println!(
-                        "fixed: created profile {} ({})",
-                        field(&created, "id"),
-                        field(&created, "name")
-                    );
-                    resolved_profile = Some(created);
-                }
-                ProfileFix::Impossible => {
-                    return Err(CliError::runtime(
-                        "cannot create a compatible profile: no providers are registered in \
-                         bae-config.toml — run `baectl setup` to configure one",
-                    ));
-                }
+        // #2: create/update the profile (additive).
+        match &profile_fix {
+            Some(ProfileFix::Update { target }) => {
+                let updated = apply_update(&server.engine, dir, target, requires)?;
+                println!(
+                    "fixed: widened profile {} — allowed_tools/mcp_servers/available_sandboxes \
+                     now cover the harness",
+                    field(&updated, "id")
+                );
+                resolved_profile = Some(updated);
             }
+            Some(ProfileFix::Create { primary }) => {
+                let created = apply_create(&server.engine, dir, manifest, primary, requires)?;
+                println!(
+                    "fixed: created profile {} ({})",
+                    field(&created, "id"),
+                    field(&created, "name")
+                );
+                resolved_profile = Some(created);
+            }
+            Some(ProfileFix::Impossible) => unreachable!("gated above"),
+            None => {}
         }
         // #4: create a key for the now-resolved profile (unless we reused one).
         if key_needs_create {
@@ -370,16 +425,10 @@ pub(crate) fn evaluate(
         }
     }
 
-    // -- Gate: every gating check must be resolved -------------------------
-    let profile_resolved = resolved_profile.is_some();
-    let key_resolved = key_reuse.is_some();
-    if !(profile_resolved && mcp_ok && key_resolved && env_ok) {
-        return Ok(None);
-    }
-
-    let profile = resolved_profile.expect("gated on Some");
-    let (key_id, plaintext) = key_reuse.expect("gated on Some");
-    Ok(Some(Resolved {
+    let (Some(profile), Some((key_id, plaintext))) = (resolved_profile, key_reuse) else {
+        return Ok(Outcome::Blocked);
+    };
+    Ok(Outcome::Ready(Resolved {
         profile_id: field(&profile, "id").to_string(),
         profile_name: field(&profile, "name").to_string(),
         key_id,
@@ -394,6 +443,49 @@ pub(crate) fn evaluate(
         // provider token check #5 accepted.
         provider_env,
     }))
+}
+
+/// Probe that `<dir>/.baectl/builds/<id>/` accepts a write before a key is
+/// created: the admin API shows a key's plaintext exactly once, so a key whose
+/// `resolved.json` cannot be written would be orphaned.
+fn ensure_resolved_writable(dir: &Path, id: &str) -> Result<(), CliError> {
+    let probe = artifact_dir(dir, id).join(".resolved.probe");
+    std::fs::write(&probe, b"")
+        .and_then(|()| std::fs::remove_file(&probe))
+        .map_err(|e| {
+            CliError::runtime(format!(
+                "cannot write {} ({e}) — refusing to create a client key whose secret could \
+                 not be saved",
+                resolved_path(dir, id).display()
+            ))
+        })
+}
+
+/// B8: prompt for each missing container env var and merge the answers into
+/// the `0600` `harness.env` (where `run`'s env resolution and check #5 both
+/// read them). An empty answer aborts.
+fn prompt_missing_env(
+    dir: &Path,
+    id: &str,
+    missing: &[String],
+    prompt: &Prompter,
+) -> Result<(), CliError> {
+    let path = harness_env_path(dir, id);
+    let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    for var in missing {
+        let value = prompt.ask_line(&format!("Value for required env var {var}?"), "");
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(CliError::runtime(format!(
+                "no value provided for required env var {var}"
+            )));
+        }
+        body.push_str(&format!("{var}={value}\n"));
+    }
+    write_private(&path, &body)
 }
 
 /// The proposed #2 fix when no compatible profile exists.
@@ -418,11 +510,15 @@ fn pick_widen_target<'a>(profiles: &'a [Value], prior: Option<&Resolved>) -> Opt
         .or_else(|| profiles.first())
 }
 
-/// Whether a profile's `allowed_tools` and `mcp_servers` both cover `requires`.
+/// Whether a profile's `allowed_tools`, `mcp_servers` and `available_sandboxes`
+/// all cover `requires`.
 fn profile_compatible(profile: &Value, requires: &Requires) -> bool {
     let tools = string_array(profile.get("allowed_tools"));
     let servers = string_array(profile.get("mcp_servers"));
-    is_superset(&tools, &requires.allowed_tools) && is_superset(&servers, &requires.mcp_servers)
+    let sandboxes = string_array(profile.get("available_sandboxes"));
+    is_superset(&tools, &requires.allowed_tools)
+        && is_superset(&servers, &requires.mcp_servers)
+        && is_superset(&sandboxes, &requires.sandboxes)
 }
 
 /// Whether `have` contains every element of `need`.
@@ -444,10 +540,12 @@ pub(crate) fn union(base: &[String], extra: &[String]) -> Vec<String> {
 }
 
 /// Build the `baectl update profile …` argument vector that widens `target`
-/// additively: the profile's existing primary/name/fallbacks preserved verbatim
-/// (a full PUT replacement would otherwise drop them), and its tools/servers
-/// unioned with `requires`. `--json` is *not* appended (callers add it for
-/// exec; the display path shows it without).
+/// additively. The admin update is a full PUT replacement, so **every** field
+/// the profile body carries is re-sent: primary/name/fallbacks verbatim, and
+/// tools/servers/sandboxes as the profile's existing list unioned with
+/// `requires`. `available_sandboxes` is always re-sent even when the harness
+/// declares none (the server treats a missing field as `[]`). `--json` is *not*
+/// appended (callers add it for exec; the display path shows it without).
 pub(crate) fn update_fix_args(target: &Value, requires: &Requires) -> Vec<String> {
     let id = field(target, "id").to_string();
     let primary = field(target, "primary_provider").to_string();
@@ -460,6 +558,10 @@ pub(crate) fn update_fix_args(target: &Value, requires: &Requires) -> Vec<String
     let servers = union(
         &string_array(target.get("mcp_servers")),
         &requires.mcp_servers,
+    );
+    let sandboxes = union(
+        &string_array(target.get("available_sandboxes")),
+        &requires.sandboxes,
     );
 
     let mut args = vec![
@@ -482,6 +584,10 @@ pub(crate) fn update_fix_args(target: &Value, requires: &Requires) -> Vec<String
         args.push("--mcp-server".into());
         args.push(s);
     }
+    for s in sandboxes {
+        args.push("--available-sandbox".into());
+        args.push(s);
+    }
     args
 }
 
@@ -500,6 +606,10 @@ fn create_fix_args(manifest: &BuildManifest, primary: &str, requires: &Requires)
     }
     for s in &requires.mcp_servers {
         args.push("--mcp-server".into());
+        args.push(s.clone());
+    }
+    for s in &requires.sandboxes {
+        args.push("--available-sandbox".into());
         args.push(s.clone());
     }
     args
@@ -563,6 +673,7 @@ fn apply_create(
         "fallback_providers": [],
         "allowed_tools": requires.allowed_tools,
         "mcp_servers": requires.mcp_servers,
+        "available_sandboxes": requires.sandboxes,
     }))
 }
 
@@ -610,10 +721,11 @@ fn key_reuse(
 }
 
 /// The env vars check #5 needs resolvable: `requires.env` plus the resolved
-/// provider's auth-token var. `local` checks the host process env (what `run`
-/// inherits); `container` checks `<dir>/.env` or the host env (what `run`
-/// passes through). `BAE_SERVER_URL`/`BAE_CLIENT_KEY` are excluded — `run` sets
-/// them itself.
+/// provider's auth-token var (the variable `run` exports as
+/// `BAE_PROVIDER_KEY_ENV`). `local` checks the host process env (what `run`
+/// inherits); `container` checks `<dir>/.env`, the build's saved `harness.env`,
+/// or the host env (what `run` passes through). `BAE_SERVER_URL`/
+/// `BAE_CLIENT_KEY` are excluded — `run` sets them itself.
 fn missing_env_vars(
     dir: &Path,
     manifest: &BuildManifest,
@@ -627,7 +739,11 @@ fn missing_env_vars(
         }
     }
     let dotenv = match manifest {
-        BuildManifest::Container(_) => dotenv_keys(dir),
+        BuildManifest::Container(m) => {
+            let mut keys = env_file_keys(&dir.join(ENV_FILE));
+            keys.extend(env_file_keys(&harness_env_path(dir, &m.id)));
+            keys
+        }
         BuildManifest::Local(_) => Vec::new(),
     };
     needed
@@ -636,7 +752,8 @@ fn missing_env_vars(
         .collect()
 }
 
-/// Whether `var` resolves from the host environment or (container) from `.env`.
+/// Whether `var` resolves from the host environment or (container) from an env
+/// file.
 fn env_resolvable(var: &str, dotenv: &[String]) -> bool {
     if std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false) {
         return true;
@@ -644,9 +761,10 @@ fn env_resolvable(var: &str, dotenv: &[String]) -> bool {
     dotenv.iter().any(|k| k == var)
 }
 
-/// The `KEY` names present in `<dir>/.env` (values not needed here).
-fn dotenv_keys(dir: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(dir.join(ENV_FILE)).unwrap_or_default();
+/// The `KEY` names with a non-empty value in a Docker-style env file (values
+/// not needed here). A missing file has none.
+fn env_file_keys(path: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -699,21 +817,47 @@ fn load_registry(dir: &Path) -> Result<Option<ConfigRegistry>, CliError> {
 
 // -- Fix-hint printers -------------------------------------------------------
 
+/// The copy-pasteable host command prefix that reaches the in-container
+/// `baectl`, matching how `setup` launched the server: `docker compose exec -T
+/// <service> baectl` (with `-f <dir>/docker-compose.yml` when `dir` is not the
+/// current directory) or `container exec <name> baectl`.
+pub(crate) fn exec_prefix(engine: &Engine, dir: &Path) -> String {
+    match engine {
+        Engine::Docker { service } => {
+            let here = std::env::current_dir()
+                .ok()
+                .and_then(|c| c.canonicalize().ok());
+            let there = dir.canonicalize().ok();
+            if here.is_some() && here == there {
+                format!("docker compose exec -T {service} baectl")
+            } else {
+                let file = dir.join(COMPOSE_FILE).display().to_string();
+                format!(
+                    "docker compose -f {} exec -T {service} baectl",
+                    shell_quote(&file)
+                )
+            }
+        }
+        Engine::Apple { container } => format!("container exec {container} baectl"),
+    }
+}
+
 fn print_profile_fix_hint(
     fix: &ProfileFix,
     requires: &Requires,
     manifest: &BuildManifest,
     mode: FixMode,
+    exec: &str,
 ) {
     let suffix = fix_suffix(mode);
     match fix {
         ProfileFix::Update { target } => {
             let cmd = shell_join(&update_fix_args(target, requires));
-            println!("    widen the existing profile (additive): baectl {cmd}{suffix}");
+            println!("    widen the existing profile (additive): {exec} {cmd}{suffix}");
         }
         ProfileFix::Create { primary } => {
             let cmd = shell_join(&create_fix_args(manifest, primary, requires));
-            println!("    create a compatible profile: baectl {cmd}{suffix}");
+            println!("    create a compatible profile: {exec} {cmd}{suffix}");
         }
         ProfileFix::Impossible => {
             println!(
@@ -724,12 +868,23 @@ fn print_profile_fix_hint(
     }
 }
 
-fn print_key_fix_hint(profile_id: Option<&str>, manifest: &BuildManifest, mode: FixMode) {
-    let suffix = fix_suffix(mode);
+fn print_key_fix_hint(
+    profile_id: Option<&str>,
+    manifest: &BuildManifest,
+    mode: FixMode,
+    exec: &str,
+) {
+    // A hand-created key's plaintext never reaches `resolved.json`, so point
+    // out that `--fix` (or `run`) also records it.
+    let suffix = match mode {
+        FixMode::Report => "  (--fix also records the key for `run`)",
+        FixMode::Prompt | FixMode::Auto => "",
+    };
     match profile_id {
         Some(pid) => println!(
-            "    create a client key baectl can hand to `run`: baectl create key {} {pid}{suffix}",
-            manifest.id()
+            "    create a client key baectl can hand to `run`: {exec} create key {} {}{suffix}",
+            shell_quote(manifest.id()),
+            shell_quote(pid)
         ),
         None => {
             println!("    a client key will be created for the new profile once it exists{suffix}")
@@ -804,22 +959,49 @@ fn manifest_name(manifest: &BuildManifest) -> &str {
     }
 }
 
-/// Join argument tokens for display, quoting any that contain whitespace.
+/// Join argument tokens into a copy-pasteable POSIX shell command line.
 fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|a| {
-            if a.chars().any(char::is_whitespace) {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
-            }
-        })
+        .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn print_check(ok: bool, label: &str) {
-    println!("{} {}", if ok { "✓" } else { "✗" }, label);
+/// Single-quote `s` for a POSIX shell unless it is made only of characters
+/// that never need quoting.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// A check line's state marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// `✓` — passed.
+    Ok,
+    /// `⚠ … — will be fixed by run` — failing, but `run`/`--fix` resolves it.
+    Fixable,
+    /// `✗` — failing and blocking.
+    Fail,
+}
+
+/// The exact stdout line for one check.
+fn check_line(mark: Mark, label: &str) -> String {
+    match mark {
+        Mark::Ok => format!("✓ {label}"),
+        Mark::Fixable => format!("⚠ {label} — {WILL_BE_FIXED_MARKER}"),
+        Mark::Fail => format!("✗ {label}"),
+    }
+}
+
+fn print_check(mark: Mark, label: &str) {
+    println!("{}", check_line(mark, label));
 }
 
 /// Prompt `Apply the N safe fix(es) above? [y/N]` and read one line — asked even
@@ -846,6 +1028,7 @@ mod tests {
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
             mcp_servers: servers.iter().map(|s| s.to_string()).collect(),
             env: Vec::new(),
+            sandboxes: Vec::new(),
         }
     }
 
@@ -869,6 +1052,7 @@ mod tests {
             harness_dir: PathBuf::from("/tmp/ref"),
             run_command: "true".to_string(),
             working_dir: ".".to_string(),
+            prepare: None,
             requires: requires(&["get_current_time"], &[]),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         })
@@ -942,6 +1126,191 @@ mod tests {
         ] {
             assert!(window_has(&args, &pair), "missing {pair:?} in {args:?}");
         }
+
+        // Regression (B2): every value of every list field of the input profile
+        // is re-sent — including `available_sandboxes`, which the harness does
+        // not declare at all (the old args dropped it, and the full PUT then
+        // wiped the profile's sandbox images).
+        let target = json!({
+            "id": "pro_1",
+            "name": "default",
+            "primary_provider": "anthropic-sonnet",
+            "fallback_providers": ["openai-gpt", "anthropic-haiku"],
+            "allowed_tools": ["t1", "t2"],
+            "mcp_servers": ["s1", "s2"],
+            "available_sandboxes": ["python:3.12", "alpine"],
+        });
+        let args = update_fix_args(&target, &requires(&["get_current_time"], &[]));
+        for (field, flag) in [
+            ("fallback_providers", "--fallback"),
+            ("allowed_tools", "--allowed-tool"),
+            ("mcp_servers", "--mcp-server"),
+            ("available_sandboxes", "--available-sandbox"),
+        ] {
+            for value in string_array(target.get(field)) {
+                assert!(
+                    window_has(&args, &[flag, value.as_str()]),
+                    "{field} value {value:?} dropped from {args:?}"
+                );
+            }
+        }
+        assert!(window_has(&args, &["--name", "default"]));
+
+        // A harness-declared sandbox is unioned in after the existing images.
+        let mut req = requires(&[], &[]);
+        req.sandboxes = vec!["alpine".to_string(), "node:22".to_string()];
+        let args = update_fix_args(&target, &req);
+        let sandboxes: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--available-sandbox")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(sandboxes, vec!["python:3.12", "alpine", "node:22"]);
+    }
+
+    /// B2: `requires.sandboxes` is part of compatibility (check #2), and a
+    /// created profile carries it.
+    #[test]
+    fn required_sandboxes_are_checked_and_carried_by_create() {
+        let mut req = requires(&["get_current_time"], &[]);
+        req.sandboxes = vec!["alpine".to_string()];
+        let mut p = profile("p1", "a", &["get_current_time"], &[]);
+        assert!(!profile_compatible(&p, &req), "no sandboxes → incompatible");
+        p["available_sandboxes"] = json!(["python:3.12", "alpine"]);
+        assert!(profile_compatible(&p, &req));
+
+        let args = create_fix_args(&local_manifest(), "anthropic-sonnet", &req);
+        assert!(window_has(&args, &["--available-sandbox", "alpine"]));
+    }
+
+    /// B7: the exact check-line markers.
+    #[test]
+    fn check_lines_use_the_three_markers() {
+        assert_eq!(
+            check_line(Mark::Ok, "server reachable"),
+            "✓ server reachable"
+        );
+        assert_eq!(
+            check_line(Mark::Fixable, "compatible profile"),
+            "⚠ compatible profile — will be fixed by run"
+        );
+        assert_eq!(
+            check_line(Mark::Fail, "compatible profile"),
+            "✗ compatible profile"
+        );
+        assert_eq!(WILL_BE_FIXED_MARKER, "will be fixed by run");
+    }
+
+    /// B7: hints use the exec form matching the engine `setup` launched.
+    #[test]
+    fn exec_prefix_matches_the_engine() {
+        assert_eq!(
+            exec_prefix(&Engine::apple("bae-max"), Path::new("/anywhere")),
+            "container exec bae-max baectl"
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            exec_prefix(&Engine::docker("baesrv"), &cwd),
+            "docker compose exec -T baesrv baectl"
+        );
+        let dir = temp_dir("exec-prefix");
+        assert_eq!(
+            exec_prefix(&Engine::docker("bae-max"), &dir),
+            format!(
+                "docker compose -f {}/docker-compose.yml exec -T bae-max baectl",
+                dir.display()
+            )
+        );
+        // A path needing quoting stays copy-pasteable.
+        assert_eq!(shell_quote("/tmp/my dir/x"), "'/tmp/my dir/x'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (B8): a value saved in the build's `harness.env` (where `run`
+    /// persists prompted values) satisfies check #5 for a container build; an
+    /// empty one does not, and a local build never reads it.
+    #[test]
+    fn harness_env_values_satisfy_check_5_for_container_builds() {
+        let dir = temp_dir("harness-env-check5");
+        let path = harness_env_path(&dir, "ref-rust-api");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "BAECTL_TEST_B8_SAVED=from-harness-env\nBAECTL_TEST_B8_BLANK=\n",
+        )
+        .unwrap();
+        let mut req = requires(&[], &[]);
+        req.env = vec![
+            "BAECTL_TEST_B8_SAVED".to_string(),
+            "BAECTL_TEST_B8_BLANK".to_string(),
+        ];
+
+        let missing = missing_env_vars(
+            &dir,
+            &container_manifest(),
+            &req,
+            Some("BAECTL_TEST_B8_SAVED"),
+        );
+        assert_eq!(missing, vec!["BAECTL_TEST_B8_BLANK"]);
+
+        // `local` reads the host env only (`harness.env` is never passed on).
+        let mut local = local_manifest();
+        if let BuildManifest::Local(m) = &mut local {
+            m.id = "ref-rust-api".to_string();
+        }
+        let missing = missing_env_vars(&dir, &local, &req, None);
+        assert_eq!(
+            missing,
+            vec!["BAECTL_TEST_B8_SAVED", "BAECTL_TEST_B8_BLANK"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B8: the TTY prompt appends answers to the `0600` `harness.env`, after
+    /// which check #5 passes; an empty answer aborts naming the variable.
+    #[test]
+    fn prompted_env_values_are_saved_privately_and_satisfy_check_5() {
+        let dir = temp_dir("prompt-env");
+        let path = harness_env_path(&dir, "ref-rust-api");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "EXISTING=keep").unwrap();
+        let missing = vec![
+            "BAECTL_TEST_B8_A".to_string(),
+            "BAECTL_TEST_B8_B".to_string(),
+        ];
+
+        let prompt = Prompter::scripted(&["value-a", "  value-b  "]);
+        prompt_missing_env(&dir, "ref-rust-api", &missing, &prompt).unwrap();
+
+        assert_eq!(prompt.prompt_count.get(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "EXISTING=keep\nBAECTL_TEST_B8_A=value-a\nBAECTL_TEST_B8_B=value-b\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let mut req = requires(&[], &[]);
+        req.env = missing.clone();
+        assert!(missing_env_vars(&dir, &container_manifest(), &req, None).is_empty());
+
+        let err = prompt_missing_env(
+            &dir,
+            "ref-rust-api",
+            &["BAECTL_TEST_B8_C".to_string()],
+            &Prompter::scripted(&[""]),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(
+            err.message(),
+            "no value provided for required env var BAECTL_TEST_B8_C"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

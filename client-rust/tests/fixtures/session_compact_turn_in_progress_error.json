@@ -1,0 +1,5 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "error": { "code": -32020, "message": "turn in progress: resolve the paused turn before compacting" }
+}

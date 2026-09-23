@@ -25,6 +25,14 @@ key for that profile. See
 [`docs/guides/00-quickstart.md`](../../../docs/guides/00-quickstart.md) for the
 admin-side setup (create a profile, create a key).
 
+**Fastest path:** skip the manual profile/key setup below entirely with
+`baectl build reference-assistant --sdk typescript && baectl run
+reference-assistant-typescript-local` — see the
+[Quickstart](../../../docs/guides/00-quickstart.md#fastest-path-three-commands).
+The steps below are what that command automates, useful if you want to see or
+customize each layer by hand (see
+[`docs/guides/00a-quickstart-step-by-step.md`](../../../docs/guides/00a-quickstart-step-by-step.md)).
+
 ## Configuration (environment)
 
 | Variable               | Default                  | Meaning                              |

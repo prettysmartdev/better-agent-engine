@@ -133,7 +133,7 @@ export interface Profile {
 // handling it here is a compile error.
 // ---------------------------------------------------------------------------
 
-/** The closed set of 27 event type strings. */
+/** The closed set of 28 event type strings. */
 export type EventType =
   | "client.message.send"
   | "server.message.send"
@@ -168,9 +168,20 @@ export interface ClientMessagePayload {
   role: "user";
   content: Content;
 }
+/**
+ * Why the server wrote a synthetic `server.message.send`: `"compaction_preamble"`
+ * marks the user-role preamble that precedes a compaction summary,
+ * `"abandoned_tool_results"` the user-role tool results written when an expired
+ * paused turn is retired. Open-ended: future values may appear.
+ */
+export type SyntheticMessageKind =
+  "compaction_preamble" | "abandoned_tool_results" | (string & {});
 export interface ServerMessagePayload {
-  role: "assistant";
+  /** `"user"` only on synthetic server messages (see `synthetic`). */
+  role: "assistant" | "user";
   content: ContentBlock[];
+  /** Present only on server-written synthetic messages; absent otherwise. */
+  synthetic?: SyntheticMessageKind;
 }
 export interface ProviderRequestPayload {
   attempt: number;
@@ -181,6 +192,13 @@ export interface ProviderRequestPayload {
   max_tokens: number;
   messages: unknown[];
   tools: unknown[];
+  /**
+   * Present only when the provider-request normalizer changed the history
+   * (Anthropic sequence rules); each key only when that change happened.
+   */
+  normalized?: { prepended_user?: true; merged?: number[][] };
+  /** `"compaction"` on the compaction call; absent on ordinary turns. */
+  purpose?: "compaction";
 }
 export type ProviderResponsePayload =
   | {
@@ -190,6 +208,13 @@ export type ProviderResponsePayload =
       ok: true;
       status: number;
       body: Record<string, unknown>;
+      /**
+       * Provider-reported usage (`input_tokens` is cache-inclusive), or null /
+       * absent when the provider reported none.
+       */
+      usage?: { input_tokens: number; output_tokens: number } | null;
+      /** `"compaction"` on the compaction call; absent on ordinary turns. */
+      purpose?: "compaction";
     }
   | {
       attempt: number;
@@ -199,6 +224,8 @@ export type ProviderResponsePayload =
       status: number | null;
       error: string;
       body: string | null;
+      /** `"compaction"` on the compaction call; absent on ordinary turns. */
+      purpose?: "compaction";
     };
 export interface ToolCallPayload {
   id: string;
@@ -277,18 +304,26 @@ export interface SessionErrorPayload {
     | "all_providers_failed"
     | "primary_provider_unavailable"
     | "driver_turn_abandoned"
+    | "tool_result_merge_invalid"
+    | "compaction_store_failed"
     | "loop_limit"
     | "profile_unavailable";
   [key: string]: unknown;
 }
 export interface SessionCompactionStartedPayload {
   trigger: "auto" | "client";
-  reason: "token_threshold" | "manual";
+  /** `retry_after_failure` only ever appears with `trigger: "auto"`. */
+  reason: "token_threshold" | "retry_after_failure" | "manual";
   token_count: number | null;
   threshold_tokens: number | null;
   [key: string]: unknown;
 }
 export interface SessionCompactionCompletedPayload {
+  /**
+   * The synthetic user-role preamble written before the summary. Absent on
+   * events written by servers that predate the preamble.
+   */
+  preamble_event_id?: string;
   summary_event_id: string;
   compacted_message_count: number;
   /** Provider-reported compaction input usage, or null when unavailable. */
@@ -444,6 +479,29 @@ export type SessionEvent = {
   [T in EventType]: EventEnvelope<T>;
 }[EventType];
 
+/** The {@link SessionEvent} arm for one `event_type`. */
+export type SessionEventOf<T extends EventType> = Extract<
+  SessionEvent,
+  { event_type: T }
+>;
+
+/** The `session.compaction.completed` record returned by `Session.compact()`. */
+export type SessionCompactionCompleted =
+  SessionEventOf<"session.compaction.completed">;
+
+/**
+ * Session-level compaction, fixed at creation (`POST /api/v1/sessions`):
+ * `auto` compacts once the session reaches `size` tokens; `client` compacts only
+ * when a driver calls `session.compact`, using `prompt` (or the server default).
+ */
+export type CompactionConfig =
+  { mode: "auto"; size: number } | { mode: "client"; prompt?: string };
+
+/** Params for `session.compact`. */
+export interface CompactParams {
+  prompt?: string;
+}
+
 /** Compile-time exhaustiveness guard. */
 export function assertNever(value: never): never {
   throw new Error(`unhandled event: ${JSON.stringify(value)}`);
@@ -459,7 +517,11 @@ export function describeEvent(event: SessionEvent): string {
     case "client.message.send":
       return "client → server: user turn";
     case "server.message.send":
-      return "server → client: assistant turn";
+      return event.payload.synthetic === "compaction_preamble"
+        ? "server: compaction preamble (synthetic)"
+        : event.payload.synthetic !== undefined
+          ? `server: synthetic ${event.payload.role} message (${event.payload.synthetic})`
+          : "server → client: assistant turn";
     case "provider.request":
       return `provider request (attempt ${event.payload.attempt}, ${event.payload.kind})`;
     case "provider.response":
@@ -540,7 +602,8 @@ export type RpcMethod =
   | "session.cancelSubagent"
   | "session.updateClientTools"
   | "session.startRemoteSandbox"
-  | "session.stopRemoteSandbox";
+  | "session.stopRemoteSandbox"
+  | "session.compact";
 
 /** A JSON-RPC 2.0 request envelope. */
 export interface JsonRpcRequest<P = unknown> {

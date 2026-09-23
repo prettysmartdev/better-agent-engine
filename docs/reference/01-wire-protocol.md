@@ -172,11 +172,12 @@ Errors on `POST /api/v1/sessions/{id}/rpc` are JSON-RPC error objects:
 |---|---|---|
 | `-32700` | Parse error | Request body is not valid JSON. |
 | `-32600` | Invalid Request | Well-formed JSON that is not a valid JSON-RPC request object, or a batch array (batches are unsupported). |
-| `-32601` | Method not found | `method` is not one of the three supported values. |
+| `-32601` | Method not found | `method` is not one of the supported `session.*` methods. |
 | `-32602` | Invalid params | Required params are missing or have the wrong type. |
 | `-32603` | Internal error | Unexpected server error (e.g. database failure). |
 | `-32000` | Application error | Session is not in `open` state, profile was deleted mid-session, or the broadcast channel was overrun (see `"lagged"` below). |
 | `-32001` | Driver not registered | `session.sendMessage` called before `session.registerDriver` on this connection's client key. See [FIFO turn ownership](#fifo-turn-ownership-and-driver-registration) below. |
+| `-32020` | Turn in progress | `session.compact` found a live paused turn blocking the gate (or the turn it was queued behind paused): `"turn in progress: resolve the paused turn before compacting"`. See [Client API — `session.compact`](00-client-api.md#sessioncompact). |
 
 All other client-port endpoints (meta, session open/getEvents/close) return RFC
 7807 error bodies on non-2xx status codes — unchanged from before.
@@ -275,9 +276,13 @@ alternation and exact tool-result coverage remain valid.
 the **same** per-session mutex described above, not a separate one: a
 compaction and a live turn both decide what "current history" means, so they
 must never run concurrently on one session. A `session.compact` call that
-arrives while another driver's turn is in flight queues exactly like a
+arrives while another driver's turn is **running** queues exactly like a
 second `session.sendMessage` call would — silent, zero-byte NDJSON response
-until dequeued.
+until dequeued. It never waits on a **paused** turn: a live pause (or a
+running turn that pauses while the compact is queued) fails the call
+immediately with `-32020`, and a pause past `BAE_TURN_TIMEOUT` is reclaimed
+and retired before the compaction runs — see [Client API —
+`session.compact`](00-client-api.md#sessioncompact).
 
 Automatic (`mode: "auto"`) compaction needs no separate acquisition at all:
 it runs synchronously inside `run_turn`, after that turn's own

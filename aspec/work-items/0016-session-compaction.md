@@ -59,6 +59,16 @@ render an accurate transcript/timeline (e.g. in MAX's observer-only webapp) and 
 
 ## Implementation Details:
 
+> **Amended by `aspec/work-items/0018-compaction-and-first-run-hardening.md`
+> (§A1–A7).** In particular: the compacted summary below (§5 step 5) is now
+> preceded by a persisted synthetic `user`-role preamble message, so the
+> post-compaction history replays as a provider-valid `user → assistant`
+> sequence instead of starting `assistant`-first; `session.compaction.completed`
+> (§3) gains `preamble_event_id`; and §6's history-scoping bound resolves from
+> the preamble when present, falling back to the pre-0018 summary-based bound
+> for sessions compacted before that change. §5.7 below is amended directly.
+> Where this note and the section text below disagree, 0018 is current.
+
 ### 1. Session-level compaction config (`server/src/api/client/sessions.rs`, `server/src/store/sessions.rs`)
 - Add `CompactionConfig` to `sessions.rs` (near `ClientToolDef`/`CreateSession`, `sessions.rs:100-128`):
   ```rust
@@ -120,7 +130,7 @@ render an accurate transcript/timeline (e.g. in MAX's observer-only webapp) and 
   4. Call the provider (same call path `run_turn` uses; also goes through `usage_tokens` extraction from §4), take the single resulting assistant message and its `(input_tokens, output_tokens)`.
   5. Insert **one** synthetic `server.message.send` event holding the compacted summary — this is the "single message containing the fully compacted session" the summary calls for, and it is what a subsequent `stream_history` call will treat as the new starting point.
   6. Insert `session.compaction.completed`, with `input_tokens`/`summary_tokens` taken directly from step 4's usage (§3) — no separate size computation needed.
-  7. Return the completed event so callers (both the auto path in `run_turn` and the `session.compact` RPC handler) can include it in their response/broadcast the same way other engine calls surface their `Vec<EventRecord>`.
+  7. Return the **full compaction record** — `session.compaction.started`, the compaction call's own `provider.request`/`provider.response` pair(s), the preamble and summary `server.message.send` events, and `session.compaction.completed`, in that order — as a `Vec<EventRecord>`, not just the terminal `completed` event. **Amended by work item 0018 (A3):** the auto path in `run_turn` appends every one of these to `Turn.events`, after the turn's own `server.message.send`, so the terminal `session.sendMessage` result's `events` array ends with the complete compaction record — matching this work item's own "the terminal result is the turn's full log" convention rather than surfacing only `completed`. A failed automatic attempt still contributes what it persisted (`started` plus the provider pair(s)) to `result.events`. The `session.compact` RPC handler's own response stays just the `session.compaction.completed` event (see §7 below) — its notification stream carries the rest, as documented in `docs/reference/00-client-api.md#sessioncompact`.
 - **Auto trigger point is *after* a turn, not before it.** Token usage for a turn is only known once the provider has actually responded (the server doesn't run its own tokenizer — §4), so the check cannot be a pre-turn estimate the way a byte-count check could have been. Instead: `run_turn`'s iteration loop (`session.rs:301+`, the `for _ in 0..MAX_ITERATIONS` tool round-trip loop) already makes one-or-more provider calls per turn; track the **last** successful call's `(input_tokens, output_tokens)` in a local `Option<(u64, u64)>` through that loop. Once the loop reaches a true turn boundary (`Outcome::Completed` or `Outcome::Paused` — never mid-loop, while a `tool_use`/`tool_result` exchange is still in flight in memory, see Edge Cases) and the session's `CompactionConfig` is `Auto { size }`, compare `input_tokens + output_tokens` from that last call against `size`. If over threshold, call `run_compaction` **before returning** `Turn` to the RPC handler — so the *next* `session.sendMessage` (not this one) is the first thing that sees the fresh, compacted history. This is simpler than a pre-turn estimate, requires no SQL aggregate at all (the number is already sitting in memory from the call `run_turn` just made), and matches the trigger condition exactly as specified: "if input + output is greater than the size limit, compaction should be triggered."
 
 ### 6. Compaction-aware history assembly (`server/src/store/sessions.rs`)

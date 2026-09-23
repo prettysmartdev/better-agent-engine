@@ -1,5 +1,5 @@
 import type { SessionEvent } from "../api/types";
-import { categoryFor } from "../api/eventTypes";
+import { categoryForEvent, syntheticLabel } from "../api/eventTypes";
 import ShapeMarker from "./ShapeMarker";
 
 function pretty(payload: unknown): string {
@@ -18,7 +18,8 @@ export default function EventDetailPanel({
   event: SessionEvent;
   onClose: () => void;
 }) {
-  const cat = categoryFor(event.event_type);
+  const cat = categoryForEvent(event);
+  const synthetic = syntheticLabel(event);
   return (
     <aside className="detail-panel" aria-label={`Event ${event.id} detail`}>
       <div className="detail-head">
@@ -39,6 +40,12 @@ export default function EventDetailPanel({
         <dd>{event.id}</dd>
         <dt>Category</dt>
         <dd>{cat.label}</dd>
+        {synthetic ? (
+          <>
+            <dt>Origin</dt>
+            <dd data-testid="event-synthetic">{synthetic}</dd>
+          </>
+        ) : null}
         <dt>Client key</dt>
         <dd>{event.client_key_id ?? "—"}</dd>
         <dt>Created</dt>

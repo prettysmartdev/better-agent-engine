@@ -175,11 +175,14 @@ impl Prompter {
         }
     }
 
-    #[cfg(test)]
+    /// A prompter that never asks: every question resolves to its default.
+    /// `setup --yes` uses it regardless of whether stdin is a TTY.
     pub(crate) fn non_interactive() -> Prompter {
         Prompter {
             interactive: false,
+            #[cfg(test)]
             prompt_count: Cell::new(0),
+            #[cfg(test)]
             scripted_answers: RefCell::new(None),
         }
     }

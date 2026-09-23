@@ -248,33 +248,55 @@ same driver-registration gate and per-session turn-serialization as
 gate](../reference/01-wire-protocol.md#compaction-shares-the-same-gate)), so
 it can never race a live turn on the same session.
 
+Unlike `session.sendMessage`, a `session.compact` call never waits behind a
+**paused** turn — it fails immediately with JSON-RPC error `-32020` (`turn in
+progress: resolve the paused turn before compacting`) instead of blocking, so
+a driver that pauses on a tool call can't deadlock against its own
+compaction. A pause whose turn timeout has already expired is reclaimed
+instead (no error) and the compaction proceeds. See [Client API —
+`session.compact`](../reference/00-client-api.md#sessioncompact) for this and
+every other error `session.compact` can return (provider exhaustion, a
+truncated or empty summary, and internal errors).
+
 **In both modes**, compaction only changes what the **next** provider call is
 built from. `GET /api/v1/sessions/{id}/events` and `session.subscribe`
 replay always return the complete, unmodified append-only event log —
 nothing before a compaction is ever deleted or hidden from the audit trail,
 it is simply excluded from what gets sent to the model going forward.
 
-**Typical notification sequence for an auto-triggered compaction:**
+**Typical notification sequence for an auto-triggered compaction:** the
+compaction runs *inside* the same `sendMessage` call that crossed the
+threshold, so every compaction event streams — and is persisted into
+`result.events` — **before** that call's terminal result, not after it:
 
 ```
 session.event notification: client.message.send
 session.event notification: provider.request
 session.event notification: provider.response      (usage crosses the configured size)
 session.event notification: server.message.send    (the turn's own reply)
-terminal result: {message, events}                 -- this turn's own terminal result
 session.event notification: session.compaction.started   (trigger: auto)
 session.event notification: provider.request             (compaction call)
 session.event notification: provider.response
-session.event notification: server.message.send          (compacted summary)
+session.event notification: server.message.send          (compaction preamble: role user,
+                                                            synthetic: compaction_preamble)
+session.event notification: server.message.send          (compacted summary: role assistant)
 session.event notification: session.compaction.completed
+terminal result: {message, events}                 -- this turn's own terminal result;
+                                                     -- `events` ends with the full compaction
+                                                     -- record above, in this order
 ```
 
+A failed automatic attempt still contributes what it persisted — `started`
+and the provider pair(s), no summary or `completed` — to `result.events`, in
+the same position, right before the terminal result.
+
 A manual `session.compact` call produces the same
-`started → provider.request → provider.response → server.message.send →
-completed` sequence, streamed the same way, with its own terminal result
-being the `session.compaction.completed` event itself rather than a
-`{message, events}` body — see [Client API —
-`session.compact`](../reference/00-client-api.md#sessioncompact).
+`started → provider.request → provider.response → server.message.send
+(preamble) → server.message.send (summary) → completed` sequence, streamed
+the same way, with its own terminal result being the
+`session.compaction.completed` event itself rather than a `{message, events}`
+body — see [Client API — `session.compact`](../reference/00-client-api.md#sessioncompact)
+for its full JSON-RPC error set, including the turn-in-progress error below.
 
 ---
 

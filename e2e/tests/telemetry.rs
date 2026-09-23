@@ -19,10 +19,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::Request;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
 use bae_rs::{Config as ClientConfig, Harness, Tool};
 use opentelemetry::global;
 use opentelemetry::trace::{FutureExt as _, TraceContextExt as _, Tracer as _};
@@ -136,56 +133,14 @@ struct CapturedSpan {
     span: Span,
 }
 
-/// A tiny Anthropic-shaped provider.  It is the canonical client-tool parity
-/// fixture: the first response asks for one client tool; the result round trip
-/// receives a final assistant message.
-async fn provider_mock(request: Request) -> Response {
-    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-        .await
-        .expect("read provider request");
-    let body: Value = serde_json::from_slice(&bytes).expect("provider JSON");
-    let has_tool_result = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .and_then(|messages| messages.last())
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        });
-    let reply = if has_tool_result {
-        json!({
-            "role": "assistant",
-            "stop_reason": "end_turn",
-            "content": [{"type": "text", "text": "tool round-trip complete"}],
-        })
-    } else {
-        json!({
-            "role": "assistant",
-            "stop_reason": "tool_use",
-            "content": [{
-                "type": "tool_use",
-                "id": "tu_e2e",
-                "name": "get_current_time",
-                "input": {},
-            }],
-        })
-    };
-    (StatusCode::OK, Json(reply)).into_response()
-}
-
+/// The canonical client-tool parity fixture (see
+/// [`bae_e2e::provider_mock::tool_round_trip`]) on an ephemeral loopback port.
 async fn start_provider_mock() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind provider mock");
-    let addr = listener.local_addr().expect("provider mock address");
-    tokio::spawn(async move {
-        axum::serve(listener, Router::new().fallback(provider_mock))
-            .await
-            .expect("serve provider mock");
-    });
+    let addr = bae_e2e::provider_mock::start(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        bae_e2e::provider_mock::tool_round_trip,
+    )
+    .await;
     format!("http://{addr}")
 }
 

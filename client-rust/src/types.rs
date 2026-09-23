@@ -426,3 +426,351 @@ pub struct McpResponsePayload {
     #[serde(default)]
     pub error: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/// Session-level compaction, fixed at session creation. Sent as the
+/// `compaction` field of `POST /api/v1/sessions` (never on join), serialized as
+/// the server's mode-tagged enum: `{"mode":"auto","size":N}`,
+/// `{"mode":"client"}`, or `{"mode":"client","prompt":"…"}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum CompactionConfig {
+    /// The server compacts automatically once the session reaches `size`
+    /// tokens.
+    Auto {
+        /// Token threshold that triggers an automatic compaction.
+        size: u64,
+    },
+    /// Compaction runs only when a driver calls [`Session::compact`](crate::Session::compact).
+    Client {
+        /// Default summarization prompt for this session (the server default
+        /// when `None`). Omitted from the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+}
+
+impl CompactionConfig {
+    /// `{"mode":"auto","size":size}`.
+    pub fn auto(size: u64) -> Self {
+        Self::Auto { size }
+    }
+
+    /// `{"mode":"client"}` — the server's default summarization prompt.
+    pub fn client() -> Self {
+        Self::Client { prompt: None }
+    }
+
+    /// `{"mode":"client","prompt":prompt}`.
+    pub fn client_with_prompt(prompt: impl Into<String>) -> Self {
+        Self::Client {
+            prompt: Some(prompt.into()),
+        }
+    }
+}
+
+/// Params for the `session.compact` method. An absent `prompt` serializes as
+/// `{}`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CompactParams {
+    /// Summarization prompt override for this compaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// Payload of a `session.compaction.started` event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionCompactionStartedPayload {
+    /// `"auto"` (token threshold) or `"client"` (`session.compact`).
+    pub trigger: String,
+    /// `"token_threshold"`, `"retry_after_failure"` (auto only), or `"manual"`.
+    pub reason: String,
+    /// The session's token count when compaction started, if known.
+    #[serde(default)]
+    pub token_count: Option<u64>,
+    /// The auto-compaction threshold (`null` for client-triggered runs).
+    #[serde(default)]
+    pub threshold_tokens: Option<u64>,
+}
+
+/// Payload of a `session.compaction.completed` event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionCompactionCompletedPayload {
+    /// The synthetic user-role preamble written before the summary. `None` on
+    /// events written by servers that predate the preamble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble_event_id: Option<String>,
+    /// The `server.message.send` event holding the summary.
+    pub summary_event_id: String,
+    /// How many history messages were summarized.
+    pub compacted_message_count: u64,
+    /// Provider-reported compaction input usage, if any.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// Provider-reported summary output usage, if any.
+    #[serde(default)]
+    pub summary_tokens: Option<u64>,
+}
+
+/// A typed `session.compaction.started` event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionCompactionStarted {
+    /// Event id (`evt_…`).
+    pub id: String,
+    /// Owning session id.
+    pub session_id: String,
+    /// The acting client key, if any.
+    #[serde(default)]
+    pub client_key_id: Option<String>,
+    /// RFC 3339 timestamp.
+    pub created_at: String,
+    /// The typed payload.
+    pub payload: SessionCompactionStartedPayload,
+}
+
+/// A typed `session.compaction.completed` event — the terminal result of
+/// [`Session::compact`](crate::Session::compact).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionCompactionCompleted {
+    /// Event id (`evt_…`).
+    pub id: String,
+    /// Owning session id.
+    pub session_id: String,
+    /// The acting client key, if any.
+    #[serde(default)]
+    pub client_key_id: Option<String>,
+    /// RFC 3339 timestamp.
+    pub created_at: String,
+    /// The typed payload.
+    pub payload: SessionCompactionCompletedPayload,
+}
+
+/// `payload.synthetic` on the user-role preamble that precedes a compaction
+/// summary.
+pub const SYNTHETIC_COMPACTION_PREAMBLE: &str = "compaction_preamble";
+/// `payload.synthetic` on the user-role tool results the server writes when it
+/// retires an expired paused turn.
+pub const SYNTHETIC_ABANDONED_TOOL_RESULTS: &str = "abandoned_tool_results";
+
+/// Payload of a `server.message.send` event. `role` is `"assistant"` for model
+/// turns and `"user"` only on server-written synthetic messages, which carry
+/// `synthetic` naming why they exist (see [`SYNTHETIC_COMPACTION_PREAMBLE`]).
+/// `content` is kept as raw JSON so every block round-trips untouched.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ServerMessagePayload {
+    /// `"assistant"` or `"user"`.
+    #[serde(default = "default_server_role")]
+    pub role: String,
+    /// The message content blocks, verbatim.
+    pub content: Value,
+    /// Why a synthetic message was written; absent on ordinary messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<String>,
+}
+
+fn default_server_role() -> String {
+    "assistant".to_string()
+}
+
+impl ServerMessagePayload {
+    /// Is this the compaction preamble marker?
+    pub fn is_compaction_preamble(&self) -> bool {
+        self.synthetic.as_deref() == Some(SYNTHETIC_COMPACTION_PREAMBLE)
+    }
+}
+
+impl EventView {
+    /// Decode `payload` as `T` (e.g. [`ServerMessagePayload`] for a
+    /// `server.message.send` row). The caller checks `event_type` first.
+    pub fn payload_as<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        T::deserialize(&self.payload)
+    }
+}
+
+impl TryFrom<EventView> for SessionCompactionCompleted {
+    type Error = serde_json::Error;
+    fn try_from(e: EventView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            payload: serde_json::from_value(e.payload)?,
+            id: e.id,
+            session_id: e.session_id,
+            client_key_id: e.client_key_id,
+            created_at: e.created_at,
+        })
+    }
+}
+
+impl TryFrom<EventView> for SessionCompactionStarted {
+    type Error = serde_json::Error;
+    fn try_from(e: EventView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            payload: serde_json::from_value(e.payload)?,
+            id: e.id,
+            session_id: e.session_id,
+            client_key_id: e.client_key_id,
+            created_at: e.created_at,
+        })
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Fixtures shared with the other SDKs and the server (WI 0018 contracts.md
+    // §1/§8), copied verbatim into tests/fixtures/.
+    const PREAMBLE_EVENT: &str = include_str!("../tests/fixtures/compaction_preamble_event.json");
+    const SUMMARY_EVENT: &str = include_str!("../tests/fixtures/compaction_summary_event.json");
+    const COMPLETED_EVENT: &str = include_str!("../tests/fixtures/compaction_completed_event.json");
+    const COMPLETED_EVENT_LEGACY: &str =
+        include_str!("../tests/fixtures/compaction_completed_event_legacy.json");
+    const STARTED_MANUAL: &str = include_str!("../tests/fixtures/compaction_started_manual.json");
+    const STARTED_RETRY_AFTER_FAILURE: &str =
+        include_str!("../tests/fixtures/compaction_started_retry_after_failure.json");
+
+    // -------------------------------------------------------------------
+    // `CompactionConfig` serialization (contracts.md §1.11) — byte-exact.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compaction_config_auto_serializes_exactly() {
+        let v = serde_json::to_value(CompactionConfig::auto(128_000)).unwrap();
+        assert_eq!(v, json!({ "mode": "auto", "size": 128_000 }));
+    }
+
+    #[test]
+    fn compaction_config_client_no_prompt_omits_prompt_key() {
+        let v = serde_json::to_value(CompactionConfig::client()).unwrap();
+        assert_eq!(v, json!({ "mode": "client" }));
+        assert!(
+            v.as_object().unwrap().get("prompt").is_none(),
+            "prompt key must be absent, not null: {v}"
+        );
+    }
+
+    #[test]
+    fn compaction_config_client_with_prompt_serializes_exactly() {
+        let v = serde_json::to_value(CompactionConfig::client_with_prompt(
+            "Summarize focusing on open TODOs.",
+        ))
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({ "mode": "client", "prompt": "Summarize focusing on open TODOs." })
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `CompactParams` — `session.compact` request params (contracts.md §1.12).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compact_params_no_prompt_serializes_as_empty_object() {
+        let v = serde_json::to_value(CompactParams::default()).unwrap();
+        assert_eq!(v, json!({}));
+    }
+
+    #[test]
+    fn compact_params_with_prompt_serializes_exactly() {
+        let params = CompactParams {
+            prompt: Some("…".to_string()),
+        };
+        let v = serde_json::to_value(params).unwrap();
+        assert_eq!(v, json!({ "prompt": "…" }));
+    }
+
+    // -------------------------------------------------------------------
+    // `synthetic` / `preamble_event_id` round-trip through the shared fixtures.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn preamble_event_payload_has_synthetic_and_user_role() {
+        let ev: EventView = serde_json::from_str(PREAMBLE_EVENT).unwrap();
+        assert_eq!(ev.event_type, "server.message.send");
+        let payload: ServerMessagePayload = ev.payload_as().unwrap();
+        assert_eq!(payload.role, "user");
+        assert_eq!(
+            payload.synthetic.as_deref(),
+            Some(SYNTHETIC_COMPACTION_PREAMBLE)
+        );
+        assert!(payload.is_compaction_preamble());
+
+        // Round-trip: serializing it back out keeps `synthetic`.
+        let back = serde_json::to_value(&payload).unwrap();
+        assert_eq!(back["synthetic"], json!("compaction_preamble"));
+        assert_eq!(back["role"], json!("user"));
+    }
+
+    #[test]
+    fn summary_event_payload_has_no_synthetic_field() {
+        let ev: EventView = serde_json::from_str(SUMMARY_EVENT).unwrap();
+        let payload: ServerMessagePayload = ev.payload_as().unwrap();
+        assert_eq!(payload.role, "assistant");
+        assert_eq!(payload.synthetic, None);
+        assert!(!payload.is_compaction_preamble());
+
+        // A `None` synthetic never reappears on the wire.
+        let back = serde_json::to_value(&payload).unwrap();
+        assert!(back.as_object().unwrap().get("synthetic").is_none());
+    }
+
+    #[test]
+    fn completed_payload_preamble_event_id_round_trips() {
+        let ev: EventView = serde_json::from_str(COMPLETED_EVENT).unwrap();
+        let completed = SessionCompactionCompleted::try_from(ev).unwrap();
+        assert_eq!(completed.id, "evt_01completed");
+        assert_eq!(
+            completed.payload.preamble_event_id.as_deref(),
+            Some("evt_01preamble")
+        );
+        assert_eq!(completed.payload.summary_event_id, "evt_01summary");
+        assert_eq!(completed.payload.compacted_message_count, 17);
+        assert_eq!(completed.payload.input_tokens, Some(42_100));
+        assert_eq!(completed.payload.summary_tokens, Some(900));
+
+        // Round-trip back through JSON keeps the field, not dropped.
+        let back = serde_json::to_value(&completed.payload).unwrap();
+        assert_eq!(back["preamble_event_id"], json!("evt_01preamble"));
+    }
+
+    #[test]
+    fn completed_payload_missing_preamble_event_id_defaults_to_none() {
+        // A pre-A1 event has no `preamble_event_id` key at all.
+        let ev: EventView = serde_json::from_str(COMPLETED_EVENT_LEGACY).unwrap();
+        assert!(ev.payload.get("preamble_event_id").is_none());
+        let completed = SessionCompactionCompleted::try_from(ev).unwrap();
+        assert_eq!(completed.payload.preamble_event_id, None);
+        assert_eq!(completed.payload.summary_event_id, "evt_01summaryold");
+        assert_eq!(completed.payload.input_tokens, None);
+        assert_eq!(completed.payload.summary_tokens, None);
+
+        // And omitting it when `None` keeps the wire shape byte-for-byte with
+        // what an old server sent — no stray `"preamble_event_id":null`.
+        let back = serde_json::to_value(&completed.payload).unwrap();
+        assert!(back.as_object().unwrap().get("preamble_event_id").is_none());
+    }
+
+    #[test]
+    fn started_manual_matches_fixture() {
+        let ev: EventView = serde_json::from_str(STARTED_MANUAL).unwrap();
+        let started = SessionCompactionStarted::try_from(ev).unwrap();
+        assert_eq!(started.payload.trigger, "client");
+        assert_eq!(started.payload.reason, "manual");
+        assert_eq!(started.payload.token_count, Some(1_100));
+        assert_eq!(started.payload.threshold_tokens, None);
+    }
+
+    #[test]
+    fn started_retry_after_failure_matches_fixture() {
+        let ev: EventView = serde_json::from_str(STARTED_RETRY_AFTER_FAILURE).unwrap();
+        let started = SessionCompactionStarted::try_from(ev).unwrap();
+        assert_eq!(started.payload.trigger, "auto");
+        assert_eq!(started.payload.reason, "retry_after_failure");
+        assert_eq!(started.payload.token_count, Some(140_010));
+        assert_eq!(started.payload.threshold_tokens, Some(128_000));
+    }
+}

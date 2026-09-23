@@ -58,16 +58,16 @@ Storage location: none of its own — a pure HTTP client over the admin API. `au
 
 #### Command structure
 Verb-first, resource-typed positional, mapping 1:1 onto the admin API's CRUD surface:
-- `create profile <name> <provider> <model>` / `create key <name> <profile_id>`
+- `create profile <name> <primary_provider> [--fallback …] [--mcp-server …] [--allowed-tool …] [--available-sandbox …]` / `create key <name> <profile_id>`
 - `list profiles` / `list keys` (cursor-paginated; auto-paginates by default)
 - `get profile <id>`
-- `update profile <id> <provider> <model>` (full replacement, mirroring the API's `PUT`)
+- `update profile <id> <primary_provider> [--name …] [--fallback …] [--mcp-server …] [--allowed-tool …] [--available-sandbox …]` (full replacement, mirroring the API's `PUT`)
 - `delete profile <id>` / `delete key <id>`
 - `auth create key` — local-only admin-key-pair generation (no API call); pre-provisions a shared admin credential across multiple server replicas.
-- `setup` — interactive quickstart wizard; local scaffolding (generates a launcher, `.env`, and `bae-config.toml`) with an optional final step that launches the deployment and creates a first profile/key. See [Setup wizard](#setup-wizard) below and [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup) for the full question list.
+- `setup [--dev] [--apple] [--yes|-y] [--dir <path>]` — interactive quickstart wizard; local scaffolding (generates a launcher, `.env`, and `bae-config.toml`) with an optional final step that launches the deployment and creates a first profile/key. `--yes`/`-y` runs it fully non-interactively — every question at its default, the provider picked from `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in the environment — for the [Quickstart](../../docs/guides/00-quickstart.md)'s scripted path. See [Setup wizard](#setup-wizard) below and [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup) for the full question list.
 - `build <harness> [--sdk <sdk>] [--harness-dir <path>] [--launcher <launcher>] [--id <id>] [--dev] [--dir <path>]` — package a bundled or external client harness as a local artifact or launcher image.
-- `ready <id> [--fix] [--dir <path>] [--dev]` — check a built harness's server, profile, key, registry, and environment readiness, optionally applying safe fixes.
-- `run <id> [--dir <path>] [--no-ready] [--server-url <url>] [--dev]` — launch a ready local harness or detached launcher container and show where/how to use it.
+- `ready <id> [--fix] [--dir <path>] [--dev]` — check a built harness's server, profile, key, registry, and environment readiness, optionally applying safe fixes. Exits `0` (all pass), `3` (only auto-fixable issues remain — `run`/`--fix` resolves them without prompting), or `1` (a blocking issue remains).
+- `run <id> [--dir <path>] [--no-ready] [--server-url <url>] [--dev]` — launch a ready local harness or detached launcher container and show where/how to use it. For `--launcher local`, runs the harness manifest's optional `prepare` command first (only when needed — e.g. a TypeScript example's `npm install`).
 
 Profiles get the full CRUD set; keys get create/list/delete only — there is
 no single-key-get or key-update endpoint on the admin API (keys are
@@ -87,13 +87,19 @@ Flag guidance (same conventions as `baesrv` above):
   document the admin API returned (an array for an auto-paginated list);
   default is a compact human-readable summary/table.
 - `--help` on every command and subcommand.
-- `setup`-specific flag: `--apple` (emit a `bae-setup.sh` script driving
-  Apple's `container` CLI instead of `docker-compose.yml`). The host-invoked
+- `setup`-specific flags: `--apple` (emit a `bae-setup.sh` script driving
+  Apple's `container` CLI instead of `docker-compose.yml`) and `--yes`/`-y`
+  (non-interactive: every question at its default, provider picked from the
+  environment — see [Setup wizard](#setup-wizard) below). The host-invoked
   `build`, `ready`, and `run` commands also accept `--dev` (use locally-built
   images/binaries instead of published tags) and `--dir <DIR>` (workspace
-  directory, default `.`), as shown above; `build` additionally accepts
-  `--sdk`, `--harness-dir`, `--launcher`, and `--id`, `ready` accepts `--fix`,
-  and `run` accepts `--no-ready` and `--server-url`.
+  directory, default `.`, canonicalized once at argument mapping so every
+  path derived from it is absolute), as shown above; `build` additionally
+  accepts `--sdk`, `--harness-dir`, `--launcher`, and `--id`, `ready` accepts
+  `--fix`, and `run` accepts `--no-ready` and `--server-url`. `create
+  profile`/`update profile` additionally accept `--available-sandbox
+  <IMAGE>` (repeatable), unioned rather than replaced when a widen applies a
+  fix.
 
 #### Auto-configuration
 Unlike `baesrv`, `baectl` is a client with nothing to bind — its
@@ -115,9 +121,12 @@ I/O Guidance (identical to `baesrv`'s conventions):
 - stderr: diagnostics, one-off warnings (e.g. "copy this key now"), and
   error messages, prefixed `baectl: `.
 - Exit codes: 0 success, 1 runtime error (connection failure, any admin API
-  error response, an unexpected/unparseable response body — version skew),
-  2 usage error (a missing required positional or a value `baectl` rejects
-  itself, e.g. a malformed `--fallback` spec).
+  error response, an unexpected/unparseable response body — version skew, or
+  an invalid `--dir`), 2 usage error (a missing required positional or a
+  value `baectl` rejects itself, e.g. a malformed `--fallback` spec, an
+  unknown `bae-harness.toml` field, or an invalid harness/build name), 3
+  (`baectl ready` only) every failing readiness check is auto-fixable —
+  `run` or `ready --fix` resolves them without prompting.
 
 ##### Setup wizard
 `setup` is the primary `baectl` command whose "stdin: unused" line above does
@@ -127,7 +136,8 @@ exists to talk to. `ready --fix` reads a confirmation before applying fixes,
 and container-mode `run` may prompt for missing harness secrets. When stdin
 isn't a TTY (piped/CI), every setup question falls back to its default with
 nothing printed, and the launch question specifically defaults to declining
-rather than the interactive default — see
+rather than the interactive default. `--yes` takes the same defaulted path
+explicitly (even on a TTY) and additionally implies **Launch: yes** — see
 [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup)
 for the full question list, generated-file shapes, and exit codes. Every
 other `baectl` command's "stdin: unused" line stays accurate unless one of

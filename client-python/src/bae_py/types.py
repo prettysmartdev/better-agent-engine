@@ -2,7 +2,7 @@
 the sanitized profile view.
 
 The event model is deliberately *closed*. ``EventType`` enumerates exactly the
-fourteen strings the server may emit (api-contract §8); parsing an unknown
+twenty-eight strings the server may emit (api-contract §8); parsing an unknown
 string raises immediately, and :func:`describe_event` switches over every arm
 with an ``assert_never`` fall-through, so adding a new event type without
 handling it is a loud failure rather than a silent pass-through.
@@ -164,7 +164,7 @@ class Profile:
 
 
 # ---------------------------------------------------------------------------
-# Session events (the closed fourteen-member set)
+# Session events (the closed twenty-eight-member set)
 # ---------------------------------------------------------------------------
 
 
@@ -172,7 +172,7 @@ class EventType(str, Enum):
     """The complete, closed set of ``session_events.event_type`` values (§8).
 
     WI 0006 grew this from 14 to 22 with the sandbox lifecycle and dispatch
-    events; the ``SANDBOX_*`` members must be present or :meth:`SessionEvent.from_wire`
+    events, and WI 0010 to 28 with the subagent lifecycle events; the ``SANDBOX_*`` members must be present or :meth:`SessionEvent.from_wire`
     would raise on a sandbox event the server now legitimately emits.
     """
 
@@ -320,6 +320,167 @@ class McpResponsePayload:
 
 
 # ---------------------------------------------------------------------------
+# Compaction (session-level config, typed compaction events, synthetic messages)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AutoCompaction:
+    """Compact automatically once the session reaches ``size`` tokens.
+    Serializes as ``{"mode": "auto", "size": size}``."""
+
+    size: int
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"mode": "auto", "size": self.size}
+
+
+@dataclass(frozen=True, slots=True)
+class ClientCompaction:
+    """Compact only when a driver calls :meth:`Session.compact`, with
+    ``prompt`` (or the server default when ``None``) as the session's default
+    summarization prompt. Serializes as ``{"mode": "client"}`` or
+    ``{"mode": "client", "prompt": prompt}`` (never ``"prompt": null``)."""
+
+    prompt: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        if self.prompt is None:
+            return {"mode": "client"}
+        return {"mode": "client", "prompt": self.prompt}
+
+
+# Session-level compaction, fixed at creation (sent by ``Harness.connect`` only).
+CompactionConfig = Union[AutoCompaction, ClientCompaction]
+
+# ``payload.synthetic`` on the user-role preamble that precedes a compaction summary.
+SYNTHETIC_COMPACTION_PREAMBLE = "compaction_preamble"
+# ``payload.synthetic`` on the user-role tool results the server writes when it
+# retires an expired paused turn.
+SYNTHETIC_ABANDONED_TOOL_RESULTS = "abandoned_tool_results"
+
+
+@dataclass(slots=True)
+class ServerMessagePayload:
+    """Payload of a ``server.message.send`` event. ``role`` is ``"assistant"``
+    for model turns and ``"user"`` only on server-written synthetic messages,
+    which carry ``synthetic`` naming why they exist (e.g.
+    :data:`SYNTHETIC_COMPACTION_PREAMBLE`). ``content`` is the raw block list,
+    verbatim. :class:`SessionEvent` keeps the whole payload as a dict, so
+    ``synthetic`` is never dropped.
+    """
+
+    role: str
+    content: Any
+    synthetic: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ServerMessagePayload":
+        return cls(
+            role=payload.get("role", "assistant"),
+            content=payload.get("content"),
+            synthetic=payload.get("synthetic"),
+        )
+
+    @property
+    def is_compaction_preamble(self) -> bool:
+        return self.synthetic == SYNTHETIC_COMPACTION_PREAMBLE
+
+
+@dataclass(slots=True)
+class SessionCompactionStartedPayload:
+    """Payload of a ``session.compaction.started`` event. ``trigger`` is
+    ``"auto"`` or ``"client"``; ``reason`` is ``"token_threshold"``,
+    ``"retry_after_failure"`` (auto only) or ``"manual"``."""
+
+    trigger: str
+    reason: str
+    token_count: int | None = None
+    threshold_tokens: int | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "SessionCompactionStartedPayload":
+        return cls(
+            trigger=payload.get("trigger", ""),
+            reason=payload.get("reason", ""),
+            token_count=payload.get("token_count"),
+            threshold_tokens=payload.get("threshold_tokens"),
+        )
+
+
+@dataclass(slots=True)
+class SessionCompactionCompletedPayload:
+    """Payload of a ``session.compaction.completed`` event.
+    ``preamble_event_id`` is ``None`` on events written by servers that predate
+    the compaction preamble."""
+
+    summary_event_id: str
+    compacted_message_count: int
+    preamble_event_id: str | None = None
+    input_tokens: int | None = None
+    summary_tokens: int | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "SessionCompactionCompletedPayload":
+        return cls(
+            # Required fields: a malformed record raises (KeyError/TypeError/
+            # ValueError) instead of yielding a fake-success default.
+            summary_event_id=str(payload["summary_event_id"]),
+            compacted_message_count=int(payload["compacted_message_count"]),
+            preamble_event_id=payload.get("preamble_event_id"),
+            input_tokens=payload.get("input_tokens"),
+            summary_tokens=payload.get("summary_tokens"),
+        )
+
+
+@dataclass(slots=True)
+class SessionCompactionStarted:
+    """A typed ``session.compaction.started`` event."""
+
+    id: str
+    session_id: str
+    client_key_id: str | None
+    created_at: str
+    payload: SessionCompactionStartedPayload
+
+    @classmethod
+    def from_event(cls, event: SessionEvent) -> "SessionCompactionStarted":
+        return cls(
+            id=event.id,
+            session_id=event.session_id,
+            client_key_id=event.client_key_id,
+            created_at=event.created_at,
+            payload=SessionCompactionStartedPayload.from_payload(event.payload),
+        )
+
+
+@dataclass(slots=True)
+class SessionCompactionCompleted:
+    """A typed ``session.compaction.completed`` event — the terminal result of
+    :meth:`Session.compact`."""
+
+    id: str
+    session_id: str
+    client_key_id: str | None
+    created_at: str
+    payload: SessionCompactionCompletedPayload
+
+    @classmethod
+    def from_event(cls, event: SessionEvent) -> "SessionCompactionCompleted":
+        return cls(
+            id=event.id,
+            session_id=event.session_id,
+            client_key_id=event.client_key_id,
+            created_at=event.created_at,
+            payload=SessionCompactionCompletedPayload.from_payload(event.payload),
+        )
+
+    @classmethod
+    def from_wire(cls, raw: dict[str, Any]) -> "SessionCompactionCompleted":
+        return cls.from_event(SessionEvent.from_wire(raw))
+
+
+# ---------------------------------------------------------------------------
 # JSON-RPC 2.0 envelopes for the session loop (`POST …/rpc`)
 #
 # The management routes (session open/close, events replay) stay plain REST;
@@ -331,7 +492,12 @@ class McpResponsePayload:
 # ---------------------------------------------------------------------------
 
 # The JSON-RPC methods the session loop understands.
-RPC_METHODS = ("session.sendMessage", "session.subscribe", "session.unsubscribe")
+RPC_METHODS = (
+    "session.sendMessage",
+    "session.subscribe",
+    "session.unsubscribe",
+    "session.compact",
+)
 
 
 @dataclass(slots=True)
@@ -377,7 +543,7 @@ class SendMessageResult:
 def describe_event(event: SessionEvent) -> str:
     """One-line human description of an event.
 
-    The ``match`` is exhaustive over all twelve members; the ``_`` arm hands the
+    The ``match`` is exhaustive over all twenty-eight members; the ``_`` arm hands the
     value to :func:`assert_never`, so a type checker flags any newly added
     ``EventType`` member that is not given a ``case`` here.
     """
@@ -386,6 +552,12 @@ def describe_event(event: SessionEvent) -> str:
         case EventType.CLIENT_MESSAGE_SEND:
             return "client sent a user turn"
         case EventType.SERVER_MESSAGE_SEND:
+            synthetic = event.payload.get("synthetic")
+            if synthetic == SYNTHETIC_COMPACTION_PREAMBLE:
+                return "server wrote the compaction preamble (synthetic)"
+            if synthetic is not None:
+                role = event.payload.get("role", "assistant")
+                return f"server wrote a synthetic {role} message ({synthetic})"
             return "server sent an assistant turn"
         case EventType.PROVIDER_REQUEST:
             return "request dispatched to the provider"

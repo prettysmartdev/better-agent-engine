@@ -54,9 +54,12 @@ harness machinery lives in `bae_py.harness`.
   receives the `tool_use` input and returns the result content.
 - **`Harness`** — register tools and hooks, then `connect()` opens a new session
   or `join(session_id)` attaches to an existing one as a second driver; both
-  return a `Session`.
+  return a `Session`. `Harness(config, compaction=...)` picks the session's
+  compaction mode at creation: `AutoCompaction(size)` or
+  `ClientCompaction(prompt=None)`.
 - **`Session`** — `send(message)` drives the loop to a final assistant turn,
-  `close()` ends the session, and `subscribe()` / `unsubscribe()` tap the live
+  `compact(prompt=None)` summarizes the history now and returns the typed
+  `SessionCompactionCompleted` record, `close()` ends the session, and `subscribe()` / `unsubscribe()` tap the live
   event stream out of band.
 - **`Hooks`** — `before_send`, `after_receive`, `before_tool_call`,
   `after_tool_call`, and `on_event` (the live event stream); raising from any
@@ -68,7 +71,7 @@ harness machinery lives in `bae_py.harness`.
 - **Errors** — `ApiError` (RFC 7807 slug), `ProvidersFailedError` (a `502`,
   carrying the session `events`), `RpcError`, `UnknownToolError`, `ToolError`,
   `HookError`, `TransportError`.
-- **Events** — `SessionEvent` is a discriminated union over all 27 event types;
+- **Events** — `SessionEvent` is a discriminated union over all 28 event types;
   `describe_event()` demonstrates the exhaustive match.
 
 ## Example

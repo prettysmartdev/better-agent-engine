@@ -419,14 +419,66 @@ The SDK handles all NDJSON framing internally. You never interact with raw
 JSON-RPC objects unless you are building a custom transport. See
 [Wire Protocol](../reference/01-wire-protocol.md) for the full specification.
 
-**`session.compact`** — the manual compaction trigger for `mode: "client"`
-sessions (see [Event Streaming — Compaction: auto vs. client
-mode](06-event-streaming.md#compaction-auto-vs-client-mode) and [Client API —
-`session.compact`](../reference/00-client-api.md#sessioncompact)) has no
-dedicated `Session` method in any of the three SDKs yet, unlike
-`sendMessage`/`subscribe`/the sandbox and subagent methods above. A harness
-that wants to drive `mode: "client"` compaction today issues that JSON-RPC
-call itself against `/rpc` using the session's own key. `mode: "auto"` needs
-no client-side call at all — the server compacts inline, and the SDK's
-`on_event` hook still sees the resulting `session.compaction.*` events like
-any other.
+### Compaction
+
+Pick the session's compaction mode when you create it. It is fixed at
+creation, so `join()` never sends it. `mode: "auto"` compacts on the server
+once the session reaches `size` tokens. `mode: "client"` compacts only when a
+driver calls `compact()`. Either way, the `on_event` hook sees the
+`session.compaction.*` events. `compact()` returns the
+`session.compaction.completed` event. It fails with an RPC error `-32020`
+while a paused turn is unresolved, or with `-32000 compaction failed: …` —
+see [Client API — `session.compact`](../reference/00-client-api.md#sessioncompact)
+for the full error set and [Event Streaming — Compaction: auto vs. client
+mode](06-event-streaming.md#compaction-auto-vs-client-mode) for when to use
+each mode.
+
+**Rust:**
+
+```rust
+use bae_rs::{CompactionConfig, Config, Harness};
+
+let mut session = Harness::new(config)
+    .with_compaction(CompactionConfig::client_with_prompt("Summarize focusing on open TODOs."))
+    // or: CompactionConfig::auto(128_000) / CompactionConfig::client()
+    .connect()
+    .await?;
+session.send("…").await?;
+let done = session.compact(None).await?;          // or Some("one-off prompt")
+println!("compacted {} messages → {}", done.payload.compacted_message_count, done.payload.summary_event_id);
+```
+
+**TypeScript:**
+
+```ts
+import { Config, Harness } from "@prettysmartdev/bae-ts";
+
+const harness = new Harness(config, {
+  compaction: { mode: "client", prompt: "Summarize focusing on open TODOs." },
+  // or { mode: "auto", size: 128000 } / { mode: "client" }
+});
+const session = await harness.connect();
+await session.send("…");
+const done = await session.compact(); // or session.compact("one-off prompt")
+console.log(done.payload.compacted_message_count, done.payload.summary_event_id);
+```
+
+**Python:**
+
+```python
+from bae_py import AutoCompaction, ClientCompaction, Config, Harness
+
+harness = Harness(config, compaction=ClientCompaction(prompt="Summarize focusing on open TODOs."))
+# or AutoCompaction(size=128_000) / ClientCompaction()
+session = await harness.connect()
+await session.send("…")
+done = await session.compact()  # or await session.compact("one-off prompt")
+print(done.payload.compacted_message_count, done.payload.summary_event_id)
+```
+
+Recognizing the preamble — the synthetic `server.message.send` a compaction
+writes just before its summary — in an `on_event` hook or in replayed events:
+
+- **Rust:** `ev.payload_as::<ServerMessagePayload>()?.is_compaction_preamble()`
+- **TypeScript:** `ev.event_type === "server.message.send" && ev.payload.synthetic === "compaction_preamble"`
+- **Python:** `ServerMessagePayload.from_payload(ev.payload).is_compaction_preamble`

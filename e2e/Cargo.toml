@@ -11,7 +11,18 @@ publish = false
 
 # This crate exists so that tests spanning *two* components have somewhere to
 # live that is downstream of both. Nothing here is a runtime dependency of
-# anything — everything is a dev-dependency, consumed only by `tests/`.
+# anything. The few [dependencies] back the shared test fixtures in src/lib.rs
+# (the mock model provider); everything else is a dev-dependency, consumed only
+# by `tests/`.
+[dependencies]
+# The mock model provider (`provider_mock`) the server is pointed at.
+axum = "0.8"
+serde_json = "1"
+# Async runtime for the mock and the tests. `process` spawns the real baesrv
+# binary, `net` reserves ephemeral ports, `sync` backs the receiver shutdown
+# channel.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "sync"] }
+
 [dev-dependencies]
 # The Rust client SDK under test. This crate depends on client-rust so that
 # `server/` does not have to: an end-to-end test that proves client and server
@@ -20,16 +31,9 @@ publish = false
 # standalone buildability (it also silently broke the Docker image builds,
 # since Cargo resolves dev-dependencies even for `cargo build --release`).
 bae-rs = { path = "../client-rust" }
-# Async runtime for the tests themselves. `process` spawns the real baesrv
-# binary, `net` reserves ephemeral loopback ports, `sync` backs the receiver
-# shutdown channel.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "sync"] }
 # HTTP client for the admin/client REST calls and the readiness poll. Pinned to
 # rustls to match the rest of the workspace (no OpenSSL anywhere).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
-# The in-test mock model provider the server is pointed at.
-axum = "0.8"
-serde_json = "1"
 # OTel client-side SDK bring-up: the test installs a real tracer provider and
 # W3C propagator on the client side, so the `traceparent` the SDK emits is the
 # shipped one rather than a header the test hand-wrote.

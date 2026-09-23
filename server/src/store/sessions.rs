@@ -333,15 +333,18 @@ pub fn insert_event(
 /// `tool.result` payloads are never pulled into memory — and rows are consumed
 /// one at a time from the SQLite cursor rather than collected wholesale.
 ///
-/// Each row becomes a provider-shaped `{role, content}` message: a
-/// `client.message.send` keeps its stored role (defaulting to `user`), a
-/// `server.message.send` is always `assistant`.
+/// Each row becomes a provider-shaped `{role, content}` message whose role is
+/// taken from the payload: a `client.message.send` defaults to `user`, a
+/// `server.message.send` to `assistant` — but a server message may carry
+/// `role: "user"` (the compaction preamble, or the synthetic tool results that
+/// retire an abandoned pause), and it replays as a `user` message. Any other
+/// payload field (e.g. `synthetic`) never reaches the provider.
 pub fn stream_history(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<Value>> {
     // Scope the message scan to the most recent *completed* compaction, if any.
-    // The lower bound is the summary message's own rowid (not the completed
-    // marker's), because the synthetic summary `server.message.send` is inserted
-    // just *before* the completed marker — so the first returned message is the
-    // compacted summary itself, followed by everything sent after it.
+    // The lower bound is the compaction preamble's own rowid (not the completed
+    // marker's): the preamble and the summary are inserted just *before* the
+    // completed marker, so replay starts `user(preamble) → assistant(summary)`
+    // followed by everything sent after it.
     let lower_bound = history_lower_bound(conn, session_id)?;
     let sql = "SELECT event_type, payload FROM session_events \
                WHERE session_id = ?1 \
@@ -356,24 +359,26 @@ pub fn stream_history(conn: &Connection, session_id: &str) -> rusqlite::Result<V
         let payload: String = row.get(1)?;
         let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
         let content = payload.get("content").cloned().unwrap_or(Value::Null);
-        let role = if event_type == EventType::ServerMessageSend.as_str() {
-            "assistant".to_string()
+        let default_role = if event_type == EventType::ServerMessageSend.as_str() {
+            "assistant"
         } else {
-            payload
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user")
-                .to_string()
+            "user"
         };
+        let role = payload
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or(default_role)
+            .to_string();
         history.push(serde_json::json!({ "role": role, "content": content }));
     }
     Ok(history)
 }
 
-/// The `tool_use` blocks of the session's most recent `server.message.send`
-/// (the paused assistant turn), in their original order, each retaining its
-/// `id`/`name`/`dispatch` fields. Empty when there is no such event or it
-/// carried no `tool_use` blocks.
+/// The `tool_use` blocks of the session's most recent **assistant**
+/// `server.message.send` (the paused assistant turn), in their original order,
+/// each retaining its `id`/`name`/`dispatch` fields. Server messages with
+/// `role: "user"` (synthetic ones such as the compaction preamble) are skipped.
+/// Empty when there is no such event or it carried no `tool_use` blocks.
 ///
 /// Used at mixed-turn resume to know exactly which `tool_use` ids the merged
 /// `user` turn must answer, and in what order, without loading full history.
@@ -385,6 +390,7 @@ pub fn last_assistant_tool_uses(
         .query_row(
             "SELECT payload FROM session_events \
              WHERE session_id = ?1 AND event_type = 'server.message.send' \
+               AND coalesce(json_extract(payload, '$.role'), 'assistant') = 'assistant' \
              ORDER BY rowid DESC LIMIT 1",
             params![session_id],
             |r| r.get::<_, String>(0),
@@ -424,32 +430,17 @@ pub fn rowid_of_event(
     .optional()
 }
 
-/// The rowid of the newest `session.compaction.completed` marker for a session,
-/// or `None` if the session has never completed a compaction. Keys strictly off
-/// the **completed** marker — a `session.compaction.started` without a matching
-/// completion (a failed attempt) is deliberately ignored, so history keeps
-/// scoping from the previous successful compaction (or session start).
-pub fn rowid_of_last_compaction(
-    conn: &Connection,
-    session_id: &str,
-) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        "SELECT rowid FROM session_events \
-         WHERE session_id = ?1 AND event_type = 'session.compaction.completed' \
-         ORDER BY rowid DESC LIMIT 1",
-        params![session_id],
-        |r| r.get::<_, i64>(0),
-    )
-    .optional()
-}
-
 /// Best-effort accumulated context token count for a session: the `input_tokens
-/// + output_tokens` recorded on the session's **newest** `provider.response`
-/// event's `usage` field (added by the engine). Returns `None` when there is no
-/// provider response yet, or the newest one has no usable `usage` (a failed
-/// response, `usage: null`, or a malformed/partial object) — it does **not**
-/// search backward for an older usable response. Used only for the informational
-/// `token_count` on a manually-triggered `session.compaction.started` event.
+/// + output_tokens` recorded on the `usage` field (added by the engine) of the
+/// session's newest **successful** (`ok: true`) `provider.response` that is not
+/// a compaction call's own response (`purpose: "compaction"`) — a failed
+/// attempt carries no usage, and a summary call's usage measures the old
+/// history plus the instruction, not the session's current context. Returns
+/// `None` when there is no such response yet, or the newest one has no usable
+/// `usage` (`usage: null`, or a malformed/partial object) — it does **not**
+/// search further back for an older usable response. Used only for the
+/// informational `token_count` on a manually-triggered
+/// `session.compaction.started` event.
 pub fn last_provider_token_count(
     conn: &Connection,
     session_id: &str,
@@ -458,6 +449,8 @@ pub fn last_provider_token_count(
         .query_row(
             "SELECT payload FROM session_events \
              WHERE session_id = ?1 AND event_type = 'provider.response' \
+               AND json_extract(payload, '$.ok') = 1 \
+               AND json_extract(payload, '$.purpose') IS NULL \
              ORDER BY rowid DESC LIMIT 1",
             params![session_id],
             |r| r.get::<_, String>(0),
@@ -481,13 +474,18 @@ pub fn last_provider_token_count(
 }
 
 /// The inclusive rowid lower bound for [`stream_history`]'s provider-facing
-/// message scan. Resolves the most recent `session.compaction.completed`
-/// marker's `payload.summary_event_id` to the summary message's own rowid.
+/// message scan, from the most recent `session.compaction.completed` marker:
 ///
-/// Falls back to `0` (full history) when there is no completed marker, its
-/// payload is malformed, the `summary_event_id` is missing/foreign to this
-/// session, or the referenced event is not a message event — never dropping
-/// context on a broken reference.
+/// 1. `payload.preamble_event_id` resolves in this session to a
+///    `server.message.send` → that rowid (replay starts at the preamble).
+/// 2. Else `payload.summary_event_id` resolves to a message event → that rowid
+///    (sessions compacted before the preamble existed; the Anthropic request
+///    normalizer keeps their assistant-first replay valid).
+/// 3. Else `0` (full history).
+///
+/// With no completed marker, a malformed payload, or a missing/foreign
+/// reference the result is the full history — never dropping context on a
+/// broken reference.
 fn history_lower_bound(conn: &Connection, session_id: &str) -> rusqlite::Result<i64> {
     let payload: Option<String> = conn
         .query_row(
@@ -502,19 +500,27 @@ fn history_lower_bound(conn: &Connection, session_id: &str) -> rusqlite::Result<
         return Ok(0);
     };
     let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    // Resolve an id to its rowid and event type within this session.
+    let resolve = |id: &str| -> rusqlite::Result<Option<(i64, String)>> {
+        conn.query_row(
+            "SELECT rowid, event_type FROM session_events \
+             WHERE session_id = ?1 AND id = ?2",
+            params![session_id, id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+    };
+    if let Some(preamble_id) = payload.get("preamble_event_id").and_then(Value::as_str) {
+        if let Some((rowid, event_type)) = resolve(preamble_id)? {
+            if event_type == EventType::ServerMessageSend.as_str() {
+                return Ok(rowid);
+            }
+        }
+    }
     let Some(summary_id) = payload.get("summary_event_id").and_then(Value::as_str) else {
         return Ok(0);
     };
-    // Resolve the summary event and confirm it is a message row in this session.
-    let resolved: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT rowid, event_type FROM session_events \
-             WHERE session_id = ?1 AND id = ?2",
-            params![session_id, summary_id],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    match resolved {
+    match resolve(summary_id)? {
         Some((rowid, event_type))
             if event_type == EventType::ClientMessageSend.as_str()
                 || event_type == EventType::ServerMessageSend.as_str() =>
@@ -523,6 +529,65 @@ fn history_lower_bound(conn: &Connection, session_id: &str) -> rusqlite::Result<
         }
         _ => Ok(0),
     }
+}
+
+/// The three records a successful compaction commits, in insertion order.
+#[derive(Debug, Clone)]
+pub struct CompactionRecords {
+    pub preamble: EventRecord,
+    pub summary: EventRecord,
+    pub completed: EventRecord,
+}
+
+/// Insert a successful compaction's preamble, summary, and
+/// `session.compaction.completed` marker in **one** `IMMEDIATE` transaction, in
+/// that order. `completed` is the marker's payload minus the two pointers;
+/// `preamble_event_id` and `summary_event_id` are filled in here from the rows
+/// just inserted. On any error the transaction rolls back, so no orphan
+/// preamble or summary is ever visible to [`stream_history`]. The caller
+/// publishes the returned records only after this returns `Ok` (i.e. after
+/// commit).
+pub fn insert_compaction_records(
+    conn: &Connection,
+    session_id: &str,
+    client_key_id: Option<&str>,
+    preamble: &Value,
+    summary: &Value,
+    completed: &Value,
+) -> rusqlite::Result<CompactionRecords> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let preamble = insert_event(
+        &tx,
+        session_id,
+        client_key_id,
+        EventType::ServerMessageSend,
+        preamble,
+    )?;
+    let summary = insert_event(
+        &tx,
+        session_id,
+        client_key_id,
+        EventType::ServerMessageSend,
+        summary,
+    )?;
+    let mut completed = completed.clone();
+    if let Some(obj) = completed.as_object_mut() {
+        obj.insert("preamble_event_id".into(), Value::from(preamble.id.clone()));
+        obj.insert("summary_event_id".into(), Value::from(summary.id.clone()));
+    }
+    let completed = insert_event(
+        &tx,
+        session_id,
+        client_key_id,
+        EventType::SessionCompactionCompleted,
+        &completed,
+    )?;
+    tx.commit()?;
+    Ok(CompactionRecords {
+        preamble,
+        summary,
+        completed,
+    })
 }
 
 /// One page of a session's events, ordered by insertion (rowid), for replay.
@@ -600,12 +665,17 @@ mod tests {
         event_type: EventType,
         content: &str,
     ) -> EventRecord {
+        let role = if event_type == EventType::ServerMessageSend {
+            "assistant"
+        } else {
+            "user"
+        };
         insert_event(
             c,
             session_id,
             Some("key_a"),
             event_type,
-            &json!({ "role": "user", "content": content }),
+            &json!({ "role": role, "content": content }),
         )
         .unwrap()
     }
@@ -624,59 +694,6 @@ mod tests {
             }),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn rowid_of_last_compaction_is_none_without_completed_event() {
-        let store = Store::open_in_memory().unwrap();
-        store.with_conn(|c| {
-            let session = test_session(c);
-            assert_eq!(rowid_of_last_compaction(c, &session.id).unwrap(), None);
-
-            insert_event(
-                c,
-                &session.id,
-                Some("key_a"),
-                EventType::SessionCompactionStarted,
-                &json!({ "trigger": "client", "reason": "manual" }),
-            )
-            .unwrap();
-            assert_eq!(
-                rowid_of_last_compaction(c, &session.id).unwrap(),
-                None,
-                "a failed/started-only attempt must not move the history boundary"
-            );
-        });
-    }
-
-    #[test]
-    fn rowid_of_last_compaction_returns_the_newest_completed_marker() {
-        let store = Store::open_in_memory().unwrap();
-        store.with_conn(|c| {
-            let session = test_session(c);
-            let first = completed(c, &session.id, "summary-1");
-            assert_eq!(
-                rowid_of_last_compaction(c, &session.id).unwrap(),
-                rowid_of_event(c, &session.id, &first.id).unwrap()
-            );
-
-            // Started events are intentionally irrelevant, even when they are
-            // newer than the last successful completion.
-            insert_event(
-                c,
-                &session.id,
-                Some("key_a"),
-                EventType::SessionCompactionStarted,
-                &json!({ "trigger": "client", "reason": "manual" }),
-            )
-            .unwrap();
-            let second = completed(c, &session.id, "summary-2");
-            assert_eq!(
-                rowid_of_last_compaction(c, &session.id).unwrap(),
-                rowid_of_event(c, &session.id, &second.id).unwrap()
-            );
-            assert_ne!(first.id, second.id);
-        });
     }
 
     #[test]
@@ -737,6 +754,201 @@ mod tests {
                     json!({ "role": "user", "content": "after-2" }),
                 ]
             );
+        });
+    }
+
+    /// A `server.message.send` carrying `role: "user"` (the compaction
+    /// preamble) replays as a `user` message, and history starts at the
+    /// preamble named by the newest completed marker.
+    #[test]
+    fn stream_history_starts_at_the_compaction_preamble() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            message(c, &session.id, EventType::ClientMessageSend, "before");
+            message(c, &session.id, EventType::ServerMessageSend, "old answer");
+            insert_compaction_records(
+                c,
+                &session.id,
+                Some("key_a"),
+                &json!({ "role": "user", "content": "preamble", "synthetic": "compaction_preamble" }),
+                &json!({ "role": "assistant", "content": "summary" }),
+                &json!({ "compacted_message_count": 2 }),
+            )
+            .unwrap();
+            message(c, &session.id, EventType::ClientMessageSend, "after");
+
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![
+                    json!({ "role": "user", "content": "preamble" }),
+                    json!({ "role": "assistant", "content": "summary" }),
+                    json!({ "role": "user", "content": "after" }),
+                ]
+            );
+        });
+    }
+
+    /// A preamble reference that does not resolve falls back to the summary
+    /// bound; a summary reference that does not resolve either means the
+    /// full history.
+    #[test]
+    fn history_bound_falls_back_from_preamble_to_summary_to_full() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            message(c, &session.id, EventType::ClientMessageSend, "before");
+            let summary = message(c, &session.id, EventType::ServerMessageSend, "summary");
+            insert_event(
+                c,
+                &session.id,
+                Some("key_a"),
+                EventType::SessionCompactionCompleted,
+                &json!({ "preamble_event_id": "evt_missing", "summary_event_id": summary.id }),
+            )
+            .unwrap();
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![json!({ "role": "assistant", "content": "summary" })]
+            );
+            insert_event(
+                c,
+                &session.id,
+                Some("key_a"),
+                EventType::SessionCompactionCompleted,
+                &json!({ "preamble_event_id": "evt_missing", "summary_event_id": "evt_gone" }),
+            )
+            .unwrap();
+            assert_eq!(stream_history(c, &session.id).unwrap().len(), 2);
+        });
+    }
+
+    /// `stream_history` takes `role` from the payload and defaults it by event
+    /// type when absent; `synthetic` never reaches the replayed message.
+    #[test]
+    fn stream_history_defaults_role_by_event_type_and_drops_synthetic() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            for (event_type, payload) in [
+                (EventType::ClientMessageSend, json!({ "content": "q" })),
+                (EventType::ServerMessageSend, json!({ "content": "a" })),
+                (
+                    EventType::ServerMessageSend,
+                    json!({ "role": "user", "content": "u", "synthetic": "abandoned_tool_results" }),
+                ),
+            ] {
+                insert_event(c, &session.id, Some("key_a"), event_type, &payload).unwrap();
+            }
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![
+                    json!({ "role": "user", "content": "q" }),
+                    json!({ "role": "assistant", "content": "a" }),
+                    json!({ "role": "user", "content": "u" }),
+                ]
+            );
+        });
+    }
+
+    /// The token count behind the auto trigger and the manual `started` event
+    /// comes from the newest *successful, non-compaction* provider response.
+    #[test]
+    fn last_provider_token_count_skips_failed_and_compaction_responses() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            let response = |payload: Value| {
+                insert_event(
+                    c,
+                    &session.id,
+                    Some("key_a"),
+                    EventType::ProviderResponse,
+                    &payload,
+                )
+                .unwrap();
+            };
+            assert_eq!(last_provider_token_count(c, &session.id).unwrap(), None);
+            response(json!({ "ok": true, "usage": { "input_tokens": 900, "output_tokens": 200 } }));
+            response(json!({ "ok": false, "usage": { "input_tokens": 7, "output_tokens": 7 } }));
+            response(json!({ "ok": true, "purpose": "compaction",
+                             "usage": { "input_tokens": 50000, "output_tokens": 100 } }));
+            response(json!({ "ok": false, "purpose": "compaction" }));
+            assert_eq!(
+                last_provider_token_count(c, &session.id).unwrap(),
+                Some(1100)
+            );
+            response(json!({ "ok": true }));
+            assert_eq!(
+                last_provider_token_count(c, &session.id).unwrap(),
+                None,
+                "the newest ordinary response carried no usage"
+            );
+        });
+    }
+
+    /// A session row written before migration 0009 (NULL `compaction`) and a
+    /// hand-seeded malformed value both read back as `None`.
+    #[test]
+    fn pre_0009_null_compaction_column_reads_as_none() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            assert!(get_session(c, &session.id)
+                .unwrap()
+                .unwrap()
+                .compaction
+                .is_some());
+            c.execute(
+                "UPDATE sessions SET compaction = NULL WHERE id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+            let read = get_session(c, &session.id).unwrap().unwrap();
+            assert!(read.compaction.is_none());
+            assert_eq!(read.id, session.id);
+            c.execute(
+                "UPDATE sessions SET compaction = 'not json' WHERE id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+            assert!(get_session(c, &session.id)
+                .unwrap()
+                .unwrap()
+                .compaction
+                .is_none());
+        });
+    }
+
+    /// A failure while inserting the completed marker rolls back the preamble
+    /// and summary written before it in the same transaction.
+    #[test]
+    fn insert_compaction_records_is_atomic() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            message(c, &session.id, EventType::ClientMessageSend, "before");
+            c.execute_batch(
+                "CREATE TEMP TRIGGER fail_completed BEFORE INSERT ON session_events \
+                 WHEN NEW.event_type = 'session.compaction.completed' \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+            let err = insert_compaction_records(
+                c,
+                &session.id,
+                Some("key_a"),
+                &json!({ "role": "user", "content": "preamble" }),
+                &json!({ "role": "assistant", "content": "summary" }),
+                &json!({}),
+            );
+            assert!(err.is_err());
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![json!({ "role": "user", "content": "before" })],
+                "no orphan preamble or summary survives the rollback"
+            );
+            assert!(c.is_autocommit(), "the transaction was closed");
         });
     }
 

@@ -302,7 +302,10 @@ pub async fn call(
     // (`dispatch`, `caller`) from replayed `tool_use` blocks before the request
     // is built. These are persisted on `server.message.send` blocks and thus
     // replayed by `stream_history`, but the LLM must never see them — an
-    // unknown field can trip a provider's strict-schema validation.
+    // unknown field can trip a provider's strict-schema validation. The engine
+    // already passes [`prepare_messages`] output (so the logged
+    // `provider.request` equals what is sent); this re-strip is idempotent and
+    // only guards any other caller.
     let messages = strip_nonstandard_block_fields(messages);
     let messages = &messages;
 
@@ -359,6 +362,94 @@ pub async fn call(
             status: status.as_u16(),
             body: text,
         })
+    }
+}
+
+/// Prepare canonical `messages` for `kind`: strip baesrv's non-standard block
+/// fields (`dispatch`, `caller`) and, for Anthropic, enforce the Messages API
+/// sequence rules. Returns the exact message list to send plus a record of what
+/// the normalizer changed (`None` when it changed nothing — stripping alone is
+/// not a "change"). Pure.
+///
+/// Anthropic rejects a first message that is not `user` and consecutive
+/// same-role messages. The engine's persisted history is already a valid
+/// sequence (a compaction writes a `user` preamble before its `assistant`
+/// summary); this is a safety net for anything that is not — for example a
+/// session compacted before the preamble existed, whose history starts at the
+/// assistant summary. Rules, in order:
+///
+/// 1. A non-empty list whose first message is not `user` gets a `user`
+///    message carrying [`super::session::COMPACTION_PREAMBLE_TEXT`] prepended
+///    (the same constant, so prompt-cache prefixes stay stable) →
+///    `"prepended_user": true`.
+/// 2. Each run of consecutive same-role messages is merged into one message
+///    whose `content` is the concatenation of every member's content array, in
+///    order (a string `content` becomes one `text` block first). Blocks are
+///    never reordered, so `tool_use`/`tool_result` pairing is preserved →
+///    `"merged": [[i, j, …], …]`, the input indices (after rule 1) folded into
+///    each output message.
+///
+/// OpenAI's Chat Completions translation accepts either shape, so for
+/// [`ProviderKind::OpenAi`] this only strips and never reports a change.
+pub fn prepare_messages(kind: ProviderKind, messages: &Value) -> (Value, Option<Value>) {
+    let stripped = strip_nonstandard_block_fields(messages);
+    if kind != ProviderKind::Anthropic {
+        return (stripped, None);
+    }
+    let Value::Array(list) = stripped else {
+        return (stripped, None);
+    };
+    let role_of = |m: &Value| m.get("role").and_then(Value::as_str).map(str::to_owned);
+
+    let mut input: Vec<Value> = Vec::with_capacity(list.len() + 1);
+    let mut record = serde_json::Map::new();
+    if list
+        .first()
+        .is_some_and(|m| role_of(m).as_deref() != Some("user"))
+    {
+        input.push(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": super::session::COMPACTION_PREAMBLE_TEXT }],
+        }));
+        record.insert("prepended_user".into(), Value::Bool(true));
+    }
+    input.extend(list);
+
+    let mut output: Vec<Value> = Vec::with_capacity(input.len());
+    let mut merged: Vec<Value> = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let role = role_of(&input[i]);
+        let mut j = i + 1;
+        while j < input.len() && role.is_some() && role_of(&input[j]) == role {
+            j += 1;
+        }
+        if j - i == 1 {
+            output.push(input[i].clone());
+        } else {
+            let blocks: Vec<Value> = input[i..j]
+                .iter()
+                .flat_map(|m| content_blocks(m.get("content")))
+                .collect();
+            output.push(json!({ "role": role, "content": blocks }));
+            merged.push(json!((i..j).collect::<Vec<_>>()));
+        }
+        i = j;
+    }
+    if !merged.is_empty() {
+        record.insert("merged".into(), Value::Array(merged));
+    }
+    let change = (!record.is_empty()).then_some(Value::Object(record));
+    (Value::Array(output), change)
+}
+
+/// A message `content` as a list of blocks, for merging: an array verbatim, a
+/// string as one `text` block, anything else (absent/null) as no blocks.
+fn content_blocks(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::Array(blocks)) => blocks.clone(),
+        Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+        _ => Vec::new(),
     }
 }
 
@@ -596,20 +687,47 @@ fn from_openai_response(raw: &Value) -> Result<Value, String> {
 
 /// Returns `(input_tokens, output_tokens)` from a raw provider response.
 ///
-/// Anthropic reads `usage.input_tokens` / `usage.output_tokens`.
-/// OpenAI reads `usage.prompt_tokens` / `usage.completion_tokens`.
+/// Anthropic reads `usage.input_tokens` / `usage.output_tokens`, and adds
+/// `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens` when
+/// present: with prompt caching Anthropic's `input_tokens` counts only the
+/// uncached remainder, so the cache-inclusive sum is the real context size.
+/// OpenAI reads `usage.prompt_tokens` / `usage.completion_tokens` (its
+/// `prompt_tokens` already includes cached tokens).
 /// Missing or partial/malformed usage returns `None`.
 pub fn usage_tokens(provider: ProviderKind, raw: &Value) -> Option<(u64, u64)> {
     let usage = raw.get("usage")?;
-    let (input_field, output_field) = match provider {
-        ProviderKind::Anthropic => ("input_tokens", "output_tokens"),
-        ProviderKind::OpenAi => ("prompt_tokens", "completion_tokens"),
-    };
+    match provider {
+        ProviderKind::Anthropic => {
+            let cached = |field: &str| usage.get(field).and_then(Value::as_u64).unwrap_or(0);
+            let input = usage
+                .get("input_tokens")?
+                .as_u64()?
+                .saturating_add(cached("cache_read_input_tokens"))
+                .saturating_add(cached("cache_creation_input_tokens"));
+            Some((input, usage.get("output_tokens")?.as_u64()?))
+        }
+        ProviderKind::OpenAi => Some((
+            usage.get("prompt_tokens")?.as_u64()?,
+            usage.get("completion_tokens")?.as_u64()?,
+        )),
+    }
+}
 
-    Some((
-        usage.get(input_field)?.as_u64()?,
-        usage.get(output_field)?.as_u64()?,
-    ))
+/// Why a successful (2xx) response's output was cut off by the output budget,
+/// or `None` when it finished normally: Anthropic `stop_reason: "max_tokens"`
+/// → `"stop_reason max_tokens"`; OpenAI `choices[0].finish_reason: "length"` →
+/// `"finish_reason length"`. Read off the raw wire body.
+pub fn truncation_reason(provider: ProviderKind, raw: &Value) -> Option<&'static str> {
+    match provider {
+        ProviderKind::Anthropic => (raw.get("stop_reason").and_then(Value::as_str)
+            == Some("max_tokens"))
+        .then_some("stop_reason max_tokens"),
+        ProviderKind::OpenAi => (raw
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            == Some("length"))
+        .then_some("finish_reason length"),
+    }
 }
 
 /// reqwest errors can embed the request URL; strip it defensively so a resolved
@@ -951,6 +1069,125 @@ mod tests {
         assert_eq!(
             usage_tokens(ProviderKind::Anthropic, &raw),
             Some((1200, 300))
+        );
+    }
+
+    #[test]
+    fn usage_tokens_includes_anthropic_cache_tokens() {
+        let raw = json!({
+            "usage": { "input_tokens": 10, "output_tokens": 5,
+                       "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 200 },
+        });
+        assert_eq!(usage_tokens(ProviderKind::Anthropic, &raw), Some((1210, 5)));
+    }
+
+    // -- prepare_messages ------------------------------------------------------
+
+    #[test]
+    fn prepare_messages_leaves_a_valid_anthropic_sequence_unchanged() {
+        let messages = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [{ "type": "text", "text": "yo" }] },
+            { "role": "user", "content": "again" },
+        ]);
+        let (out, change) = prepare_messages(ProviderKind::Anthropic, &messages);
+        assert_eq!(out, messages);
+        assert_eq!(change, None);
+    }
+
+    #[test]
+    fn prepare_messages_prepends_user_and_merges_same_role_runs() {
+        let messages = json!([
+            { "role": "assistant", "content": [{ "type": "text", "text": "SUMMARY" }] },
+            { "role": "user", "content": "a" },
+            { "role": "user", "content": [{ "type": "text", "text": "b" }] },
+        ]);
+        let (out, change) = prepare_messages(ProviderKind::Anthropic, &messages);
+        assert_eq!(
+            change,
+            Some(json!({ "prepended_user": true, "merged": [[2, 3]] }))
+        );
+        assert_eq!(
+            out,
+            json!([
+                { "role": "user", "content": [{ "type": "text",
+                  "text": crate::engine::session::COMPACTION_PREAMBLE_TEXT }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "SUMMARY" }] },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "a" }, { "type": "text", "text": "b" } ] },
+            ])
+        );
+    }
+
+    /// Merging same-role runs keeps block order within and across the run, so
+    /// every `tool_use` stays in the assistant turn immediately before the
+    /// user turn carrying its `tool_result` — pairing survives normalization.
+    #[test]
+    fn prepare_messages_merge_preserves_tool_use_tool_result_pairing() {
+        let messages = json!([
+            { "role": "user", "content": "go" },
+            { "role": "assistant", "content": [{ "type": "text", "text": "calling" }] },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "t1", "name": "a", "input": {}, "dispatch": "client" },
+                { "type": "tool_use", "id": "t2", "name": "b", "input": {} } ] },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": "r1" } ] },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t2", "content": "r2" } ] },
+            { "role": "user", "content": "and then" },
+        ]);
+        let (out, change) = prepare_messages(ProviderKind::Anthropic, &messages);
+        assert_eq!(change, Some(json!({ "merged": [[1, 2], [3, 4, 5]] })));
+        assert_eq!(
+            out,
+            json!([
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "calling" },
+                    { "type": "tool_use", "id": "t1", "name": "a", "input": {} },
+                    { "type": "tool_use", "id": "t2", "name": "b", "input": {} } ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": "r1" },
+                    { "type": "tool_result", "tool_use_id": "t2", "content": "r2" },
+                    { "type": "text", "text": "and then" } ] },
+            ])
+        );
+    }
+
+    #[test]
+    fn prepare_messages_openai_only_strips() {
+        let messages = json!([
+            { "role": "assistant", "content": [{ "type": "tool_use", "id": "t", "name": "n",
+              "input": {}, "dispatch": "client" }] },
+            { "role": "assistant", "content": "x" },
+        ]);
+        let (out, change) = prepare_messages(ProviderKind::OpenAi, &messages);
+        assert_eq!(change, None);
+        assert_eq!(out, strip_nonstandard_block_fields(&messages));
+    }
+
+    #[test]
+    fn truncation_reason_per_provider() {
+        assert_eq!(
+            truncation_reason(
+                ProviderKind::Anthropic,
+                &json!({ "stop_reason": "max_tokens" })
+            ),
+            Some("stop_reason max_tokens")
+        );
+        assert_eq!(
+            truncation_reason(
+                ProviderKind::Anthropic,
+                &json!({ "stop_reason": "end_turn" })
+            ),
+            None
+        );
+        assert_eq!(
+            truncation_reason(
+                ProviderKind::OpenAi,
+                &json!({ "choices": [{ "finish_reason": "length" }] })
+            ),
+            Some("finish_reason length")
         );
     }
 

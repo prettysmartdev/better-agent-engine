@@ -64,6 +64,33 @@ The server's final assistant turn for this iteration of the loop.
 `tool_use` block to the client, this event is still emitted with that
 `tool_use` content so the full round-trip is visible in the event log.
 
+**`role`** is `"assistant"` for every ordinary turn reply. It is `"user"` only
+for the two kinds of **synthetic** server-written message below — a
+`server.message.send` event is the only place a `"user"`-role message can
+come from the server itself rather than the client.
+
+**`synthetic`** is an optional string present only on those server-written
+`"user"`-role messages. Its value names why the message exists; it is never
+present on an ordinary reply, and it never reaches the provider (history
+replay sends only `{role, content}` — see [`provider.request`](#providerrequest)
+below). Two values exist today:
+
+- `"compaction_preamble"` — the fixed-text message a compaction writes
+  immediately before its summary, so the replayed history is a valid
+  `user → assistant` sequence. See
+  [`session.compaction.completed`](#sessioncompactioncompleted) below.
+- `"abandoned_tool_results"` — written when `session.compact` reclaims a
+  paused turn whose deadline has expired: one synthetic error `tool_result`
+  per client tool-use id that was never answered (`"Client tool call was
+  abandoned before returning a result."`, `is_error: true`), alongside any
+  server-dispatched results already stashed for that turn. This keeps the
+  persisted history a valid `assistant(tool_use) → user(tool_result…)`
+  transcript before the compaction call runs.
+
+A client or UI rendering a transcript should treat any `synthetic` message as
+system-generated, not as something a user typed — SDKs and MAX pass the field
+through untouched rather than dropping it.
+
 **Mixed and all-client turns:** when the turn contains at least one
 `dispatch:"client"` tool, every `tool_use` block in this event's `content` —
 client-, sandbox-, MCP-, and subagent-dispatched alike — carries a `dispatch` field, the
@@ -107,7 +134,8 @@ auth token is **never** included.
   "model":     "claude-sonnet-4-6",
   "max_tokens": 8096,
   "messages":  [ {"role": "user", "content": "…"}, … ],
-  "tools":     [ … ]
+  "tools":     [ … ],
+  "normalized": { "prepended_user": true, "merged": [[3, 4]] }
 }
 ```
 
@@ -116,6 +144,36 @@ auth token is **never** included.
 - `tools` includes both client-declared tools and any tools fetched from
   connected MCP servers.
 - Inserted **before** each provider attempt (primary + every fallback).
+- `messages` is always the **exact** canonical (Anthropic-shaped) list the
+  provider call is made with — baesrv's internal-only `dispatch`/`caller`
+  tool-use fields are stripped before this event is written, never after. For
+  `provider: "anthropic"` it is byte-for-byte the `messages` of the request
+  body. For `provider: "openai"` the wire body is the deterministic
+  translation of this list into Chat Completions shape (`tool_use` blocks
+  become `tool_calls`, `tool_result` blocks become `role: "tool"` messages, an
+  empty `tools` list is omitted), so replaying it against the OpenAI API
+  requires the same translation.
+- `normalized` is present only when the Anthropic normalizer actually changed
+  the message list before sending it (never for an OpenAI-kind provider,
+  which is unchanged from history as stored). It records what changed, so the
+  persisted log always shows the true provider input alongside a trace of any
+  server-side transformation:
+  - `"prepended_user": true` — the list's first message was not `"user"`, so
+    the server prepended a fixed `user` message (the same preamble text used
+    for compaction) to satisfy the Anthropic Messages API's "first message
+    must be `user`" rule. This only happens replaying a session compacted
+    before this normalizer existed (no `preamble_event_id` on its
+    `session.compaction.completed`).
+  - `"merged": [[i, j, …], …]` — one entry per run of consecutive same-role
+    messages that had to be folded into one message, each inner array listing
+    the 0-indexed positions (after any prepend) that were merged, in order.
+  - Either key may be present alone, or both together; the field is omitted
+    entirely when the normalizer changed nothing (stripping the internal
+    fields alone does not count as a change).
+- `purpose: "compaction"` is present (and equal to `"compaction"`) only on the
+  request that runs a compaction summary, so it can be told apart from an
+  ordinary turn's provider calls — see
+  [`session.compaction.completed`](#sessioncompactioncompleted) below.
 
 ---
 
@@ -155,14 +213,26 @@ The raw response received from the LLM provider (or the failure reason).
 - `error` is a human-readable failure reason.
 - Inserted **after** each attempt, success or failure.
 - `usage` is `{"input_tokens", "output_tokens"}`, read from the provider's own
-  raw response — Anthropic: `usage.input_tokens`/`usage.output_tokens`;
-  OpenAI: `usage.prompt_tokens`/`usage.completion_tokens`. It is `null` when
-  the provider omitted usage entirely or reported only one of the two fields
-  (a partial usage object is treated the same as no usage, never as a partial
-  number). Only **successful** responses carry a `usage` member at all —
-  failure payloads never gain one. This is the number `mode: auto` compares
-  against a session's configured compaction `size`; see
-  [`session.compaction.started`](#sessioncompactionstarted) below.
+  raw response. For Anthropic, `input_tokens` is the **cache-inclusive**
+  total: `usage.input_tokens + usage.cache_read_input_tokens +
+  usage.cache_creation_input_tokens` (either cache field defaults to 0 when
+  absent) — a request that hits the prompt cache still counts its full input
+  toward `mode: "auto"`'s threshold. For OpenAI, it's
+  `usage.prompt_tokens`/`usage.completion_tokens`, unchanged. `usage` is
+  `null` when the provider omitted it entirely or reported only one of the
+  two fields (a partial usage object is treated the same as no usage, never
+  as a partial number). Only **successful** responses carry a `usage` member
+  at all — failure payloads never gain one. This cache-inclusive total is the
+  number `mode: auto` compares against a session's configured compaction
+  `size`; see [`session.compaction.started`](#sessioncompactionstarted) below.
+- `purpose: "compaction"` is present on both the success and failure shape
+  above when this attempt belongs to a compaction call, not an ordinary turn
+  — see [`provider.request`](#providerrequest) above. A compaction response
+  carrying `purpose: "compaction"` is excluded from
+  `last_provider_token_count` (the figure a `trigger: "client"`
+  [`session.compaction.started`](#sessioncompactionstarted) reports), so a
+  manual compact's own call never feeds back into the next manual compact's
+  best-effort token estimate.
 
 #### Raw-logged vs. canonical-returned (OpenAI-kind providers)
 
@@ -758,6 +828,7 @@ non-fatal audit/visibility signal.
 | `"primary_provider_unavailable"` | `POST /api/v1/sessions` or `POST /api/v1/sessions/{id}/join` rejected the request because the profile's `primary_provider` name isn't in the `[providers]` registry. Payload: `{"profile_id": "pro_…", "primary_provider": "name"}`. Logged on this **separate audit session row** (`state='error'`) — the real session, if any, is untouched. See [Profiles](../profiles.md#fatal-primary--non-fatal-fallback). | n/a — no real session was created |
 | `"driver_turn_abandoned"` | A paused turn's owning driver didn't return with its continuation before `BAE_TURN_TIMEOUT` elapsed; the FIFO gate was released to the next queued driver. Payload: `{"owner_client_key_id": "key_…"}` (also the event's `client_key_id` column). | **no** — the session stays `open`; other drivers are unaffected |
 | `"tool_result_merge_invalid"` | A paused-turn continuation had a non-user role or did not answer exactly the assistant turn's tool-use ids (missing, duplicate, or unexpected result). Payload includes a human-readable `detail`. | yes — prevents incomplete durable tool history from being replayed upstream |
+| `"compaction_store_failed"` | An automatic compaction attempt that ran after a completed turn failed while writing its record (a store error; its transaction rolled back, so the history is unchanged). The turn's own result is still returned normally, and the attempt backs off exactly like a failed summary (see the auto-compaction backoff). Payload includes a human-readable `detail`. | **no** — the session stays `open` |
 
 Note: `"provider_call_failed"` is recorded once when the primary fails but
 a fallback attempt follows. If a fallback succeeds, the session continues
@@ -809,29 +880,59 @@ turn's reported usage crosses the configured `size`) or explicitly via the
 }
 ```
 
+**Auto trigger, retried after a prior auto attempt failed:**
+
+```json
+{
+  "trigger": "auto",
+  "reason": "retry_after_failure",
+  "token_count": 140010,
+  "threshold_tokens": 128000
+}
+```
+
 - `trigger` is `"auto"` or `"client"`.
-- `reason` is `"token_threshold"` for an auto trigger, `"manual"` for a
-  `session.compact` call — including a manual call on a session configured
-  for `mode: "auto"`.
+- `reason` is `"manual"` for any `session.compact` call — including one on a
+  session configured for `mode: "auto"` — and, for an auto trigger, either
+  `"token_threshold"` (the ordinary case) or `"retry_after_failure"`. The
+  latter is emitted only for the first **automatic** attempt after a
+  previous automatic attempt failed, once the backoff below has been
+  satisfied; it never appears with `trigger: "client"` — a manual compact
+  always ignores the backoff.
 - `token_count`: for `trigger: "auto"`, the just-completed turn's
-  `input_tokens + output_tokens` that crossed the threshold. For
-  `trigger: "client"`, a **best-effort** figure read from the session's most
-  recently persisted `provider.response` event's `usage`, or `null` if that
-  event has no usage or the session has made no provider calls yet. This
-  never scans further back than that single newest response.
+  `input_tokens + output_tokens` (cache-inclusive for Anthropic, see
+  [`provider.response`](#providerresponse) above) that crossed the
+  threshold. For `trigger: "client"`, a **best-effort** figure read from the
+  session's most recently persisted `provider.response` event's `usage`
+  (excluding a compaction call's own response, `purpose: "compaction"`), or
+  `null` if that event has no usage or the session has made no provider
+  calls yet. This never scans further back than that single newest response.
 - `threshold_tokens` is the session's configured `size` for an auto trigger;
   always `null` for a manual trigger, since no auto config governs a
   `session.compact` call.
+
+**Auto-compaction backoff (`reason: "retry_after_failure"`):** after an
+automatic attempt fails, the server suppresses further automatic triggers for
+that session until *both* of the following hold: at least one more turn has
+completed, and a later trigger's `token_count` exceeds the failed attempt's
+`token_count`. A successful automatic (or manual) compaction clears this
+state; another automatic failure re-arms it at the new token count. This
+state lives in server memory only — it is lost on restart, which simply means
+the very next crossing after a restart retries immediately rather than
+waiting out the backoff. A manual `session.compact` is never subject to it,
+and a *successful* manual compact also clears it.
 
 ---
 
 ### `session.compaction.completed`
 
 Emitted when the compaction provider call finishes and the compacted summary
-has been recorded as a synthetic `server.message.send` event.
+has been recorded — preceded by its own synthetic preamble — as two
+`server.message.send` events.
 
 ```json
 {
+  "preamble_event_id": "evt_…",
   "summary_event_id": "evt_…",
   "compacted_message_count": 17,
   "input_tokens": 42100,
@@ -839,30 +940,77 @@ has been recorded as a synthetic `server.message.send` event.
 }
 ```
 
+- `preamble_event_id` — the id of the `server.message.send` event written
+  immediately before the summary: a fixed-text, `role: "user"` message
+  (`synthetic: "compaction_preamble"`, see [`server.message.send`](#servermessagesend)
+  above) that makes the replayed history start `user(preamble) →
+  assistant(summary) → …` — a sequence every provider accepts, unlike
+  `assistant(summary) → …` on its own. It is **always present** on an event
+  written by this version of the server. It is **absent** (omitted, or
+  `null` depending on SDK type) only on a `session.compaction.completed`
+  event written before this field existed; see "Compatibility" below.
 - `summary_event_id` — the id of the `server.message.send` event immediately
-  preceding this one, holding the compacted summary text itself. The summary
+  after the preamble, holding the compacted summary text itself. The summary
   text is **not** duplicated into this payload.
 - `compacted_message_count` — the number of effective history messages that
   were summarized (the length of the pre-compaction history the server built
   the compaction request from); it excludes both the appended compaction
-  instruction and the produced summary.
+  instruction and the produced preamble and summary. After a prior
+  compaction, that history already starts with that compaction's own
+  preamble — there is no special-casing for a second or later compaction.
 - `input_tokens` / `summary_tokens` — the compaction call's **own**
   provider-reported usage: `input_tokens` is that request's input usage
   (necessarily including the appended compaction instruction — the server has
   no way to subtract it out and does not attempt to), `summary_tokens` is the
   summary's `output_tokens`.
-- All four fields are always present. `input_tokens` and `summary_tokens` are
-  `null` when a provider returned a valid summary without usage accounting;
-  the summary is still committed, because missing metrics must not discard a
-  completed model result. If the compaction's provider call fails, no summary
-  message and no `session.compaction.completed` event are written at all — only
-  the `session.compaction.started` event from the attempt remains as an audit
-  trail. The session remains compactable on the next attempt.
+- `input_tokens` and `summary_tokens` are `null` when a provider returned a
+  valid summary without usage accounting; the summary is still committed,
+  because missing metrics must not discard a completed model result.
+
+**Failure:** if the compaction's provider call fails outright (every
+provider/fallback exhausted, or the primary provider's config doesn't
+resolve), or the call succeeds but the response is unusable — truncated by
+the provider's own output-token limit (`stop_reason: "max_tokens"` /
+`finish_reason: "length"`) or has no non-whitespace text — the compaction is
+treated as **failed**: no preamble, no summary, and no
+`session.compaction.completed` event are written at all. Only the
+`session.compaction.started` event (and the attempt's `provider.request`/
+`provider.response` pair(s)) remain as an audit trail. The session's history
+is unchanged and it remains compactable on the next attempt. A truncated or
+empty response still logs its `provider.response` with `ok: true` (it was a
+successful HTTP call) — the failure is a budget/content problem, not a
+provider outage, so no further fallback is attempted for that call. See
+[`session.compact`](00-client-api.md#sessioncompact) for the exact JSON-RPC
+error each of these produces on a manual call, and [`session.compaction.started`](#sessioncompactionstarted)
+above for the backoff a **failed automatic** attempt puts on later automatic
+triggers.
+
+The compaction call is given its own output-token budget rather than the
+profile's ordinary turn `max_tokens`: the larger of the profile's configured
+value and 4096.
+
+**Atomicity:** the preamble, summary, and `completed` event are inserted in
+one database transaction and broadcast to live watchers only after it
+commits — a store error between them can never leave an orphaned preamble or
+summary for a later `stream_history` call to pick up.
+
+**Compatibility:** a session compacted before `preamble_event_id` existed has
+a `session.compaction.completed` event with no such field. `history_lower_bound`
+falls back, in order: `preamble_event_id` if present and it resolves to a
+`server.message.send` row; else `summary_event_id` if present and it resolves
+to a message row (the pre-change case — the Anthropic normalizer, see
+[`provider.request`](#providerrequest) above, then repairs the
+`assistant`-first sequence on the wire and records what it changed); else the
+full history, so a broken reference never loses context.
 
 **Effect on subsequent turns:** starting with the next `session.sendMessage`
 or `session.compact` call, the history sent to the **model** begins at this
-event's referenced summary message, followed by every message recorded after
-it — the pre-compaction messages are no longer sent upstream. This changes
+event's referenced preamble message (so the sequence starts `user(preamble) →
+assistant(summary) → …`), followed by every message recorded after it — the
+pre-compaction messages are no longer sent upstream. A session with no
+messages after the boundary yet (compaction as the most recent event) simply
+replays as `user(preamble) → assistant(summary)`; a valid sequence on its
+own. This changes
 only what is sent to the model. `GET /api/v1/sessions/{id}/events` (and any
 `session.subscribe` replay via `since_event_id`) always returns the complete,
 unmodified append-only log, including every event before the compaction —
@@ -1074,12 +1222,28 @@ server.message.send                                 -- the turn's own reply, per
 session.compaction.started    (trigger: auto)
 provider.request               (compaction call: history + compaction instruction)
 provider.response      (ok: true)
-server.message.send            (compacted summary)
+server.message.send            (preamble, role: user, synthetic: compaction_preamble)
+server.message.send            (compacted summary, role: assistant)
 session.compaction.completed
+terminal result: {message, events}                  -- this turn's own terminal result;
+                                                      -- `events` ends with the full compaction
+                                                      -- record above, in this order
 ```
 
-The *next* turn's `provider.request` contains only the compacted summary plus
-whatever was recorded after it — never the pre-compaction messages.
+The preamble, the summary and `session.compaction.completed` are inserted in
+one transaction (see "Atomicity" above); `session.compaction.started` and the
+compaction's provider pair are ordinary autocommitted rows that survive a
+failed attempt as its audit trail. All of them are appended to this
+turn's own `result.events`, after that turn's own `server.message.send` —
+`result.events` is always the turn's complete log, in the order it happened,
+compaction included. This holds even when the automatic attempt **fails**:
+`result.events` still ends with that attempt's `session.compaction.started`
+and its `provider.request`/`provider.response` pair(s) (no summary, no
+`completed` — see "Failure" above).
+
+The *next* turn's `provider.request` contains only the preamble and the
+compacted summary plus whatever was recorded after them — never the
+pre-compaction messages.
 
 **Manual compaction (`session.compact` RPC call):**
 
@@ -1087,12 +1251,14 @@ whatever was recorded after it — never the pre-compaction messages.
 session.compact                                     -- session.compaction.started
 provider.request               (compaction call: history + compaction instruction)
 provider.response      (ok: true)
-server.message.send            (compacted summary)
+server.message.send            (preamble, role: user, synthetic: compaction_preamble)
+server.message.send            (compacted summary, role: assistant)
                                                      -- session.compaction.completed
 ```
 
 Unlike `session.sendMessage`, `session.compact` is not itself an
 `event_type` — it is the RPC call whose terminal result is the
 `session.compaction.completed` event. Every event above still streams to
-`session.subscribe` watchers exactly like any other event. See [Client API —
-`session.compact`](00-client-api.md#sessioncompact).
+`session.subscribe` watchers exactly like any other event, in this order,
+before the terminal `session.compaction.completed` frame. See [Client API —
+`session.compact`](00-client-api.md#sessioncompact) for its full error set.

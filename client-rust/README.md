@@ -54,9 +54,12 @@ session.close().await?;
 - **`Harness`** — register tools and hooks (builder-style `with_tool` /
   `with_hooks` or `register_tool`), then `connect()` opens a new session or
   `join(session_id)` attaches to an existing one as a second driver; both
-  return a `Session`.
+  return a `Session`. `with_compaction(CompactionConfig::auto(size))` or
+  `CompactionConfig::client()` / `client_with_prompt(..)` picks the session's
+  compaction mode at creation.
 - **`Session`** — `send(message)` drives the loop until a final (no-`tool_use`)
-  assistant turn, `close()` ends the session, and `subscribe()` /
+  assistant turn, `compact(prompt)` summarizes the history now and returns the
+  typed `SessionCompactionCompleted`, `close()` ends the session, and `subscribe()` /
   `unsubscribe()` tap the live event stream out of band.
 - **`Hooks`** — `before_send`, `after_receive`, `before_tool_call`,
   `after_tool_call`, and `on_event` (the live event stream). Each gets `&mut`
@@ -69,7 +72,7 @@ session.close().await?;
   `ProvidersFailed` (a `502`, carrying the session `events`), plus RPC, tool,
   hook, and transport failures.
 - **Events** — each live event arrives as an `EventView` whose `event_type` is
-  one of the closed 27-value set; the `on_event` hook receives every one.
+  one of the closed 28-value set; the `on_event` hook receives every one.
 
 ## Example
 

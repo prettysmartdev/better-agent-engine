@@ -1,0 +1,182 @@
+# Container-engine coverage that `test.yml` cannot give: `test.yml` runs every
+# component inside the dev image, where there is no Docker engine, so the
+# production image builds and the engine-gated suites never ran in CI.
+#
+#   image             `make image` + `make image-max` still build (WI 0018 B1 — a
+#                     stray path dev-dependency once broke both silently).
+#   engine-tests      baectl's gated engine suite plus one packaged API-container
+#                     round trip per SDK (Rust, TypeScript, Python) against a mock
+#                     provider (B11).
+#   quickstart-smoke  the three commands extracted from docs/guides/00-quickstart.md,
+#                     run verbatim with `--dev` against a mock provider (C7).
+#
+# No provider API key is used: the e2e mock stands in for the model, and the
+# baectl engine tests that need a real key skip themselves.
+#
+# Images are built with buildx + GitHub Actions layer caching, exactly like the
+# dev image in test.yml; each build step is the cached equivalent of the named
+# `make image*` target (same Dockerfile, context, and tag). The builder is not
+# made the default (`use: false`), so the `docker build` that `baectl build`
+# runs later uses the local engine and can see the loaded base images.
+name: engine
+
+on:
+  pull_request:
+    paths:
+      - "baectl/**"
+      - "server/**"
+      - "launchers/**"
+      - "max/**"
+      - "client-rust/**"
+      - "client-typescript/**"
+      - "client-python/**"
+      - "e2e/**"
+      - "docs/guides/00-quickstart.md"
+      - "docs/guides/developer/00-quickstart.md"
+      - "README.md"
+      - "Dockerfile*"
+      - ".dockerignore"
+      - "docker/**"
+      - "Makefile"
+      - ".github/workflows/engine.yml"
+  push:
+    branches: [main]
+    paths:
+      - "baectl/**"
+      - "server/**"
+      - "launchers/**"
+      - "max/**"
+      - "client-rust/**"
+      - "client-typescript/**"
+      - "client-python/**"
+      - "e2e/**"
+      - "docs/guides/00-quickstart.md"
+      - "docs/guides/developer/00-quickstart.md"
+      - "README.md"
+      - "Dockerfile*"
+      - ".dockerignore"
+      - "docker/**"
+      - "Makefile"
+      - ".github/workflows/engine.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: engine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: image · image-max
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          use: false
+
+      # make image
+      - name: Build server image (Dockerfile)
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: Dockerfile
+          tags: better-agent-engine:latest
+          load: false
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+
+      # make image-max
+      - name: Build max image (Dockerfile.max)
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: Dockerfile.max
+          tags: better-agent-engine:max
+          load: false
+          cache-from: type=gha,scope=image-max
+          cache-to: type=gha,scope=image-max,mode=max
+
+  engine-tests:
+    name: engine tests (per-SDK containers)
+    needs: image
+    runs-on: ubuntu-latest
+    env:
+      BAECTL_HARNESS_ENGINE_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          use: false
+
+      # make image (warm from the `image` job's cache)
+      - name: Load server image
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: Dockerfile
+          tags: better-agent-engine:latest
+          load: true
+          cache-from: type=gha,scope=image
+
+      # make image-launcher-api
+      - name: Load API launcher base image
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: Dockerfile.launcher-api
+          tags: better-agent-engine:launcher-api
+          load: true
+          cache-from: type=gha,scope=launcher-api
+          cache-to: type=gha,scope=launcher-api,mode=max
+
+      - name: Build host baectl
+        run: make build-baectl
+
+      # Key-gated tests skip (no ANTHROPIC_API_KEY); the no-host-toolchain
+      # generated container build runs.
+      - name: baectl engine suite
+        run: cargo test --manifest-path baectl/Cargo.toml --test harness_engine -- --test-threads=1
+
+      - name: Per-SDK API container round trips (mock provider)
+        run: make -C e2e test-engine
+
+  quickstart-smoke:
+    name: quickstart smoke (--dev)
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          use: false
+
+      # make image (warm from the `image` job's cache)
+      - name: Load server image
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: Dockerfile
+          tags: better-agent-engine:latest
+          load: true
+          cache-from: type=gha,scope=image
+
+      - name: Build host baectl
+        run: make build-baectl
+
+      # Sets BAECTL_HARNESS_ENGINE_TESTS=1 and BAE_E2E_ENGINE_REQUIRED=1 itself.
+      - name: Quickstart smoke test
+        run: make -C e2e test-quickstart

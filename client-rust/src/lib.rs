@@ -37,7 +37,8 @@
 //! 1. [`Config`] — server URL, client key, client version.
 //! 2. [`Tool`] — name, description, JSON input schema, and a callable handler.
 //! 3. [`Harness`] — config + tool registry + hooks; `connect()` opens a session.
-//! 4. [`Session`] — `send(message)` drives the round-trip; `close()` ends it.
+//! 4. [`Session`] — `send(message)` drives the round-trip; `compact(prompt)`
+//!    summarizes the history on demand; `close()` ends it.
 //! 5. [`Hooks`] — optional `before_send` / `after_receive` / `before_tool_call`
 //!    / `after_tool_call` / `on_event` callbacks; an error from any aborts the
 //!    loop.
@@ -75,9 +76,12 @@ pub use subagent::{
 };
 pub use tool::{BoxError, Tool, ToolFuture, ToolHandler};
 pub use types::{
-    ApiError, Content, ContentBlock, EventView, JsonRpcError, JsonRpcFrame, JsonRpcRequest,
-    McpRequestPayload, McpResponsePayload, Message, Profile, SendMessageParams, SendMessageResult,
-    SessionJoinPayload, SubscribeParams, ToolResult, ToolUse,
+    ApiError, CompactParams, CompactionConfig, Content, ContentBlock, EventView, JsonRpcError,
+    JsonRpcFrame, JsonRpcRequest, McpRequestPayload, McpResponsePayload, Message, Profile,
+    SendMessageParams, SendMessageResult, ServerMessagePayload, SessionCompactionCompleted,
+    SessionCompactionCompletedPayload, SessionCompactionStarted, SessionCompactionStartedPayload,
+    SessionJoinPayload, SubscribeParams, ToolResult, ToolUse, SYNTHETIC_ABANDONED_TOOL_RESULTS,
+    SYNTHETIC_COMPACTION_PREAMBLE,
 };
 
 /// Client library version, from the crate manifest.

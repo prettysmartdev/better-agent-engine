@@ -748,6 +748,12 @@ textarea:focus-visible {
   color: var(--text-h);
   font-weight: 600;
 }
+.node-synthetic {
+  font-family: var(--sans, inherit);
+  font-weight: 500;
+  font-style: italic;
+  color: var(--muted);
+}
 .node-meta {
   font-size: 12px;
   color: var(--muted);

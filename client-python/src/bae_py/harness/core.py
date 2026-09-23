@@ -34,10 +34,12 @@ from ..sandbox import (
 from ..subagent import SubagentSession, SubagentTool, SubagentToolDef
 from ..tool import Tool, ToolRegistry
 from ..types import (
+    CompactionConfig,
     EventType,
     Message,
     Profile,
     SendMessageResult,
+    SessionCompactionCompleted,
     SessionEvent,
     ToolResultBlock,
     ToolUseBlock,
@@ -77,8 +79,12 @@ class Harness:
         tools: list[Tool] | None = None,
         hooks: Hooks | None = None,
         transport: Transport | None = None,
+        compaction: CompactionConfig | None = None,
     ) -> None:
         self.config = config
+        # Session-level compaction (``AutoCompaction`` / ``ClientCompaction``),
+        # sent by :meth:`connect` only — fixed at creation, never sent on join.
+        self.compaction = compaction
         self.hooks = hooks or Hooks()
         self._registry = ToolRegistry()
         for tool in tools or []:
@@ -147,6 +153,12 @@ class Harness:
             self._subagent_defs.append(tool.definition)
         return self
 
+    def set_compaction(self, compaction: CompactionConfig | None) -> "Harness":
+        """Set (or clear) the session-level compaction mode sent by
+        :meth:`connect`. Returns self for chaining."""
+        self.compaction = compaction
+        return self
+
     def set_hooks(self, hooks: Hooks) -> "Harness":
         """Replace the hook set. Returns self for chaining."""
         self.hooks = hooks
@@ -161,7 +173,7 @@ class Harness:
         (``session.registerDriver``) before returning, so the first
         :meth:`Session.send` is permitted.
         """
-        return await self._open(self.config.url("/api/v1/sessions"))
+        return await self._open(self.config.url("/api/v1/sessions"), self.compaction)
 
     async def join(self, session_id: str) -> "Session":
         """Join an **existing** session as an additional driver, returning a
@@ -175,13 +187,15 @@ class Harness:
         ``403 profile_mismatch``. Like :meth:`connect`, registers this
         connection as a driver before returning.
         """
-        return await self._open(self.config.url(f"/api/v1/sessions/{session_id}/join"))
+        # Never forward ``compaction``: the server rejects the key on join.
+        return await self._open(self.config.url(f"/api/v1/sessions/{session_id}/join"), None)
 
-    async def _open(self, url: str) -> "Session":
+    async def _open(self, url: str, compaction: CompactionConfig | None) -> "Session":
         """Shared body of :meth:`connect` and :meth:`join`: POST the declared
         tools to ``url`` with client-key auth, build the :class:`Session`, then
         register it as a driver before handing it back. Both endpoints return the
-        identical ``{session_id, session_key, profile}`` shape.
+        identical ``{session_id, session_key, profile}`` shape. ``compaction``
+        is included only when set (the key is omitted entirely otherwise).
         """
         transport = self._transport or HttpxTransport()
         try:
@@ -200,6 +214,8 @@ class Harness:
             # Only present when a Remote-launch subagent tool is registered.
             if self._subagent_defs:
                 open_body["subagent_tools"] = [d.declaration() for d in self._subagent_defs]
+            if compaction is not None:
+                open_body["compaction"] = compaction.to_wire()
             resp = await transport.request(
                 "POST",
                 url,
@@ -547,6 +563,44 @@ class Session:
             if _is_terminal(frame):
                 return frame.get("result") or {}
         raise RpcError(-32603, "stream ended without a terminal response")
+
+    async def compact(self, prompt: str | None = None) -> SessionCompactionCompleted:
+        """Compact the session's history now (``session.compact``).
+
+        ``prompt`` overrides the summarization prompt for this call; ``None``
+        uses the session's configured client-mode prompt or the server default
+        (sent as ``params: {}``). Live ``session.event`` notifications
+        (``session.compaction.started``, the provider pair, the preamble and
+        summary messages) are handed to the ``on_event`` hook. Returns the typed
+        terminal ``session.compaction.completed`` record. Raises
+        :class:`RpcError` on failure — e.g. ``-32020`` while a paused turn is
+        unresolved, or ``-32000`` with a ``compaction failed: …`` message.
+        """
+        params: dict[str, Any] = {} if prompt is None else {"prompt": prompt}
+        frames = self._transport.stream(
+            "POST",
+            self.config.url(f"/api/v1/sessions/{self.session_id}/rpc"),
+            headers=self._session_auth(),
+            json=self._rpc_request("session.compact", params),
+        )
+        notifications: list[SessionEvent] = []
+        completed: SessionCompactionCompleted | None = None
+        async for frame in frames:
+            _raise_for_rpc_error(frame)
+            if _is_terminal(frame):
+                try:
+                    completed = SessionCompactionCompleted.from_wire(frame.get("result") or {})
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RpcError(-32603, f"malformed session.compact result: {exc!r}") from exc
+                break
+            event = _event_from_frame(frame)
+            if event is not None:
+                notifications.append(event)
+        if completed is None:
+            raise RpcError(-32603, "stream ended without a terminal response")
+        for event in notifications:
+            await self._run_hook("on_event", self._hooks.on_event, event)
+        return completed
 
     async def subscribe(
         self,

@@ -68,7 +68,7 @@ make build-baectl
 export PATH="$PWD/baectl/target/host/release:$PATH"
 
 export ANTHROPIC_API_KEY="sk-ant-…"
-baectl setup --dev                            # once — your local image, running
+baectl setup --yes --dev                      # once — your local image, running
 baectl build reference-assistant --dev        # your local SDK source
 baectl run reference-assistant-rust-local --dev
 ```
@@ -106,10 +106,10 @@ Container packaging works for all three SDKs — `baectl` compiles the harness
 inside Docker and provisions the interpreter the Debian-based launcher base
 needs. Swap `--sdk typescript`/`--sdk python` on `build` and use the matching
 `-typescript-`/`-python-` id on `run`. For `--launcher local` the harness runs
-on your host instead, so its toolchain applies: Python and Rust prepare
-themselves on first `run`, but TypeScript needs `(cd client-typescript && npm
-install)` once first (its run command is `npm run example`, which does not
-install dependencies).
+on your host instead, so its toolchain applies: all three SDKs prepare
+themselves automatically on first `run` — Rust compiles, Python syncs its
+virtualenv, and TypeScript installs dependencies via the manifest's `prepare`
+command — no manual install step first.
 
 > **Security.** `baectl` does not set `BAE_LAUNCHER_API_TOKEN` for you, so the
 > `api`/`webapp` trigger routes on the launched container are **open** — fine
@@ -123,9 +123,10 @@ by-hand alternatives for when you need them.
 
 ## Part 1 — Build and start the server
 
-Everything below mirrors the [normal Quickstart's Part 1](../00-quickstart.md#part-1--start-the-server),
-with two developer differences: you **build** the image instead of pulling it,
-and you pass **`--dev`** to the wizard so the generated launcher references your
+Everything below mirrors the [normal Quickstart: step by step's Part
+1](../00a-quickstart-step-by-step.md#part-1--start-the-server), with two
+developer differences: you **build** the image instead of pulling it, and you
+pass **`--dev`** to the wizard so the generated launcher references your
 local tag.
 
 ### 1. Build the server image
@@ -200,11 +201,12 @@ curl -s http://localhost:8080/healthz && echo "  ← server is up"
 ### 4. Create a profile and key for the example
 
 The wizard's `default` profile allows **no client-side tools**, and the
-`reference-assistant` in Part 2 declares **four**: `get_current_time` plus the
+`reference-assistant` in Part 2 declares **five**: `get_current_time`, the
 three builtin file tools (`read_file`, `write_file`, `explore_files`) scoped to
-the example's own `workspace/` directory. The server rejects the whole session
-open with `403 tool_not_allowed` if *any* declared tool is missing from the
-profile, so the profile has to allow all four. Create it, plus a client key
+the example's own `workspace/` directory, and `run_shell_command` bound to a
+**local** sandbox. The server rejects the whole session open with
+`403 tool_not_allowed` if *any* declared tool is missing from the profile, so
+the profile has to allow all five. Create it, plus a client key
 bound to it. `baectl` runs *inside* the container the wizard launched (whose
 admin API is loopback-only), reached with `docker compose exec` from the
 directory `setup` wrote its files to:
@@ -215,13 +217,16 @@ docker compose exec baesrv baectl create profile assistant anthropic-default \
   --allowed-tool get_current_time \
   --allowed-tool read_file \
   --allowed-tool write_file \
-  --allowed-tool explore_files
+  --allowed-tool explore_files \
+  --allowed-tool run_shell_command
 ```
 
-> The example's fifth tool, `run_shell_command`, is a **sandbox** tool. Those
-> are declared separately and are deliberately *not* checked against
-> `allowed_tools` — the sandbox trust boundary is the profile's allowed image
-> list — so it needs no `--allowed-tool` entry here. The
+> `run_shell_command` here is a sandbox tool with a **local** target: the
+> harness itself runs the command in a local container, so the server sees it
+> as an ordinary client-dispatched tool and checks it against
+> `allowed_tools` like the others. (A **remote** sandbox tool is declared in
+> `sandbox_tools`, is not checked against `allowed_tools`, and is gated by the
+> profile's allowed image list instead.) The
 > [fastest path](#fastest-path-three-commands-all---dev) above does this whole
 > step for you.
 
@@ -262,7 +267,8 @@ docker exec bae baectl create profile assistant anthropic-sonnet \
   --allowed-tool get_current_time \
   --allowed-tool read_file \
   --allowed-tool write_file \
-  --allowed-tool explore_files
+  --allowed-tool explore_files \
+  --allowed-tool run_shell_command
 docker exec bae baectl create key assistant pro_…      # paste the profile id
 export BAE_CLIENT_KEY="bae_…"                           # paste the key
 ```
@@ -451,10 +457,10 @@ Developer-specific first, then the failures shared with the
   without `--dev`. Re-run `baectl setup --dev` and choose **Edit** (accepting
   every default) to rewrite `docker-compose.yml` with the local tag.
 - **`403 tool_not_allowed` when the example opens a session** — the profile is
-  missing one of the four tools the example declares. The error names the
+  missing one of the five tools the example declares. The error names the
   offending tool; the profile needs `--allowed-tool` for **all** of
-  `get_current_time`, `read_file`, `write_file`, and `explore_files` (Part 1,
-  step 4). `baectl ready <id> --fix` widens an existing profile additively to
+  `get_current_time`, `read_file`, `write_file`, `explore_files`, and
+  `run_shell_command` (Part 1, step 4). `baectl ready <id> --fix` widens an existing profile additively to
   cover exactly what the harness declares, rather than recreating it by hand.
 - **`baectl ready`/`run` warns about a `--dev` mismatch** — the build recorded
   a different `--dev` setting than this invocation used. It's a warning, never

@@ -3,6 +3,9 @@ name = "issue-triage"
 sdk = "typescript"
 run = "npx tsx examples/issue-triage/main.ts"
 working_dir = "../.."
+# `baectl run` (--launcher local only) runs this first when node_modules/ is
+# missing or package-lock.json is newer than it.
+prepare = "npm install"
 
 [harness.requires]
 allowed_tools = ["read_file", "write_file", "explore_files", "run_shell_command"]

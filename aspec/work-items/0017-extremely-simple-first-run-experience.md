@@ -55,6 +55,27 @@ package and run my own harness the same way I'd run a bundled example, using bae
 
 ## Implementation Details:
 
+> **Amended by `aspec/work-items/0018-compaction-and-first-run-hardening.md`
+> (§B/§C).** In particular: §3's "`ready` exits 1 and does not write
+> `resolved.json`" below is superseded by 0018 §B7 — a check that `run`/
+> `ready --fix` resolves automatically (a widenable profile, a creatable key)
+> now reports `⚠ … — will be fixed by run` and, when every failing check is
+> auto-fixable, `ready` exits **3**, not 1; a genuinely blocking check (#1,
+> #3, #5, or an irreconcilable #2) still exits 1. `bae-harness.toml` (§1)
+> gains optional `prepare`, `[harness.requires].sandboxes`, and
+> `[harness.container]` fields, and every `bae-harness.toml` struct is now
+> `#[serde(deny_unknown_fields)]` (0018 §B9). `setup` (already shipped by
+> `aspec/work-items/0012-baectl-quickstart.md`, referenced in this file's
+> "Builds on already-shipped work" note) gains a non-interactive `--yes`/`-y`
+> flag (0018 §C1). See `docs/reference/03-baectl.md` for the current, exact
+> behavior of all three.
+>
+> **Housekeeping note (0018 §B12):** the MCP client's spawn deadline in
+> `server/src/engine/mcp.rs` is **15 seconds**, not the 4 seconds this work
+> item's design assumed — that change shipped alongside this work item's own
+> commit without being called out in this spec. Recorded here for the
+> record; it is not itself part of this work item's scope.
+
 ### 1. New local manifest: `bae-harness.toml`
 
 Every harness `build` can act on — a bundled example or a user's own project — declares itself with a `bae-harness.toml` file at its root, the same "small, explicit, TOML" convention `bae-schedules.toml`/`bae-api.toml`/`bae-app.toml` already establish (`aspec/work-items/0014-harness-launchers.md` section A):

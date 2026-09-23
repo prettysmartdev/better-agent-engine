@@ -6,7 +6,7 @@ import {
   useState,
 } from "react";
 import type { SessionEvent } from "../api/types";
-import { categoryFor } from "../api/eventTypes";
+import { categoryForEvent, syntheticLabel } from "../api/eventTypes";
 import ShapeMarker from "./ShapeMarker";
 
 const ROW_HEIGHT = 64;
@@ -110,7 +110,8 @@ function GraphNode({
   selected: boolean;
   onSelect: (event: SessionEvent) => void;
 }) {
-  const cat = categoryFor(event.event_type);
+  const cat = categoryForEvent(event);
+  const synthetic = syntheticLabel(event);
   const activate = () => onSelect(event);
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
@@ -128,14 +129,25 @@ function GraphNode({
         role="button"
         tabIndex={0}
         aria-pressed={selected}
-        aria-label={`${event.event_type} event ${event.id}`}
+        aria-label={`${event.event_type} event ${event.id}${
+          synthetic ? ` — ${synthetic}` : ""
+        }`}
+        title={synthetic ?? undefined}
         className={selected ? "graph-node graph-node-selected" : "graph-node"}
         onClick={activate}
         onKeyDown={onKeyDown}
       >
         <ShapeMarker category={cat} />
         <span className="node-body">
-          <span className="node-type">{event.event_type}</span>
+          <span className="node-type">
+            {event.event_type}
+            {synthetic ? (
+              <span className="node-synthetic" data-testid="synthetic-label">
+                {" "}
+                · {synthetic}
+              </span>
+            ) : null}
+          </span>
           <span className="node-meta">
             #{event.id}
             {event.client_key_id ? ` · ${event.client_key_id}` : ""} ·{" "}

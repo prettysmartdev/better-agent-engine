@@ -210,6 +210,10 @@ pub struct AppState {
     /// `Paused` awaiting its owner's continuation). In-memory only; torn down
     /// on session close.
     pub pending_turns: Arc<Mutex<HashMap<String, PendingTurn>>>,
+    /// Per-session auto-compaction backoff after a failed attempt. In-memory
+    /// only (lost on restart); torn down on session close. See
+    /// [`crate::engine::session::CompactionBackoff`].
+    pub compaction_backoff: crate::engine::session::CompactionBackoff,
     /// How long a paused turn may await its owner's continuation before being
     /// treated as abandoned (`BAE_TURN_TIMEOUT`).
     pub turn_timeout: Duration,
@@ -268,6 +272,7 @@ impl AppState {
             drivers: Arc::new(Mutex::new(HashMap::new())),
             turn_gates: Arc::new(Mutex::new(HashMap::new())),
             pending_turns: Arc::new(Mutex::new(HashMap::new())),
+            compaction_backoff: Arc::new(Mutex::new(HashMap::new())),
             turn_timeout: Duration::from_secs(crate::config::DEFAULT_TURN_TIMEOUT_SECS),
             sandbox_driver: Arc::new(DockerDriver::new()),
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
@@ -484,7 +489,7 @@ impl AppState {
     }
 
     /// Tear down a session's in-memory multi-client state — its driver
-    /// registrations, turn gate, and any parked paused turn (whose dropped
+    /// registrations, turn gate, auto-compaction backoff, and any parked paused turn (whose dropped
     /// guard releases the gate to any queued waiter). Called at session close
     /// alongside the broadcaster/MCP teardown; idempotent.
     pub fn remove_session_runtime(&self, session_id: &str) {
@@ -499,6 +504,10 @@ impl AppState {
         self.pending_turns
             .lock()
             .expect("pending_turns mutex poisoned")
+            .remove(session_id);
+        self.compaction_backoff
+            .lock()
+            .expect("compaction backoff mutex poisoned")
             .remove(session_id);
     }
 }

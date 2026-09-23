@@ -1,0 +1,51 @@
+# bae-app.toml — example config for the bae-launcher-webapp base image
+#
+# Point baeapi (the same binary bae-launcher-api uses) at this file with:
+#   BAE_LAUNCHER_API_CONFIG=/etc/bae/bae-app.toml   (the webapp image's default path)
+#
+# bae-app.toml is bae-api.toml's exact schema plus optional presentation
+# fields (display_name, description, icon, chat_input_field, [[agents.prompts]])
+# used only by the webapp's card grid and chat view — the plain API launcher
+# parses and ignores them.
+#
+# TOML gotcha worth calling out: every scalar `[[agents]]` field (name,
+# command, display_name, description, icon, chat_input_field, ...) must come
+# BEFORE any nested table for that same agent ([agents.request_schema],
+# [[agents.env_template]], [[agents.prompts]]) — once a nested table header
+# opens, any bare `key = value` line belongs to that nested table, not back to
+# the parent [[agents]] entry.
+
+[server]
+addr = "0.0.0.0:9090"
+
+[[agents]]
+name    = "echo"
+command = "/usr/local/bin/example-harness"
+
+# Card/detail-page presentation (webapp only).
+display_name = "Echo Agent"
+description  = "Echoes back whatever prompt or button you send it."
+icon         = "🔊"
+
+# Which request_schema field the chat box's free-text input fills. Defaults to
+# "prompt" — spelled out here for clarity.
+chat_input_field = "prompt"
+
+[agents.request_schema]
+type     = "object"
+required = ["prompt"]
+[agents.request_schema.properties.prompt]
+type = "string"
+
+[[agents.env_template]]
+field = "prompt"
+env   = "AGENT_PROMPT"
+
+# Pre-defined-prompt buttons shown in the chat view, alongside free-form text.
+[[agents.prompts]]
+label  = "Say hello"
+prompt = "Say hello!"
+
+[[agents.prompts]]
+label  = "Tell a joke"
+prompt = "Tell me a short joke."

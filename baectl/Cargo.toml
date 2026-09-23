@@ -45,10 +45,7 @@ toml = "1.1"
 # Its tests intentionally parse generated files with the server's actual schema
 # so a schema change cannot silently make wizard output invalid.
 baesrv = { path = "../server" }
-# `build`'s api/webapp launcher config generation is likewise hand-built TOML,
-# kept independent of the launcher at build time. Its tests parse the generated
-# `bae-api.toml`/`bae-app.toml` bodies with launcher-api's own `ApiConfig`
-# deserializer (same posture as the `baesrv` dependency above, and mirroring
-# WI 0012's `BaeConfig` round-trip-test posture) so a launcher config schema
-# change cannot silently make baectl's generated output unloadable.
-launcher-api = { path = "../launchers/api" }
+# No other path dependency: the Dockerfiles copy only `server/` and `baectl/`,
+# so even a dev-dependency on another directory breaks `make image`. `build`'s generated launcher configs are pinned by checked-in
+# fixtures under `tests/fixtures/generated/`, which `launchers/api`'s own tests
+# load through `baeapi`'s real config parser — the guard points the other way.

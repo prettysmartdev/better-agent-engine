@@ -9,7 +9,7 @@
 Start here. Guides walk you through real tasks end to end, and are numbered in
 a suggested reading order.
 
-- [Quickstart](guides/00-quickstart.md) — start the server, run a client harness example (TS/Python/Rust), and serve an agent in the browser with the webapp launcher.
+- [Quickstart](guides/00-quickstart.md) — three `baectl` commands to a working agent, plus the webapp launcher. [Step by step](guides/00a-quickstart-step-by-step.md) shows the same ground by hand.
 - [Building a Client](guides/01-building-a-client.md) — short per-SDK walkthrough (Rust, TypeScript, Python) covering the harness API, the JSON-RPC transport, and the `on_event` hook.
 - [MCP Servers](guides/02-mcp-servers.md) — connect a real MCP server (filesystem, fetch) to a profile using `bae-config.toml`.
 - [Sandboxes](guides/03-sandboxes.md) — run shell commands in a server-managed or local container (or unsandboxed), choosing the target per call, with a full lifecycle event trail.
@@ -32,9 +32,10 @@ Precise specification of every API surface and configuration option.
 - [Wire Protocol](reference/01-wire-protocol.md) — JSON-RPC 2.0 envelope conventions, NDJSON framing, error codes, and FIFO turn ownership.
 - [Admin API](reference/02-admin-api.md) — profile and key management, `GET /admin/v1/mcp-servers`, `GET /admin/v1/providers`, `GET /admin/v1/sessions` and its event-history route.
 - [baectl](reference/03-baectl.md) — the admin API CLI: every subcommand, flags, exit codes, and auth/address auto-configuration.
-- [Message Types](reference/04-message-types.md) — all 27 `event_type` values and their payload shapes.
+- [Message Types](reference/04-message-types.md) — all 28 `event_type` values and their payload shapes.
 - [Configuration](reference/05-configuration.md) — every `BAE_*` env var, the `--config` flag, and the `bae-config.toml` schema (`[mcp]`, `[providers]`).
 - [Harness Launchers](reference/06-launchers.md) — the `bae-schedules.toml`/`bae-api.toml`/`bae-app.toml` schemas, every launcher `BAE_*` env var, and `baeapi`'s fixed routes.
+- [Harness Manifest](reference/07-harness-manifest.md) — the `bae-harness.toml` schema `baectl build`/`ready`/`run` read.
 
 ---
 

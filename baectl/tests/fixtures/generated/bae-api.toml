@@ -1,0 +1,16 @@
+[server]
+addr = "0.0.0.0:9090"
+
+[[agents]]
+name = "reference-assistant"
+command = "/usr/local/bin/reference-assistant"
+
+[agents.request_schema]
+type = "object"
+required = ["AGENT_PROMPT"]
+[agents.request_schema.properties."AGENT_PROMPT"]
+type = "string"
+
+[[agents.env_template]]
+field = "AGENT_PROMPT"
+env = "AGENT_PROMPT"

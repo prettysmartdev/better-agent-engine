@@ -13,7 +13,10 @@
 //! baectl list   keys [--limit --cursor --json]
 //! baectl delete key <id>
 //! baectl auth   create key [--name --out-dir]   (local only — no API call)
-//! baectl setup  [--dev --apple --dir]           (local scaffolding + launch)
+//! baectl setup  [--dev --apple --yes --dir]     (local scaffolding + launch)
+//! baectl build  <harness> [--sdk --harness-dir --launcher --id --dev --dir]
+//! baectl ready  <id> [--fix --dev --dir]
+//! baectl run    <id> [--no-ready --server-url --dev --dir]
 //! ```
 //!
 //! `<primary_provider>` (and each `--fallback`) is the **name** of a
@@ -28,7 +31,8 @@
 //! - **token** — `--admin-token`/`BAE_ADMIN_TOKEN` > `--admin-key-file`/
 //!   `BAE_ADMIN_KEY_FILE` > the default key file `/var/lib/bae/admin-key.pem`.
 //!
-//! Exit codes (per `aspec/uxui/cli.md`): 0 success / 1 runtime / 2 usage. clap
+//! Exit codes (per `aspec/uxui/cli.md`): 0 success / 1 runtime / 2 usage /
+//! 3 `ready` found only auto-fixable issues. clap
 //! emits `2` for missing positionals and unknown flags for free; the value
 //! validation we do ourselves ([`CliError::usage`]) matches it.
 
@@ -162,6 +166,11 @@ struct ProfileConfigArgs {
     /// Client-side tool name to allow (repeatable).
     #[arg(long = "allowed-tool", value_name = "NAME")]
     allowed_tool: Vec<String>,
+    /// Sandbox container image the profile's sessions may launch
+    /// (repeatable). `update profile` is a full replacement, so pass every
+    /// image the profile should keep.
+    #[arg(long = "available-sandbox", value_name = "IMAGE")]
+    available_sandbox: Vec<String>,
     /// Print the raw JSON response instead of a human summary.
     #[arg(long)]
     json: bool,
@@ -272,6 +281,12 @@ struct SetupCmd {
     /// a `docker-compose.yml`. Both output modes read the same `.env`.
     #[arg(long)]
     apple: bool,
+    /// Non-interactive: accept every wizard default, take the provider from
+    /// the environment (`ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`), launch,
+    /// and create the first profile + key. Re-running in an already set-up
+    /// directory relaunches it and exits 0.
+    #[arg(long, short = 'y')]
+    yes: bool,
     /// Directory to read/write the three generated files in (default `.`),
     /// mirroring `auth create key`'s `--out-dir` convention.
     #[arg(long, default_value = ".", value_name = "DIR")]
@@ -401,8 +416,14 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
 
     // `setup` scaffolds local files (and optionally launches) — it never builds
     // a host-side admin client, so it must be handled before `build_client`.
-    if let Command::Setup(SetupCmd { dev, apple, dir }) = &cli.command {
-        return crate::setup::run(*dev, *apple, dir);
+    if let Command::Setup(SetupCmd {
+        dev,
+        apple,
+        yes,
+        dir,
+    }) = &cli.command
+    {
+        return crate::setup::run(*dev, *apple, *yes, dir);
     }
 
     // `build`/`ready`/`run` are host-invoked like `setup`: they drive the local
@@ -411,9 +432,9 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
     // `build_client`. Handled by reference (cloning the small owned option set)
     // so the shared borrow-then-move ordering with the admin path below holds.
     match &cli.command {
-        Command::Build(cmd) => return harness::build(build_options(cmd)),
-        Command::Ready(cmd) => return harness::ready(ready_options(cmd)),
-        Command::Run(cmd) => return harness::run(run_options(cmd)),
+        Command::Build(cmd) => return harness::build(build_options(cmd)?),
+        Command::Ready(cmd) => return harness::ready(ready_options(cmd)?),
+        Command::Run(cmd) => return harness::run(run_options(cmd)?),
         _ => {}
     }
 
@@ -466,38 +487,52 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// Canonicalize a `--dir` once, at argument mapping, so every later path
+/// derived from it (`.env`, `harness.env`, the compose file) is absolute — a
+/// relative dir combined with a child `current_dir(dir)` would otherwise
+/// resolve twice.
+fn canonical_dir(dir: &std::path::Path) -> Result<PathBuf, CliError> {
+    match dir.canonicalize() {
+        Ok(p) if p.is_dir() => Ok(p),
+        _ => Err(CliError::runtime(format!(
+            "--dir {} does not exist or is not a directory",
+            dir.display()
+        ))),
+    }
+}
+
 /// Map parsed `build` args to the harness module's resolved [`BuildOptions`].
-fn build_options(cmd: &BuildCmd) -> BuildOptions {
-    BuildOptions {
+fn build_options(cmd: &BuildCmd) -> Result<BuildOptions, CliError> {
+    Ok(BuildOptions {
         harness: cmd.harness.clone(),
         sdk: cmd.sdk,
         harness_dir: cmd.harness_dir.clone(),
         launcher: cmd.launcher,
         id: cmd.id.clone(),
         dev: cmd.dev,
-        dir: cmd.dir.clone(),
-    }
+        dir: canonical_dir(&cmd.dir)?,
+    })
 }
 
 /// Map parsed `ready` args to the harness module's resolved [`ReadyOptions`].
-fn ready_options(cmd: &ReadyCmd) -> ReadyOptions {
-    ReadyOptions {
+fn ready_options(cmd: &ReadyCmd) -> Result<ReadyOptions, CliError> {
+    Ok(ReadyOptions {
         id: cmd.id.clone(),
         fix: cmd.fix,
-        dir: cmd.dir.clone(),
+        dir: canonical_dir(&cmd.dir)?,
         dev: cmd.dev,
-    }
+    })
 }
 
 /// Map parsed `run` args to the harness module's resolved [`RunOptions`].
-fn run_options(cmd: &RunCmd) -> RunOptions {
-    RunOptions {
+fn run_options(cmd: &RunCmd) -> Result<RunOptions, CliError> {
+    Ok(RunOptions {
         id: cmd.id.clone(),
-        dir: cmd.dir.clone(),
+        dir: canonical_dir(&cmd.dir)?,
         no_ready: cmd.no_ready,
         server_url: cmd.server_url.clone(),
         dev: cmd.dev,
-    }
+    })
 }
 
 /// Resolve the admin address and token, then construct the client.
@@ -719,6 +754,7 @@ fn build_profile_body(name: String, config: &ProfileConfigArgs) -> ProfileBody {
         fallback_providers: config.fallback.clone(),
         mcp_servers: config.mcp_server.clone(),
         allowed_tools: config.allowed_tool.clone(),
+        available_sandboxes: config.available_sandbox.clone(),
     }
 }
 
@@ -867,6 +903,7 @@ mod tests {
             keys,
             [
                 "allowed_tools",
+                "available_sandboxes",
                 "fallback_providers",
                 "mcp_servers",
                 "name",
@@ -911,6 +948,7 @@ mod tests {
         assert_eq!(v["fallback_providers"], json!([]));
         assert_eq!(v["mcp_servers"], json!([]));
         assert_eq!(v["allowed_tools"], json!([]));
+        assert_eq!(v["available_sandboxes"], json!([]));
     }
 
     #[test]
@@ -937,5 +975,75 @@ mod tests {
         } else {
             panic!("wrong command");
         }
+    }
+
+    /// B2: `--available-sandbox` is repeatable on both profile verbs and maps
+    /// to `available_sandboxes`.
+    #[test]
+    fn available_sandbox_flag_maps_to_the_body() {
+        let a = parse_create_profile(&[
+            "baectl",
+            "create",
+            "profile",
+            "m",
+            "anthropic-sonnet",
+            "--available-sandbox",
+            "alpine",
+            "--available-sandbox",
+            "python:3.12",
+        ]);
+        let v = serde_json::to_value(build_profile_body(a.name, &a.config)).unwrap();
+        assert_eq!(v["available_sandboxes"], json!(["alpine", "python:3.12"]));
+
+        let cli = Cli::try_parse_from([
+            "baectl",
+            "update",
+            "profile",
+            "pro_1",
+            "anthropic-sonnet",
+            "--available-sandbox",
+            "alpine",
+        ])
+        .unwrap();
+        let Command::Update(UpdateCmd {
+            resource: UpdateResource::Profile(a),
+        }) = cli.command
+        else {
+            panic!("expected `update profile`");
+        };
+        assert_eq!(a.config.available_sandbox, vec!["alpine"]);
+    }
+
+    /// C1: `setup --yes` / `-y`.
+    #[test]
+    fn setup_accepts_yes_and_its_short_form() {
+        for flag in ["--yes", "-y"] {
+            let cli = Cli::try_parse_from(["baectl", "setup", flag]).unwrap();
+            let Command::Setup(cmd) = cli.command else {
+                panic!("expected setup");
+            };
+            assert!(cmd.yes && !cmd.dev && !cmd.apple);
+        }
+        let cli = Cli::try_parse_from(["baectl", "setup"]).unwrap();
+        let Command::Setup(cmd) = cli.command else {
+            panic!("expected setup");
+        };
+        assert!(!cmd.yes);
+    }
+
+    /// B4: `--dir` canonicalization.
+    #[test]
+    fn canonical_dir_is_absolute_or_a_runtime_error() {
+        let d = canonical_dir(std::path::Path::new(".")).unwrap();
+        assert!(d.is_absolute());
+        assert_eq!(d, std::env::current_dir().unwrap().canonicalize().unwrap());
+        let e = canonical_dir(std::path::Path::new("definitely/not/here")).unwrap_err();
+        assert_eq!(e.exit_code(), 1);
+        assert_eq!(
+            e.message(),
+            "--dir definitely/not/here does not exist or is not a directory"
+        );
+        let e = canonical_dir(std::path::Path::new("Cargo.toml")).unwrap_err();
+        assert_eq!(e.exit_code(), 1, "a file is not a --dir");
     }
 }

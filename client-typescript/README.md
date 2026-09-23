@@ -54,10 +54,13 @@ await session.close();
   handler receives the `tool_use.input` and returns the result content.
 - **`Harness`** — register tools and hooks, then `connect()` opens a new session
   or `join(sessionId)` attaches to an existing one as a second driver; both
-  return a `Session`.
+  return a `Session`. `new Harness(config, { compaction })` (or
+  `setCompaction()`) picks the session's compaction mode at creation:
+  `{ mode: "auto", size }` or `{ mode: "client", prompt? }`.
 - **`Session`** — `send(message)` drives the loop to a final assistant turn,
-  `close()` ends the session, and `subscribe()` / `unsubscribe()` tap the live
-  event stream out of band.
+  `compact(prompt?)` summarizes the history now and resolves with the
+  `session.compaction.completed` event, `close()` ends the session, and
+  `subscribe()` / `unsubscribe()` tap the live event stream out of band.
 - **`Hooks`** — `before_send`, `after_receive`, `before_tool_call`,
   `after_tool_call`, and `on_event` (the live event stream); throwing from any
   hook aborts the loop.
@@ -68,7 +71,7 @@ await session.close();
 - **Errors** — `ApiError` (RFC 7807 slug in `.type`), `ProvidersFailedError`
   (a `502`, carrying the session `events`), `RpcError`, `UnknownToolError`,
   `ToolError`, `HookError`, `TransportError`.
-- **Events** — `SessionEvent` is a discriminated union over all 27 event types;
+- **Events** — `SessionEvent` is a discriminated union over all 28 event types;
   `describeEvent()` demonstrates the exhaustive match.
 
 ## Example

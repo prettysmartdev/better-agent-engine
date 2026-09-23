@@ -46,8 +46,9 @@ use crate::subagent::{
 use crate::telemetry;
 use crate::tool::Tool;
 use crate::types::{
-    Content, ContentBlock, EventView, JsonRpcFrame, JsonRpcRequest, Message, Profile,
-    SendMessageParams, SendMessageResult, SubscribeParams, ToolResult,
+    CompactParams, CompactionConfig, Content, ContentBlock, EventView, JsonRpcFrame,
+    JsonRpcRequest, Message, Profile, SendMessageParams, SendMessageResult,
+    SessionCompactionCompleted, SubscribeParams, ToolResult,
 };
 
 /// The outcome of one `session.sendMessage` turn: the terminal `{message,
@@ -539,6 +540,38 @@ impl HttpTransport {
     }
 }
 
+impl HttpTransport {
+    /// `session.compact`: drive a compaction to its terminal
+    /// `session.compaction.completed` event, collecting the live
+    /// `session.event` notifications streamed before it.
+    async fn compact_rpc(
+        &self,
+        params: &CompactParams,
+    ) -> Result<(SessionCompactionCompleted, Vec<EventView>), Error> {
+        let req = JsonRpcRequest::new(self.next_id(), "session.compact", params);
+        let mut reader = self.open_rpc(&req).await?;
+        let mut notifications = Vec::new();
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(err) = frame.error {
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+            if frame.id.is_some() {
+                let result = frame
+                    .result
+                    .ok_or_else(|| rpc_protocol_error("compact missing `result`"))?;
+                return Ok((serde_json::from_value(result)?, notifications));
+            }
+            if let Some(event) = frame.into_event()? {
+                notifications.push(event);
+            }
+        }
+        Err(rpc_protocol_error("compact stream ended without a result"))
+    }
+}
+
 impl SandboxRpc for HttpTransport {
     fn exec_remote_sandbox(&self, command: String) -> SandboxFuture<'_, Result<ExecResult, Error>> {
         Box::pin(async move { self.exec_remote_sandbox_rpc(&command).await })
@@ -720,6 +753,10 @@ struct OpenRequest {
     /// Remote-launch subagent declarations; omitted when none are registered.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     subagent_tools: Vec<serde_json::Value>,
+    /// Session-level compaction; only ever `Some` on `connect()` (the server
+    /// rejects the key on join), and omitted entirely when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction: Option<CompactionConfig>,
 }
 
 /// `POST /api/v1/sessions` success body.
@@ -767,6 +804,8 @@ pub struct Harness {
     /// Remote-launch subagent declarations, sent in the session-open
     /// `subagent_tools` array.
     subagent_defs: Vec<SubagentToolDef>,
+    /// Session-level compaction, sent by [`connect`](Harness::connect) only.
+    compaction: Option<CompactionConfig>,
 }
 
 impl Harness {
@@ -784,7 +823,23 @@ impl Harness {
             sandbox_defs: Vec::new(),
             subagent,
             subagent_defs: Vec::new(),
+            compaction: None,
         }
+    }
+
+    /// Set the session-level compaction mode sent when the session is created
+    /// by [`connect`](Harness::connect). Compaction is fixed at creation, so
+    /// [`join`](Harness::join) never sends it. Builder-style; returns `self`.
+    pub fn with_compaction(mut self, compaction: CompactionConfig) -> Self {
+        self.compaction = Some(compaction);
+        self
+    }
+
+    /// Set (or clear, with `None`) the session-level compaction mode in place.
+    /// See [`with_compaction`](Harness::with_compaction).
+    pub fn set_compaction(&mut self, compaction: Option<CompactionConfig>) -> &mut Self {
+        self.compaction = compaction;
+        self
     }
 
     /// A handle to this harness's sandbox capability, for building sandbox tools
@@ -887,7 +942,7 @@ impl Harness {
     /// [`send`](Session::send) is permitted.
     pub async fn connect(self) -> Result<Session, Error> {
         let url = format!("{}/api/v1/sessions", self.config.base());
-        self.open(url).await
+        self.open(url, true).await
     }
 
     /// Join an **existing** session as an additional driver and return a
@@ -906,14 +961,16 @@ impl Harness {
             self.config.base(),
             session_id.as_ref()
         );
-        self.open(url).await
+        // Never forward `compaction`: the server rejects the key on join.
+        self.open(url, false).await
     }
 
     /// Shared body of [`connect`](Harness::connect) and [`join`](Harness::join):
     /// POST the declared tools to `url` with client-key auth, then register as a
     /// driver before handing back the [`Session`]. Both endpoints return the
-    /// identical `{session_id, session_key, profile}` shape.
-    async fn open(self, url: String) -> Result<Session, Error> {
+    /// identical `{session_id, session_key, profile}` shape. `compaction` is
+    /// sent only when `create` is true (and a mode is configured).
+    async fn open(self, url: String, create: bool) -> Result<Session, Error> {
         let Harness {
             config,
             http,
@@ -923,6 +980,7 @@ impl Harness {
             sandbox_defs,
             subagent,
             subagent_defs,
+            compaction,
         } = self;
 
         let body = OpenRequest {
@@ -936,6 +994,7 @@ impl Harness {
                 .iter()
                 .map(SubagentToolDef::declaration)
                 .collect(),
+            compaction: if create { compaction } else { None },
         };
 
         let resp = telemetry::inject_traceparent(http.post(url).bearer_auth(&config.client_key))
@@ -1120,6 +1179,30 @@ impl Session {
     /// Cancel a **remote** (server-tracked) subagent via `session.cancelSubagent`.
     pub async fn cancel_remote_subagent(&self, subagent_id: &str) -> Result<(), Error> {
         self.transport.cancel_subagent_rpc(subagent_id).await
+    }
+
+    /// Compact the session's history now via `session.compact`. `prompt`
+    /// overrides the summarization prompt for this call; `None` uses the
+    /// session's configured client-mode prompt or the server default (sent as
+    /// `params: {}`). Live `session.event` notifications
+    /// (`session.compaction.started`, the provider pair, the preamble and
+    /// summary messages) are handed to [`Hooks::on_event`]. Returns the typed
+    /// terminal `session.compaction.completed` record.
+    ///
+    /// Fails with [`Error::Rpc`] — e.g. code `-32020` while a paused turn is
+    /// unresolved, or `-32000` with a `compaction failed: …` message.
+    pub async fn compact(
+        &mut self,
+        prompt: Option<&str>,
+    ) -> Result<SessionCompactionCompleted, Error> {
+        let params = CompactParams {
+            prompt: prompt.map(str::to_string),
+        };
+        let (completed, notifications) = self.transport.compact_rpc(&params).await?;
+        for event in &notifications {
+            self.hooks.run_on_event(event).map_err(Error::Hook)?;
+        }
+        Ok(completed)
     }
 
     /// Subscribe to this session's live `session.event` feed via the
@@ -2583,6 +2666,178 @@ mod tests {
         assert!(!updates[1]
             .iter()
             .any(|t| t["name"] == json!("local_subagent_status")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Compaction wire shapes (WI 0018 A8; contracts.md §1.11/§1.12).
+    // -----------------------------------------------------------------------
+
+    const COMPLETED_TERMINAL_FRAME: &str =
+        include_str!("../tests/fixtures/session_compact_terminal_frame.json");
+    const TURN_IN_PROGRESS_ERROR: &str =
+        include_str!("../tests/fixtures/session_compact_turn_in_progress_error.json");
+
+    #[test]
+    fn open_request_omits_compaction_key_when_unset() {
+        let body = OpenRequest {
+            client_version: "1.0".to_string(),
+            tools: vec![],
+            sandbox_tools: vec![],
+            subagent_tools: vec![],
+            compaction: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(
+            v.as_object().unwrap().get("compaction").is_none(),
+            "compaction key must be omitted, never null, when unset: {v}"
+        );
+    }
+
+    #[test]
+    fn open_request_serializes_auto_compaction_exactly() {
+        let body = OpenRequest {
+            client_version: "1.0".to_string(),
+            tools: vec![],
+            sandbox_tools: vec![],
+            subagent_tools: vec![],
+            compaction: Some(CompactionConfig::auto(128_000)),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["compaction"], json!({ "mode": "auto", "size": 128_000 }));
+    }
+
+    #[test]
+    fn open_request_serializes_client_compaction_with_and_without_prompt() {
+        let no_prompt = OpenRequest {
+            client_version: "1.0".to_string(),
+            tools: vec![],
+            sandbox_tools: vec![],
+            subagent_tools: vec![],
+            compaction: Some(CompactionConfig::client()),
+        };
+        let v = serde_json::to_value(&no_prompt).unwrap();
+        assert_eq!(v["compaction"], json!({ "mode": "client" }));
+
+        let with_prompt = OpenRequest {
+            client_version: "1.0".to_string(),
+            tools: vec![],
+            sandbox_tools: vec![],
+            subagent_tools: vec![],
+            compaction: Some(CompactionConfig::client_with_prompt(
+                "Summarize focusing on open TODOs.",
+            )),
+        };
+        let v = serde_json::to_value(&with_prompt).unwrap();
+        assert_eq!(
+            v["compaction"],
+            json!({ "mode": "client", "prompt": "Summarize focusing on open TODOs." })
+        );
+    }
+
+    #[test]
+    fn compact_request_frame_matches_contract_for_no_and_some_prompt() {
+        // Mirrors what `compact_rpc` builds: `JsonRpcRequest::new(id, "session.compact", params)`.
+        let no_prompt = JsonRpcRequest::new(7, "session.compact", CompactParams::default());
+        let v = serde_json::to_value(&no_prompt).unwrap();
+        assert_eq!(
+            v,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "session.compact", "params": {} })
+        );
+
+        let with_prompt = JsonRpcRequest::new(
+            7,
+            "session.compact",
+            CompactParams {
+                prompt: Some("…".to_string()),
+            },
+        );
+        let v = serde_json::to_value(&with_prompt).unwrap();
+        assert_eq!(
+            v,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "session.compact", "params": { "prompt": "…" } })
+        );
+    }
+
+    #[test]
+    fn compact_terminal_result_deserializes_exactly_as_compact_rpc_does() {
+        // `compact_rpc` decodes the terminal frame's `result` directly into
+        // `SessionCompactionCompleted` (not via `EventView::try_into`) — exercise
+        // that exact path against the shared fixture.
+        let frame: JsonRpcFrame = serde_json::from_str(COMPLETED_TERMINAL_FRAME).unwrap();
+        assert_eq!(frame.id, Some(json!(7)));
+        let result = frame.result.expect("terminal frame has a result");
+        let completed: SessionCompactionCompleted = serde_json::from_value(result).unwrap();
+
+        assert_eq!(completed.id, "evt_01completed");
+        assert_eq!(completed.session_id, "ses_01example");
+        assert_eq!(completed.client_key_id.as_deref(), Some("key_01example"));
+        assert_eq!(
+            completed.payload.preamble_event_id.as_deref(),
+            Some("evt_01preamble")
+        );
+        assert_eq!(completed.payload.summary_event_id, "evt_01summary");
+        assert_eq!(completed.payload.compacted_message_count, 17);
+        assert_eq!(completed.payload.input_tokens, Some(42_100));
+        assert_eq!(completed.payload.summary_tokens, Some(900));
+    }
+
+    #[test]
+    fn compact_turn_in_progress_error_frame_decodes_to_rpc_error() {
+        let frame: JsonRpcFrame = serde_json::from_str(TURN_IN_PROGRESS_ERROR).unwrap();
+        let err = frame.error.expect("error frame has `error`");
+        assert_eq!(err.code, -32020);
+        assert_eq!(
+            err.message,
+            "turn in progress: resolve the paused turn before compacting"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_notifications_run_on_event_hooks_in_order_then_completed_is_returned() {
+        // `HttpTransport::compact_rpc` isn't reachable through the mockable
+        // `Transport` trait (it lives directly on `HttpTransport`, see above),
+        // so this exercises `Session::compact`'s hook-fan-out contract by
+        // driving the pieces it composes: the notifications collected during
+        // the RPC are run through `Hooks::on_event` in order, then the typed
+        // completed record is returned. The transport half (request/response
+        // JSON shapes) is covered by the fixture-based tests above.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cloned = seen.clone();
+        let mut hooks = Hooks::default().on_event(move |ev| {
+            seen_cloned.lock().unwrap().push(ev.event_type.clone());
+            Ok(())
+        });
+
+        let started: EventView = serde_json::from_str(include_str!(
+            "../tests/fixtures/compaction_started_manual.json"
+        ))
+        .unwrap();
+        let preamble: EventView = serde_json::from_str(include_str!(
+            "../tests/fixtures/compaction_preamble_event.json"
+        ))
+        .unwrap();
+        let summary: EventView = serde_json::from_str(include_str!(
+            "../tests/fixtures/compaction_summary_event.json"
+        ))
+        .unwrap();
+        let notifications = vec![started, preamble, summary];
+        for event in &notifications {
+            hooks.run_on_event(event).unwrap();
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "session.compaction.started",
+                "server.message.send",
+                "server.message.send",
+            ]
+        );
+
+        let frame: JsonRpcFrame = serde_json::from_str(COMPLETED_TERMINAL_FRAME).unwrap();
+        let completed: SessionCompactionCompleted =
+            serde_json::from_value(frame.result.unwrap()).unwrap();
+        assert_eq!(completed.payload.compacted_message_count, 17);
     }
 }
 

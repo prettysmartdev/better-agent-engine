@@ -30,6 +30,10 @@ pub struct ProfileBody {
     pub fallback_providers: Vec<String>,
     pub mcp_servers: Vec<String>,
     pub allowed_tools: Vec<String>,
+    /// Sandbox image names the profile's sessions may launch. Always sent: the
+    /// server treats a missing field as `[]`, so omitting it on a full-PUT
+    /// update would silently wipe the profile's existing allowlist.
+    pub available_sandboxes: Vec<String>,
 }
 
 /// `POST /admin/v1/keys` body.

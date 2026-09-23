@@ -21,7 +21,8 @@
 //!   session so far and makes it the new starting point for provider-facing
 //!   history. Requires driver registration and takes the **same** per-session
 //!   turn gate as `session.sendMessage`, so a compaction can never race a live
-//!   turn. Returns the produced `session.compaction.completed` event; its
+//!   turn; a paused turn fails it fast with `-32020` (`turn in progress`)
+//!   instead of waiting. Returns the produced `session.compaction.completed` event; its
 //!   `session.compaction.started`/`completed` pair reaches watchers through the
 //!   ordinary broadcast path (see [`compact_rpc`]).
 //! - `session.subscribe` (`{since_event_id?}`) — a non-driving observer feed
@@ -486,58 +487,30 @@ async fn drive_send_message(
     let mut pending_auto_compaction = None;
     // The paused turn's span context, for the resume Link on the new turn span.
     let mut resumed_span_context: Option<opentelemetry::trace::SpanContext> = None;
-    let reclaimed = {
-        let mut pending = state
-            .pending_turns
-            .lock()
-            .expect("pending_turns mutex poisoned");
-        let (caller_owns, expired) = match pending.get(&session.id) {
-            Some(pt) => (
-                pt.owner_client_key_id == acting_client_key_id,
-                tokio::time::Instant::now() > pt.deadline,
-            ),
-            None => (false, false),
-        };
-        if caller_owns {
-            pending.remove(&session.id).map(|pt| {
-                resumed_paused_turn = true;
-                stashed_server_results = pt.server_tool_results;
-                pending_auto_compaction = pt.pending_auto_compaction;
-                resumed_span_context = pt.span_context;
-                pt.guard
-            })
-        } else {
-            if expired {
-                pending.remove(&session.id).map(|pt| {
-                    abandoned_owner = Some(pt.owner_client_key_id);
-                    resumed_paused_turn = true;
-                    timed_out_paused_turn = true;
-                    stashed_server_results = pt.server_tool_results;
-                    pending_auto_compaction = pt.pending_auto_compaction;
-                    resumed_span_context = pt.span_context;
-                    // Reclaim the parked guard for this request. This retires
-                    // the expired exchange before any queued message can
-                    // interleave with its synthetic cancellation results.
-                    pt.guard
-                })
-            } else {
-                None
-            }
+    let reclaimed = match claim_pending_turn(&state, &session.id, &acting_client_key_id, true) {
+        PendingClaim::Owned(pt) => {
+            resumed_paused_turn = true;
+            stashed_server_results = pt.server_tool_results;
+            pending_auto_compaction = pt.pending_auto_compaction;
+            resumed_span_context = pt.span_context;
+            Some(pt.guard)
         }
+        PendingClaim::Expired(pt) => {
+            abandoned_owner = Some(pt.owner_client_key_id);
+            resumed_paused_turn = true;
+            timed_out_paused_turn = true;
+            stashed_server_results = pt.server_tool_results;
+            pending_auto_compaction = pt.pending_auto_compaction;
+            resumed_span_context = pt.span_context;
+            // Reclaim the parked guard for this request. This retires the
+            // expired exchange before any queued message can interleave with
+            // its synthetic cancellation results.
+            Some(pt.guard)
+        }
+        PendingClaim::None | PendingClaim::Held => None,
     };
     if let Some(owner) = abandoned_owner {
-        // Logged through the broadcast choke point so live watchers see the
-        // abandonment; the session stays open (unlike a provider failure).
-        if let Err(e) = broadcast::insert_and_publish(
-            &state.store,
-            &state.broadcaster,
-            &session.id,
-            Some(&owner),
-            EventType::SessionError,
-            &json!({ "reason": "driver_turn_abandoned", "owner_client_key_id": owner }),
-        ) {
-            tracing::error!("failed to log driver_turn_abandoned: {e}");
-        }
+        log_turn_abandoned(&state, &session.id, &owner);
     }
     let gate_guard = match reclaimed {
         Some(g) => g,
@@ -634,27 +607,9 @@ async fn drive_send_message(
             Err(reason) => {
                 // Fail loudly: the merged turn would not answer exactly the
                 // paused assistant turn's tool_use ids (a missing, duplicate, or
-                // unexpected id). Log a `session.error` and abandon this turn
-                // rather than forward a malformed body upstream (Anthropic would
-                // 400). A rejected continuation makes the session terminal:
-                // its durable assistant tool_use message is intentionally not
-                // replayable without a valid immediately-following user result.
-                let _ = broadcast::insert_and_publish(
-                    &state.store,
-                    &state.broadcaster,
-                    &session.id,
-                    Some(&acting_client_key_id),
-                    EventType::SessionError,
-                    &json!({ "reason": "tool_result_merge_invalid", "detail": reason }),
-                );
-                let _ = state
-                    .store
-                    .with_conn(|c| sessions::close_session(c, &session.id, STATE_ERROR));
-                // The session moved to terminal `error`: end its anchor span now
-                // (marked Error), matching the provider-exhaustion teardown, so
-                // it is not left live with an inflated duration and Unset status
-                // (contract §1.1).
-                state.end_session_span(&session.id, Some("tool result merge invalid"));
+                // unexpected id). Abandon this turn rather than forward a
+                // malformed body upstream (Anthropic would 400).
+                fail_tool_result_merge(&state, &session.id, &acting_client_key_id, &reason);
                 emit_terminal(&tx, &resp_id, |id| {
                     error_obj(id, -32000, format!("tool result merge invalid: {reason}"))
                 })
@@ -662,6 +617,23 @@ async fn drive_send_message(
                 return;
             }
         }
+    } else if !tool_result_blocks(&content).is_empty() {
+        // No paused turn is waiting for these results — typically its owner
+        // stayed away past `BAE_TURN_TIMEOUT` and another driver's message or
+        // `session.compact` already retired it. Forwarding them would put an
+        // orphan `tool_result` in the transcript (Anthropic answers 400 and the
+        // session would be torn down), so reject this message and keep the
+        // session open.
+        emit_terminal(&tx, &resp_id, |id| {
+            error_obj(
+                id,
+                -32000,
+                "tool result merge invalid: no paused turn is awaiting tool results \
+                 (it may have timed out and been retired)",
+            )
+        })
+        .await;
+        return;
     }
 
     let mut all_events = Vec::new();
@@ -774,6 +746,7 @@ async fn drive_send_message(
             state.max_subagents_per_session,
             &acting_client_key_id,
             pending_auto_compaction,
+            &state.compaction_backoff,
             &state.telemetry_metrics,
         ),
         turn_span.clone(),
@@ -885,6 +858,89 @@ async fn drive_send_message(
     }
     drop(turn_span);
     drop(gate_guard);
+}
+
+/// What [`claim_pending_turn`] found parked in `pending_turns` for a session.
+enum PendingClaim {
+    /// No paused turn.
+    None,
+    /// The caller's own paused turn, removed from `pending_turns` so the caller
+    /// resumes it (its guard is the session's turn gate).
+    Owned(crate::api::PendingTurn),
+    /// A paused turn whose owner stayed away past `BAE_TURN_TIMEOUT`, removed
+    /// so the caller can retire it (its guard is the session's turn gate).
+    Expired(crate::api::PendingTurn),
+    /// A live paused turn the caller may not take over; left parked.
+    Held,
+}
+
+/// Inspect — and, for a turn the caller may take over, remove — the session's
+/// parked paused turn. Shared by `session.sendMessage` (`owner_may_resume`:
+/// the owner resumes its own pause) and `session.compact` (never resumes a
+/// pause; only an expired one is reclaimed). An expired pause is reclaimed by
+/// any caller, including its owner.
+fn claim_pending_turn(
+    state: &AppState,
+    session_id: &str,
+    caller: &str,
+    owner_may_resume: bool,
+) -> PendingClaim {
+    let mut pending = state
+        .pending_turns
+        .lock()
+        .expect("pending_turns mutex poisoned");
+    let Some(pt) = pending.get(session_id) else {
+        return PendingClaim::None;
+    };
+    if owner_may_resume && pt.owner_client_key_id == caller {
+        return pending
+            .remove(session_id)
+            .map_or(PendingClaim::None, PendingClaim::Owned);
+    }
+    if tokio::time::Instant::now() > pt.deadline {
+        return pending
+            .remove(session_id)
+            .map_or(PendingClaim::None, PendingClaim::Expired);
+    }
+    PendingClaim::Held
+}
+
+/// Log `session.error` `driver_turn_abandoned` for a reclaimed expired pause,
+/// through the broadcast choke point so live watchers see the abandonment; the
+/// session stays open (unlike a provider failure).
+fn log_turn_abandoned(state: &AppState, session_id: &str, owner: &str) {
+    if let Err(e) = broadcast::insert_and_publish(
+        &state.store,
+        &state.broadcaster,
+        session_id,
+        Some(owner),
+        EventType::SessionError,
+        &json!({ "reason": "driver_turn_abandoned", "owner_client_key_id": owner }),
+    ) {
+        tracing::error!("failed to log driver_turn_abandoned: {e}");
+    }
+}
+
+/// Tear down a session whose paused turn cannot be answered with a valid
+/// `user` turn: log `session.error` `tool_result_merge_invalid` and move the
+/// session to terminal `error`. Its durable assistant `tool_use` message is
+/// intentionally not replayable without a valid immediately-following result.
+fn fail_tool_result_merge(state: &AppState, session_id: &str, acting: &str, reason: &str) {
+    let _ = broadcast::insert_and_publish(
+        &state.store,
+        &state.broadcaster,
+        session_id,
+        Some(acting),
+        EventType::SessionError,
+        &json!({ "reason": "tool_result_merge_invalid", "detail": reason }),
+    );
+    let _ = state
+        .store
+        .with_conn(|c| sessions::close_session(c, session_id, STATE_ERROR));
+    // The session moved to terminal `error`: end its anchor span now (marked
+    // Error), matching the provider-exhaustion teardown, so it is not left live
+    // with an inflated duration and Unset status (contract §1.1).
+    state.end_session_span(session_id, Some("tool result merge invalid"));
 }
 
 /// Reassemble the single `user`-turn content that answers a paused mixed
@@ -1066,6 +1122,10 @@ fn is_voluntary_abandonment(content: &Value) -> bool {
 // session.compact
 // ---------------------------------------------------------------------------
 
+/// How often a queued `session.compact` re-checks for a paused turn while it
+/// waits on the turn gate.
+const COMPACT_PAUSE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// `session.compact` params. `{}`, `{"prompt":null}`, and `{"prompt":"..."}` are
 /// all accepted; anything else in `prompt` is `-32602`.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1093,10 +1153,29 @@ struct CompactParams {
 /// `prompt`, then the session's stored `mode: client` prompt, then the engine's
 /// built-in default.
 ///
-/// The result is the produced `session.compaction.completed` event record. Every
-/// event the compaction logs (started, the provider exchange, the synthetic
-/// summary, completed) already reaches `session.subscribe` watchers live through
-/// the shared broadcaster; this method adds no streaming protocol of its own.
+/// **Paused turns.** A compaction cannot run against an unanswered `tool_use`,
+/// and a paused turn parks the gate until its owner resumes it — so waiting
+/// would deadlock a harness that pauses on a tool call and then compacts. If
+/// the session has a live paused turn (any owner, including the caller) the
+/// call fails immediately with `-32020` (`turn in progress: resolve the paused
+/// turn before compacting`), including when a turn that was running while this
+/// call queued pauses before releasing the gate. A pause past
+/// `BAE_TURN_TIMEOUT` is reclaimed exactly as `session.sendMessage` reclaims it
+/// (`session.error` `driver_turn_abandoned`), retired with one synthetic
+/// `role: "user"` `server.message.send` (`synthetic: "abandoned_tool_results"`)
+/// answering every outstanding `tool_use`, and the compaction proceeds. A
+/// running (not paused) turn is still waited for on the gate.
+///
+/// Manual compaction ignores the auto-compaction backoff; a success clears it.
+///
+/// The terminal result is the produced `session.compaction.completed` event
+/// record. Like `session.sendMessage`, the response is an NDJSON stream: once
+/// the gate is held the caller is subscribed to the session feed, and every
+/// event the compaction logs (an expired pause's retirement, `started`, the
+/// provider exchange, the preamble, the summary, `completed`) is forwarded as a
+/// `session.event` notification frame before the terminal frame. Failures that
+/// happen before the gate is taken (`-32001`, a non-open session, `-32602`)
+/// answer with a single frame.
 async fn compact_rpc(
     state: &AppState,
     session: &SessionRecord,
@@ -1128,11 +1207,134 @@ async fn compact_rpc(
             )
         }
     };
+    let state = state.clone();
+    let session_id = session.id.clone();
+    let acting = acting_client_key_id.to_string();
+    let resp_id = id_present.then_some(req_id);
+    spawn_stream(move |tx| drive_compact(state, session_id, acting, resp_id, call_params, tx))
+}
 
+/// Drive one `session.compact` once its params are valid: queue on the turn
+/// gate (failing fast on a live pause), subscribe to the session feed, run the
+/// compaction while forwarding its events live, then write the terminal frame.
+async fn drive_compact(
+    state: AppState,
+    session_id: String,
+    acting_client_key_id: String,
+    resp_id: Option<Value>,
+    call_params: CompactParams,
+    tx: mpsc::Sender<Bytes>,
+) {
     // The point where a compaction genuinely waits for an in-flight turn (and
     // vice versa). Held across the history read, the provider call, and every
-    // event insert below.
-    let _gate = state.turn_gate(&session.id).lock_owned().await;
+    // event insert below. While queued, keep checking for a pause: a paused
+    // turn never releases the gate on its own, so fail fast (or reclaim an
+    // expired one) instead of waiting. The lock future stays pinned across
+    // checks so this call keeps its FIFO position.
+    let gate = state.turn_gate(&session_id);
+    let lock = gate.lock_owned();
+    tokio::pin!(lock);
+    let mut pause_check = tokio::time::interval(COMPACT_PAUSE_CHECK_INTERVAL);
+    let (_gate, expired_pause) = loop {
+        match claim_pending_turn(&state, &session_id, &acting_client_key_id, false) {
+            PendingClaim::None => {}
+            PendingClaim::Expired(pt) => {
+                break (
+                    pt.guard,
+                    Some((pt.owner_client_key_id, pt.server_tool_results)),
+                )
+            }
+            // `owner_may_resume = false` never yields `Owned`; dropping its
+            // guard here would silently release the owner's paused turn.
+            PendingClaim::Owned(_) => unreachable!("session.compact never resumes a pause"),
+            PendingClaim::Held => {
+                emit_terminal(&tx, &resp_id, |id| {
+                    error_obj(
+                        id,
+                        -32020,
+                        "turn in progress: resolve the paused turn before compacting",
+                    )
+                })
+                .await;
+                return;
+            }
+        }
+        tokio::select! {
+            biased;
+            guard = &mut lock => break (guard, None),
+            _ = pause_check.tick() => {}
+        }
+    };
+
+    // Subscribe only once the gate is held, so a queued caller's stream stays
+    // silent while another driver's turn is in flight, and before anything is
+    // logged, so no compaction event slips past.
+    let (mut rx, _cancel) = state.broadcaster.subscribe(&session_id);
+
+    let work = compact_under_gate(
+        &state,
+        &session_id,
+        &acting_client_key_id,
+        expired_pause,
+        call_params,
+    );
+    tokio::pin!(work);
+
+    // Forward events while the compaction runs. A disconnected or lagged
+    // caller stops the forwarding but never the compaction itself: it already
+    // holds the gate and its record is written atomically.
+    let mut streaming = true;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            recv = rx.recv(), if streaming => match recv {
+                Ok(record) => {
+                    if !emit(&tx, &notification(&record)).await {
+                        streaming = false;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    let _ = emit(&tx, &lagged_error()).await;
+                    streaming = false;
+                }
+                Err(RecvError::Closed) => streaming = false,
+            },
+            outcome = &mut work => break outcome,
+        }
+    };
+    if !streaming {
+        return;
+    }
+    // Flush any events published between the last poll and the work returning.
+    while let Ok(record) = rx.try_recv() {
+        if !emit(&tx, &notification(&record)).await {
+            return;
+        }
+    }
+    match outcome {
+        Ok(result) => emit_terminal(&tx, &resp_id, |id| result_obj(id, result)).await,
+        Err((code, message)) => {
+            emit_terminal(&tx, &resp_id, |id| error_obj(id, code, message)).await
+        }
+    }
+}
+
+/// Everything `session.compact` does while holding the turn gate. Returns the
+/// terminal result (the `completed` event view) or the `(code, message)` error.
+async fn compact_under_gate(
+    state: &AppState,
+    session_id: &str,
+    acting_client_key_id: &str,
+    expired_pause: Option<(String, Vec<Value>)>,
+    call_params: CompactParams,
+) -> Result<Value, (i64, String)> {
+    let internal = |e: rusqlite::Error| {
+        tracing::error!("database error in /rpc: {e}");
+        (-32603, "Internal error".to_string())
+    };
+    if let Some((owner, _)) = &expired_pause {
+        log_turn_abandoned(state, session_id, owner);
+    }
 
     // Re-read the session now the gate is held: the turn that was in flight
     // while this call queued may have moved it to `error`, or a close may have
@@ -1140,61 +1342,99 @@ async fn compact_rpc(
     // config for the stored-prompt fallback.
     let session = match state
         .store
-        .with_conn(|c| sessions::get_session(c, &session.id))
+        .with_conn(|c| sessions::get_session(c, session_id))
     {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return single_or_empty(
-                id_present,
-                error_obj(req_id, -32000, "session no longer exists"),
-            )
-        }
-        Err(e) => {
-            tracing::error!("database error in /rpc: {e}");
-            return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
-        }
+        Ok(None) => return Err((-32000, "session no longer exists".to_string())),
+        Err(e) => return Err(internal(e)),
     };
     if session.state != STATE_OPEN {
-        let state_str = session.state.clone();
-        return single_or_empty(
-            id_present,
-            error_obj(req_id, -32000, format!("session is {state_str}, not open")),
-        );
+        return Err((-32000, format!("session is {}, not open", session.state)));
     }
-    let profile =
-        match state
+
+    // Retire a reclaimed expired pause so the persisted history is a valid
+    // provider transcript again (`assistant(tool_use) → user(tool_result…)`):
+    // the server results dispatched before the pause plus a synthetic error
+    // result for every unanswered client call — the same content a timed-out
+    // `session.sendMessage` records — as one synthetic `user` server message,
+    // followed (again as `session.sendMessage` does) by a `tool.result` event
+    // for every block that was not already logged at server dispatch time.
+    if let Some((_, stashed_server_results)) = expired_pause {
+        let tool_uses = state
             .store
-            .with_conn(|c| profiles::get(c, &session.profile_id))
-        {
-            Ok(Some(p)) => p,
-            Ok(None) => return single_or_empty(
-                id_present,
-                error_obj(
-                    req_id,
-                    -32000,
-                    "profile_unavailable: the profile bound to this session is no longer available",
-                ),
-            ),
-            Err(e) => {
-                tracing::error!("database error in /rpc: {e}");
-                return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+            .with_conn(|c| sessions::last_assistant_tool_uses(c, &session.id))
+            .map_err(internal)?;
+        let content = match cancel_abandoned_tool_uses(
+            &tool_uses,
+            &stashed_server_results,
+            &Value::Array(Vec::new()),
+        ) {
+            Ok(content) => content,
+            Err(reason) => {
+                fail_tool_result_merge(state, &session.id, acting_client_key_id, &reason);
+                return Err((-32000, format!("tool result merge invalid: {reason}")));
             }
         };
+        broadcast::insert_and_publish(
+            &state.store,
+            &state.broadcaster,
+            &session.id,
+            Some(acting_client_key_id),
+            EventType::ServerMessageSend,
+            &json!({
+                "role": "user",
+                "content": content,
+                "synthetic": session::SYNTHETIC_ABANDONED_TOOL_RESULTS,
+            }),
+        )
+        .map_err(internal)?;
+        let server_ids: HashSet<&str> = stashed_server_results
+            .iter()
+            .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+            .collect();
+        for block in tool_result_blocks(&content) {
+            if block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| server_ids.contains(id))
+            {
+                continue;
+            }
+            broadcast::insert_and_publish(
+                &state.store,
+                &state.broadcaster,
+                &session.id,
+                Some(acting_client_key_id),
+                EventType::ToolResult,
+                &block,
+            )
+            .map_err(internal)?;
+        }
+    }
+
+    let profile = match state
+        .store
+        .with_conn(|c| profiles::get(c, &session.profile_id))
+    {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err((
+                -32000,
+                "profile_unavailable: the profile bound to this session is no longer available"
+                    .to_string(),
+            ))
+        }
+        Err(e) => return Err(internal(e)),
+    };
 
     // A manual trigger has no "call that just happened" to read usage from, so
     // the `started` event's `token_count` is the best-effort figure from the
     // session's newest persisted `provider.response` — informational only, and
     // `None` when the session has made no provider call with usable usage yet.
-    let token_count = match state
+    let token_count = state
         .store
         .with_conn(|c| sessions::last_provider_token_count(c, &session.id))
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("database error in /rpc: {e}");
-            return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
-        }
-    };
+        .map_err(internal)?;
 
     // This call's prompt wins; otherwise a `mode: client` session's stored
     // prompt; otherwise the engine's built-in default (`None` here). An `auto`
@@ -1215,20 +1455,29 @@ async fn compact_rpc(
         session::CompactionTrigger::Client { token_count },
         acting_client_key_id,
         &state.telemetry_metrics,
+        &mut Vec::new(),
     )
     .await
     {
-        Ok(completed) => single_or_empty(id_present, result_obj(req_id, event_view(&completed))),
-        // A logical failure (providers exhausted, or a response with no usage to
-        // record): the session stays open and compactable, and its previous
-        // effective history is untouched.
-        Err(session::TurnError::CompactionFailed(detail)) => single_or_empty(
-            id_present,
-            error_obj(req_id, -32000, format!("compaction failed: {detail}")),
-        ),
+        Ok(completed) => {
+            // The history was just reset, so any auto-compaction backoff from
+            // an earlier failed attempt no longer applies.
+            state
+                .compaction_backoff
+                .lock()
+                .expect("compaction backoff mutex poisoned")
+                .remove(&session.id);
+            Ok(event_view(&completed))
+        }
+        // A logical failure (provider config, providers exhausted, a truncated
+        // or empty summary): the session stays open and compactable, and its
+        // previous effective history is untouched.
+        Err(session::TurnError::CompactionFailed(detail)) => {
+            Err((-32000, format!("compaction failed: {detail}")))
+        }
         Err(e) => {
             tracing::error!("session compaction failed: {e}");
-            single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"))
+            Err((-32603, "Internal error".to_string()))
         }
     }
 }

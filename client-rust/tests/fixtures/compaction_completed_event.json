@@ -1,0 +1,14 @@
+{
+  "id": "evt_01completed",
+  "session_id": "ses_01example",
+  "client_key_id": "key_01example",
+  "event_type": "session.compaction.completed",
+  "payload": {
+    "preamble_event_id": "evt_01preamble",
+    "summary_event_id": "evt_01summary",
+    "compacted_message_count": 17,
+    "input_tokens": 42100,
+    "summary_tokens": 900
+  },
+  "created_at": "2026-09-23T18:26:10.000Z"
+}

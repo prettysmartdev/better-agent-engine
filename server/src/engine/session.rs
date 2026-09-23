@@ -46,9 +46,10 @@
 //! `session.compact` RPC (`mode: client`) or, for a session created with
 //! `compaction: {"mode":"auto","size":N}`, by [`run_turn`] itself once the
 //! provider's own reported token usage for the turn it just finished crosses
-//! `N`. Nothing is rewritten: the summary is appended as an ordinary synthetic
-//! `server.message.send` and `session.compaction.completed` points at it, so a
-//! later [`sessions::stream_history`] starts its scan there while the full
+//! `N`. Nothing is rewritten: a synthetic `user` preamble and the summary are
+//! appended as ordinary `server.message.send` events and
+//! `session.compaction.completed` points at both, so a later
+//! [`sessions::stream_history`] starts its scan at the preamble while the full
 //! pre-compaction log stays intact for replay.
 
 use std::collections::{HashMap, HashSet};
@@ -150,11 +151,49 @@ pub enum CompactionTrigger {
     Auto {
         token_count: u64,
         threshold_tokens: u64,
+        /// The first auto attempt after a failed one (backoff satisfied):
+        /// `started.reason` is `retry_after_failure` instead of
+        /// `token_threshold`.
+        retry_after_failure: bool,
     },
     Client {
         token_count: Option<u64>,
     },
 }
+
+/// The persisted synthetic user message that precedes every compaction summary.
+/// Byte-exact and never templated, so prompt-cache prefixes stay stable across
+/// turns. Also the text the Anthropic request normalizer prepends to a history
+/// that does not start with `user` ([`provider::prepare_messages`]).
+pub const COMPACTION_PREAMBLE_TEXT: &str =
+    "The earlier part of this conversation was compacted. A summary follows.";
+/// `payload.synthetic` value on the compaction preamble event.
+pub const SYNTHETIC_COMPACTION_PREAMBLE: &str = "compaction_preamble";
+/// `payload.synthetic` value on the user message the server writes when it
+/// retires an expired paused turn on behalf of `session.compact`.
+pub const SYNTHETIC_ABANDONED_TOOL_RESULTS: &str = "abandoned_tool_results";
+/// Output budget floor for the compaction call: it uses the larger of this and
+/// the provider entry's own `max_tokens`, so a profile tuned for short turns
+/// cannot truncate the summary.
+pub const MIN_COMPACTION_MAX_TOKENS: u32 = 4096;
+
+/// A failed auto-compaction attempt, remembered so the next attempt waits until
+/// the history has meaningfully grown (see [`CompactionBackoff`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedAutoCompaction {
+    /// The trigger's token count at the failed attempt.
+    pub token_count: u64,
+    /// Turns completed since that attempt.
+    pub completed_turns_since: u32,
+}
+
+/// Per-session auto-compaction backoff state, keyed by session id. In-memory
+/// only (a restart clears it, which merely allows one early retry). After a
+/// failed auto attempt, auto compaction is suppressed until at least one more
+/// turn has completed **and** the trigger's token count exceeds the failed
+/// attempt's; that retry's `started` event says `reason: "retry_after_failure"`.
+/// A manual `session.compact` ignores it.
+pub type CompactionBackoff = Arc<std::sync::Mutex<HashMap<String, FailedAutoCompaction>>>;
 
 /// The built-in compaction instruction, used for every auto-triggered
 /// compaction and for a `session.compact` call that supplies no prompt of its
@@ -236,6 +275,7 @@ pub async fn run_turn(
     max_subagents_per_session: usize,
     acting_client_key_id: &str,
     pending_auto_compaction: Option<CompactionTrigger>,
+    compaction_backoff: &CompactionBackoff,
     metrics: &crate::telemetry::Metrics,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
@@ -380,14 +420,14 @@ pub async fn run_turn(
             &tools_value,
             metrics,
             &mut events,
-            true,
+            AttemptPurpose::Turn,
         )
         .await?;
 
         let body = match success {
-            Some((body, usage)) => {
-                last_usage = usage;
-                body
+            Some(ok) => {
+                last_usage = ok.usage;
+                ok.canonical
             }
             None => {
                 events.push(log_event(
@@ -425,9 +465,14 @@ pub async fn run_turn(
             // extension above) and never on a `Paused` outcome, whose assistant
             // `tool_use` message must stay the active history tail until the
             // client answers it.
+            //
+            // Every compaction event (started, the provider exchange, preamble,
+            // summary, completed — or, on failure, just the attempt's audit
+            // trail) is appended to this turn's `events`, so the terminal
+            // `result.events` is the turn's full log.
             let auto_trigger =
                 pending_auto_compaction.or_else(|| auto_trigger(session, last_usage));
-            if let Some(record) = maybe_auto_compact(
+            maybe_auto_compact(
                 store,
                 http,
                 broadcaster,
@@ -435,13 +480,12 @@ pub async fn run_turn(
                 profile,
                 provider_registry,
                 auto_trigger,
+                compaction_backoff,
                 acting_client_key_id,
                 metrics,
+                &mut events,
             )
-            .await?
-            {
-                events.push(record);
-            }
+            .await?;
             return Ok(Turn {
                 message,
                 events,
@@ -950,18 +994,41 @@ fn resolve_provider_chain(
     Ok((configs, config_names))
 }
 
+/// Why a [`provider_attempts`] walk is running. The single behavioural
+/// differences between the two callers: an ordinary turn records a
+/// `session.error` context event when the primary fails (that failure is what
+/// starts the fallback walk), while a compaction attempt writes no
+/// session-level error events at all — a failed compaction is not a session
+/// failure — and tags both provider payloads `purpose: "compaction"` so token
+/// accounting can tell the summary call apart from real turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptPurpose {
+    Turn,
+    Compaction,
+}
+
+/// The first successful attempt of a [`provider_attempts`] walk.
+struct AttemptSuccess {
+    /// The canonical-shape response body.
+    canonical: Value,
+    /// The attempt's reported `(input_tokens, output_tokens)`; `None` when the
+    /// provider omitted usage.
+    usage: Option<(u64, u64)>,
+    /// Set when the response was cut off by the output budget
+    /// ([`provider::truncation_reason`]).
+    truncated: Option<&'static str>,
+}
+
 /// One provider call's fallback walk: try `configs` in order, inserting a
 /// `provider.request` before and a `provider.response` after **every** attempt
-/// (success or failure), and return the first success as its canonical body plus
-/// that attempt's reported `(input_tokens, output_tokens)` — `None` inside the
-/// tuple when the provider omitted usage. `None` overall means every provider
-/// failed; the caller decides what that means.
+/// (success or failure), and return the first success. `None` means every
+/// provider failed; the caller decides what that means.
 ///
-/// `log_primary_failure` is the single behavioural difference between the two
-/// callers: an ordinary turn records a `session.error` context event when the
-/// primary fails (that failure is what starts the fallback walk), while a
-/// compaction attempt writes no session-level error events at all — a failed
-/// compaction is not a session failure.
+/// Each attempt's messages are prepared for that attempt's provider kind
+/// ([`provider::prepare_messages`]) — the primary and fallbacks may differ in
+/// kind — and the logged `provider.request.messages` is exactly the list sent.
+/// When the Anthropic normalizer had to change the sequence, the request payload
+/// also carries `normalized` describing what it did.
 #[allow(clippy::too_many_arguments)]
 async fn provider_attempts(
     store: &Store,
@@ -975,8 +1042,8 @@ async fn provider_attempts(
     tools: &Value,
     metrics: &crate::telemetry::Metrics,
     events: &mut Vec<EventRecord>,
-    log_primary_failure: bool,
-) -> Result<Option<(Value, Option<(u64, u64)>)>, TurnError> {
+    purpose: AttemptPurpose,
+) -> Result<Option<AttemptSuccess>, TurnError> {
     for (i, cfg) in configs.iter().enumerate() {
         let kind = if i == 0 { "primary" } else { "fallback" };
         // One `bae.provider.attempt` child span per fallback-walk iteration,
@@ -988,27 +1055,35 @@ async fn provider_attempts(
             i,
             kind,
         );
+        let (sent_messages, normalized) = provider::prepare_messages(cfg.provider, messages);
+        let mut request_payload = json!({
+            "attempt": i,
+            "kind": kind,
+            "provider": cfg.provider.as_str(),
+            "base_url": cfg.effective_base_url(),
+            "model": cfg.model,
+            "max_tokens": cfg.max_tokens,
+            "messages": sent_messages,
+            "tools": tools,
+        });
+        if let Some(normalized) = normalized {
+            request_payload["normalized"] = normalized;
+        }
+        if purpose == AttemptPurpose::Compaction {
+            request_payload["purpose"] = json!("compaction");
+        }
         events.push(log_event(
             store,
             broadcaster,
             sid,
             cid,
             EventType::ProviderRequest,
-            json!({
-                "attempt": i,
-                "kind": kind,
-                "provider": cfg.provider.as_str(),
-                "base_url": cfg.effective_base_url(),
-                "model": cfg.model,
-                "max_tokens": cfg.max_tokens,
-                "messages": messages,
-                "tools": tools,
-            }),
+            request_payload,
         )?);
 
         let provider_started = Instant::now();
         match tracing::Instrument::instrument(
-            provider::call(http, cfg, messages, tools),
+            provider::call(http, cfg, &sent_messages, tools),
             attempt_span.clone(),
         )
         .await
@@ -1025,17 +1100,26 @@ async fn provider_attempts(
                 // canonical content translation, and recording it as an explicit
                 // small field means no consumer ever re-parses `body`.
                 let usage = provider::usage_tokens(cfg.provider, &resp.raw);
+                let truncated = provider::truncation_reason(cfg.provider, &resp.raw);
                 // The event records the raw, untranslated wire body; the
                 // loop consumes only the canonical translation.
+                let mut response_payload = json!({ "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": true, "status": 200, "body": resp.raw, "usage": usage_payload(usage) });
+                if purpose == AttemptPurpose::Compaction {
+                    response_payload["purpose"] = json!("compaction");
+                }
                 events.push(log_event(
                     store,
                     broadcaster,
                     sid,
                     cid,
                     EventType::ProviderResponse,
-                    json!({ "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": true, "status": 200, "body": resp.raw, "usage": usage_payload(usage) }),
+                    response_payload,
                 )?);
-                return Ok(Some((resp.canonical, usage)));
+                return Ok(Some(AttemptSuccess {
+                    canonical: resp.canonical,
+                    usage,
+                    truncated,
+                }));
             }
             Err(e) => {
                 metrics.record_provider_attempt(
@@ -1051,20 +1135,24 @@ async fn provider_attempts(
                     );
                 }
                 crate::telemetry::set_error(&attempt_span, e.detail());
+                let mut response_payload = json!({
+                    "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": false,
+                    "status": e.status(), "error": e.detail(), "body": e.body(),
+                });
+                if purpose == AttemptPurpose::Compaction {
+                    response_payload["purpose"] = json!("compaction");
+                }
                 events.push(log_event(
                     store,
                     broadcaster,
                     sid,
                     cid,
                     EventType::ProviderResponse,
-                    json!({
-                        "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": false,
-                        "status": e.status(), "error": e.detail(), "body": e.body(),
-                    }),
+                    response_payload,
                 )?);
                 // The primary failing is the trigger for the fallback walk;
                 // record a session.error context event once, then continue.
-                if log_primary_failure && i == 0 {
+                if purpose == AttemptPurpose::Turn && i == 0 {
                     events.push(log_event(
                         store,
                         broadcaster,
@@ -1080,20 +1168,27 @@ async fn provider_attempts(
     Ok(None)
 }
 
-/// The auto-mode threshold check, run once per turn at a true turn boundary.
+/// The auto-mode compaction step, run once per turn at a true turn boundary.
 ///
 /// Eligible only for a session created with
 /// `compaction: {"mode":"auto","size":N}` — `Client` mode and a legacy NULL
-/// config (`None`) never auto-trigger, so the server only ever rewrites what it
-/// sends to the model for a session that explicitly asked for it (the bounded
-/// exception to `aspec/architecture/design.md` Principle 2).
+/// config (`None`) never produce a trigger, so the server only ever rewrites
+/// what it sends to the model for a session that explicitly asked for it (the
+/// bounded exception to `aspec/architecture/design.md` Principle 2).
 ///
 /// `trigger` is either the just-completed turn's threshold crossing or a
 /// crossing preserved while an earlier client-tool exchange was paused.
 ///
+/// **Backoff.** When the session's previous auto attempt failed, this turn is
+/// counted toward the [`CompactionBackoff`] and a new attempt runs only once at
+/// least one more turn has completed **and** the trigger's token count exceeds
+/// the failed attempt's; it then runs with `reason: "retry_after_failure"`. A
+/// failure (re-)arms the backoff; a success clears it.
+///
+/// Every event the attempt logs is appended to `events` (the turn's own log).
 /// A logical [`TurnError::CompactionFailed`] is swallowed — the ordinary turn
-/// that just succeeded stays successful and the session stays open, so the next
-/// turn simply checks again. A store failure still propagates.
+/// that just succeeded stays successful and the session stays open. A store
+/// failure still propagates.
 #[allow(clippy::too_many_arguments)]
 async fn maybe_auto_compact(
     store: &Store,
@@ -1103,13 +1198,44 @@ async fn maybe_auto_compact(
     profile: &ProfileRecord,
     provider_registry: &HashMap<String, ProviderConfig>,
     trigger: Option<CompactionTrigger>,
+    backoff: &CompactionBackoff,
     acting_client_key_id: &str,
     metrics: &crate::telemetry::Metrics,
-) -> Result<Option<EventRecord>, TurnError> {
-    let Some(trigger) = trigger else {
-        return Ok(None);
+    events: &mut Vec<EventRecord>,
+) -> Result<(), TurnError> {
+    // Count this completed turn against an armed backoff before deciding.
+    let failed = {
+        let mut map = backoff.lock().expect("compaction backoff mutex poisoned");
+        map.get_mut(&session.id).map(|f| {
+            f.completed_turns_since = f.completed_turns_since.saturating_add(1);
+            *f
+        })
     };
-    match run_compaction(
+    let Some(mut trigger) = trigger else {
+        return Ok(());
+    };
+    let CompactionTrigger::Auto {
+        token_count,
+        retry_after_failure,
+        ..
+    } = &mut trigger
+    else {
+        return Ok(());
+    };
+    let token_count = *token_count;
+    if let Some(failed) = failed {
+        if failed.completed_turns_since < 1 || token_count <= failed.token_count {
+            tracing::debug!(
+                session_id = %session.id,
+                token_count,
+                failed_token_count = failed.token_count,
+                "auto compaction suppressed: backing off after a failed attempt"
+            );
+            return Ok(());
+        }
+        *retry_after_failure = true;
+    }
+    let result = run_compaction(
         store,
         http,
         broadcaster,
@@ -1121,18 +1247,62 @@ async fn maybe_auto_compact(
         trigger,
         acting_client_key_id,
         metrics,
+        events,
     )
-    .await
-    {
-        Ok(record) => Ok(Some(record)),
+    .await;
+    let mut map = backoff.lock().expect("compaction backoff mutex poisoned");
+    match result {
+        Ok(_) => {
+            map.remove(&session.id);
+            Ok(())
+        }
         Err(TurnError::CompactionFailed(detail)) => {
             tracing::warn!(
                 session_id = %session.id,
-                "auto compaction attempt failed, leaving the session compactable: {detail}"
+                "auto compaction attempt failed, backing off until the history grows: {detail}"
             );
-            Ok(None)
+            map.insert(
+                session.id.clone(),
+                FailedAutoCompaction {
+                    token_count,
+                    completed_turns_since: 0,
+                },
+            );
+            Ok(())
         }
-        Err(e) => Err(e),
+        // A store failure inside the compaction's own writes (e.g. its
+        // transaction rolled back). The turn itself already completed and was
+        // persisted, so it must not be reported as failed: record the problem
+        // (best effort — the store may still be failing), back off exactly as
+        // for a logical failure, and let the turn return normally.
+        Err(e) => {
+            tracing::error!(
+                session_id = %session.id,
+                "auto compaction attempt hit a store error, backing off: {e}"
+            );
+            map.insert(
+                session.id.clone(),
+                FailedAutoCompaction {
+                    token_count,
+                    completed_turns_since: 0,
+                },
+            );
+            drop(map);
+            match log_event(
+                store,
+                broadcaster,
+                &session.id,
+                acting_client_key_id,
+                EventType::SessionError,
+                json!({ "reason": "compaction_store_failed", "detail": e.to_string() }),
+            ) {
+                Ok(ev) => events.push(ev),
+                Err(log_err) => {
+                    tracing::error!("failed to log compaction_store_failed: {log_err}")
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1158,6 +1328,7 @@ fn auto_trigger(
     (token_count > size).then_some(CompactionTrigger::Auto {
         token_count,
         threshold_tokens: size,
+        retry_after_failure: false,
     })
 }
 
@@ -1166,26 +1337,35 @@ fn auto_trigger(
 /// everything the server sends the model next.
 ///
 /// Nothing is ever rewritten or deleted — `session_events` stays append-only.
-/// The summary is persisted as one ordinary synthetic `server.message.send`, and
-/// the `session.compaction.completed` event points at it; a later
-/// [`sessions::stream_history`] scopes its message scan to start at that event,
-/// so the pre-compaction log remains fully intact for replay while the
-/// provider-facing history becomes "compacted summary, then everything after".
+/// Success persists a synthetic `user` preamble
+/// (`{"role":"user","content":[…COMPACTION_PREAMBLE_TEXT…],"synthetic":"compaction_preamble"}`),
+/// the summary as an `assistant` message (both `server.message.send`), and the
+/// `session.compaction.completed` marker pointing at both. A later
+/// [`sessions::stream_history`] scopes its scan to start at the preamble, so the
+/// provider-facing history becomes `user(preamble) → assistant(summary) → …` —
+/// a valid sequence for every provider — while the pre-compaction log remains
+/// fully intact for replay.
 ///
 /// Event order on success:
 /// `session.compaction.started` → one or more (`provider.request` →
-/// `provider.response`) attempts → `server.message.send` (the summary) →
-/// `session.compaction.completed` (returned).
+/// `provider.response`) attempts → preamble → summary →
+/// `session.compaction.completed` (returned). The last three are inserted in
+/// one SQLite transaction and broadcast only after it commits.
 ///
-/// On provider exhaustion, the attempt stops after its provider events: no
-/// summary and no completed marker are written, [`TurnError::CompactionFailed`]
-/// is returned, and the session keeps its previous effective history. A
-/// successful response without usage still commits its summary; its completion
-/// fields are null because accounting is unavailable.
+/// The call gets its own output budget: every provider entry's `max_tokens` is
+/// raised to at least [`MIN_COMPACTION_MAX_TOKENS`]. It fails with
+/// [`TurnError::CompactionFailed`], leaving `started` and the provider events as
+/// the attempt's only trace and the session's effective history unchanged, when
+/// every provider fails, when the summary was truncated by the output budget
+/// (`stop_reason: "max_tokens"` / `finish_reason: "length"` — no fallback is
+/// tried, it is a budget problem, not an outage), or when it contains no text.
+/// A successful response without usage still commits its summary; its
+/// completion fields are null because accounting is unavailable.
 ///
-/// `prompt` is the already-resolved compaction instruction (a `session.compact`
-/// caller's own prompt, else the session's stored client-mode prompt); `None`
-/// uses [`DEFAULT_COMPACTION_PROMPT`].
+/// Every event logged is pushed onto `events`, success or failure. `prompt` is
+/// the already-resolved compaction instruction (a `session.compact` caller's own
+/// prompt, else the session's stored client-mode prompt); `None` uses
+/// [`DEFAULT_COMPACTION_PROMPT`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_compaction(
     store: &Store,
@@ -1198,24 +1378,25 @@ pub async fn run_compaction(
     trigger: CompactionTrigger,
     acting_client_key_id: &str,
     metrics: &crate::telemetry::Metrics,
+    events: &mut Vec<EventRecord>,
 ) -> Result<EventRecord, TurnError> {
     let sid = session.id.as_str();
     let cid = acting_client_key_id;
-    // Compaction's own events are broadcast live through the same choke point as
-    // every other event; only the completed record is returned to the caller.
-    let mut events: Vec<EventRecord> = Vec::new();
 
     // Resolved before anything is logged: a profile whose primary provider no
     // longer resolves cannot start a compaction at all, so no `started` event is
     // written for an attempt that never reaches the model.
-    let (configs, config_names) = match resolve_provider_chain(profile, provider_registry) {
+    let (mut configs, config_names) = match resolve_provider_chain(profile, provider_registry) {
         Ok(v) => v,
         Err(e) => return Err(TurnError::CompactionFailed(format!("provider_config: {e}"))),
     };
+    for cfg in &mut configs {
+        cfg.max_tokens = cfg.max_tokens.max(MIN_COMPACTION_MAX_TOKENS);
+    }
 
     // The current effective history — already scoped to the most recent
-    // completed compaction, so a second compaction never re-summarizes
-    // already-compacted content.
+    // completed compaction (starting at its preamble), so a second compaction
+    // never re-summarizes already-compacted content.
     let history: Vec<Value> = store
         .with_conn(|c| sessions::stream_history(c, sid))
         .map_err(TurnError::Store)?;
@@ -1225,9 +1406,10 @@ pub async fn run_compaction(
         CompactionTrigger::Auto {
             token_count,
             threshold_tokens,
+            retry_after_failure,
         } => json!({
             "trigger": "auto",
-            "reason": "token_threshold",
+            "reason": if retry_after_failure { "retry_after_failure" } else { "token_threshold" },
             "token_count": token_count,
             "threshold_tokens": threshold_tokens,
         }),
@@ -1240,25 +1422,36 @@ pub async fn run_compaction(
             "threshold_tokens": Value::Null,
         }),
     };
-    log_event(
+    events.push(log_event(
         store,
         broadcaster,
         sid,
         cid,
         EventType::SessionCompactionStarted,
         started_payload,
-    )?;
+    )?);
 
-    // History plus one final synthetic `user` turn carrying the instruction.
-    // The server has no system-role concept and this work item deliberately
-    // does not add one, so compaction uses the same message shapes as every
-    // other provider call. No tools are advertised: the model's only job here is
-    // to write the summary.
+    // History plus the instruction as a final `user` turn. The server has no
+    // system-role concept and this work item deliberately does not add one, so
+    // compaction uses the same message shapes as every other provider call. If
+    // the history already ends with a `user` message (a paused turn retired by
+    // `session.compact`), the instruction is appended to it as a text block
+    // rather than sent as a second consecutive user message. No tools are
+    // advertised: the model's only job here is to write the summary.
+    let instruction = prompt.unwrap_or(DEFAULT_COMPACTION_PROMPT);
     let mut messages = history;
-    messages.push(json!({
-        "role": "user",
-        "content": prompt.unwrap_or(DEFAULT_COMPACTION_PROMPT),
-    }));
+    match messages.last_mut() {
+        Some(last) if last.get("role").and_then(Value::as_str) == Some("user") => {
+            let mut blocks = match last.get("content") {
+                Some(Value::Array(blocks)) => blocks.clone(),
+                Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+                _ => Vec::new(),
+            };
+            blocks.push(json!({ "type": "text", "text": instruction }));
+            last["content"] = Value::Array(blocks);
+        }
+        _ => messages.push(json!({ "role": "user", "content": instruction })),
+    }
     let messages_value = Value::Array(messages);
     let tools_value = Value::Array(Vec::new());
 
@@ -1273,48 +1466,66 @@ pub async fn run_compaction(
         &messages_value,
         &tools_value,
         metrics,
-        &mut events,
-        false,
+        events,
+        AttemptPurpose::Compaction,
     )
     .await?;
-    let Some((canonical, usage)) = success else {
+    let Some(success) = success else {
         return Err(TurnError::CompactionFailed(format!(
             "all {} providers failed",
             configs.len()
         )));
     };
-    // The single message containing the fully compacted session. Persisted as an
-    // ordinary assistant `server.message.send`, which is exactly why the scoped
-    // `stream_history` query picks it up as the first message of the new
-    // effective history with no separate "prepend a synthetic message" logic.
-    let summary = json!({
-        "role": "assistant",
-        "content": canonical.get("content").cloned().unwrap_or_else(|| json!([])),
+    if let Some(reason) = success.truncated {
+        return Err(TurnError::CompactionFailed(format!(
+            "summary truncated: {reason}"
+        )));
+    }
+    let content = success
+        .canonical
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let has_text = content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b.get("type").and_then(Value::as_str) == Some("text")
+                && b.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.trim().is_empty())
+        })
     });
-    let summary_event = log_event(
-        store,
-        broadcaster,
-        sid,
-        cid,
-        EventType::ServerMessageSend,
-        summary,
-    )?;
+    if !has_text {
+        return Err(TurnError::CompactionFailed("empty summary".to_string()));
+    }
 
-    // The summary text itself is not duplicated here — it lives in the event
-    // this marker points at.
-    log_event(
-        store,
-        broadcaster,
-        sid,
-        cid,
-        EventType::SessionCompactionCompleted,
-        json!({
-            "summary_event_id": summary_event.id,
-            "compacted_message_count": compacted_message_count,
-            "input_tokens": usage.map(|(input_tokens, _)| input_tokens),
-            "summary_tokens": usage.map(|(_, summary_tokens)| summary_tokens),
-        }),
-    )
+    // The preamble makes the replayed history start with `user`, and the
+    // summary — the single message containing the fully compacted session — is
+    // the assistant reply to it. The summary text is not duplicated in the
+    // completed marker; it lives in the event the marker points at.
+    let preamble = json!({
+        "role": "user",
+        "content": [{ "type": "text", "text": COMPACTION_PREAMBLE_TEXT }],
+        "synthetic": SYNTHETIC_COMPACTION_PREAMBLE,
+    });
+    let summary = json!({ "role": "assistant", "content": content });
+    let completed = json!({
+        "compacted_message_count": compacted_message_count,
+        "input_tokens": success.usage.map(|(input_tokens, _)| input_tokens),
+        "summary_tokens": success.usage.map(|(_, summary_tokens)| summary_tokens),
+    });
+    let records = store
+        .with_conn(|c| {
+            sessions::insert_compaction_records(c, sid, Some(cid), &preamble, &summary, &completed)
+        })
+        .map_err(TurnError::Store)?;
+    // Published only now that the transaction has committed, in write order.
+    for record in [&records.preamble, &records.summary, &records.completed] {
+        broadcaster.publish(record);
+    }
+    events.push(records.preamble);
+    events.push(records.summary);
+    events.push(records.completed.clone());
+    Ok(records.completed)
 }
 
 /// Server-form tool-result content: a compact JSON object in one text block.

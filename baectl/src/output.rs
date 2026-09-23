@@ -45,6 +45,10 @@ pub fn print_profile(v: &Value) {
     );
     print_str_list("mcp_servers", string_array(v.get("mcp_servers")));
     print_str_list("allowed_tools", string_array(v.get("allowed_tools")));
+    print_str_list(
+        "available_sandboxes",
+        string_array(v.get("available_sandboxes")),
+    );
     println!("created_at:       {}", field(v, "created_at"));
     println!("updated_at:       {}", field(v, "updated_at"));
 }

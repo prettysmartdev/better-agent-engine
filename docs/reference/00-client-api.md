@@ -230,7 +230,17 @@ in the registry is skipped non-fatally (logged as an error).
 > `auth_token`, no env var names are included.
 
 **Errors:**
-- `401 unauthorized` — bad or revoked client key.
+- `401 unauthorized` — bad or revoked client key. Checked before the request
+  body is even parsed, so a bad key wins over a malformed body.
+- `400 bad_request` — the body is malformed. Three cases, distinguished by
+  `detail`:
+  - a non-JSON body, or a missing/wrong `Content-Type` — `detail` is the raw
+    rejection text.
+  - a malformed `compaction` value (bad `mode`, missing `size`, non-integer
+    `size`, etc.) — `detail` is `"invalid compaction config: <serde error>"`,
+    e.g. `` "invalid compaction config: missing field `size`" ``.
+  - any other malformed field — `detail` is `"invalid request body: <serde
+    error>"`.
 - `400 bad_request` — `compaction.mode` is `"auto"` and `size` is below the
   1,000-token minimum. Checked before the profile is even loaded, so no
   session row (including an error-state audit row) is created for this case.
@@ -268,11 +278,23 @@ set — joining never merges with, replaces, or reads any other client's
 declared tools. See [Message Types — `session.join`](04-message-types.md#sessionjoin).
 
 `compaction` is a session-level setting fixed at creation — it cannot be
-changed by a joiner. Supplying a non-null `compaction` object on `join` is
-rejected with `400 bad_request` (checked before auth-adjacent state is even
-loaded), rather than silently ignored, since a joining client that believed
-it had changed the mode would be a silent correctness bug. Omitting the field
-(or sending `null`, indistinguishable from omission on the wire) is the only
+changed by a joiner. Supplying the `compaction` key on `join` **at all — including
+as `"compaction": null`** — is rejected with `400 bad_request` (checked
+before auth-adjacent state is even loaded):
+
+```json
+{
+  "type": "bad_request",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "compaction is a session-level setting fixed at creation and cannot be set on join"
+}
+```
+
+rather than silently ignored, since a joining client that believed it had
+changed the mode would be a silent correctness bug — and a client that
+serializes `"compaction": null` to mean "no change" needs the same rejection
+a stray, meaningful `null` would get. Omitting the key entirely is the only
 accepted form on `join`.
 
 **Response `201 Created`:** identical shape to `create`:
@@ -293,8 +315,9 @@ infrastructure established once, at create.
 **Checks, in order (first failure wins):**
 
 1. `401 unauthorized` — bad or missing client key.
-2. `400 bad_request` — a non-null `compaction` field was supplied. Checked
-   immediately after auth, before the session is even looked up.
+2. `400 bad_request` — the `compaction` key was present in the body at all
+   (including `"compaction": null`). Checked immediately after auth, before
+   the session is even looked up.
 3. `404 not_found` — no session with this id.
 4. `409 session_closed` — the session is `closed` or `error`
    (`detail: "session is already <state>"`, same shape as `DELETE`'s
@@ -641,6 +664,14 @@ plain content, and keeps the session open. See [Wire Protocol — FIFO
 turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration)
 for how the pause/resume gate itself works.
 
+A message that carries `tool_result` blocks when **no** paused turn is
+waiting for them — typically because its owner came back after
+`BAE_TURN_TIMEOUT` and another driver's message or a `session.compact` had
+already retired the pause — is rejected with `-32000` `"tool result merge
+invalid: no paused turn is awaiting tool results (it may have timed out and
+been retired)"`. Nothing is recorded and the session stays `open`; send an
+ordinary message instead.
+
 **Provider failure:**
 
 When all providers fail, the terminal response is still a `result` (not an
@@ -684,8 +715,30 @@ for when to use each mode.
 **Requires prior driver registration**, exactly like `session.sendMessage`.
 **Shares the same per-session turn gate** as `session.sendMessage` — a
 compaction can never run concurrently with a live turn on the same session;
-a call arriving while a turn is in flight queues (silent, zero-byte NDJSON
-response) exactly like a second driver's `sendMessage` would.
+a call arriving while a **running** turn is in flight queues (silent,
+zero-byte NDJSON response) exactly like a second driver's `sendMessage`
+would, and proceeds once that turn releases the gate.
+
+Unlike `session.sendMessage`, `session.compact` never waits on a **paused**
+turn:
+
+- If a paused turn is already blocking the gate when the compact call
+  arrives, or a turn that was running when the call queued *pauses* before
+  releasing the gate, the call fails immediately with `-32020` (see below)
+  instead of waiting — a driver that pauses on a tool call and then tries to
+  compact its own session would otherwise deadlock against itself, and an
+  observer's compact would otherwise block forever if the paused driver
+  never comes back.
+- A pause whose turn timeout has already **expired** is instead reclaimed
+  exactly as `session.sendMessage` reclaims it: a `session.error` event
+  (`reason: "driver_turn_abandoned"`) is logged, then one
+  `server.message.send` event answers every tool-use id the abandoned turn
+  never got a result for with a synthetic error `tool_result` (`synthetic:
+  "abandoned_tool_results"` — see [Message Types —
+  `server.message.send`](04-message-types.md#servermessagesend)), followed
+  by one `tool.result` event per synthetic client result (so every
+  `tool.call` stays paired), and the compaction then proceeds using that
+  repaired history.
 
 Permitted regardless of the session's stored `compaction.mode` — a harness
 may force an early compaction on a `mode: "auto"` session — and never mutates
@@ -718,35 +771,62 @@ the session's persisted config.
     "client_key_id": "key_…",
     "event_type": "session.compaction.completed",
     "payload": {
+      "preamble_event_id": "evt_…",
       "summary_event_id": "evt_…",
       "compacted_message_count": 17,
       "input_tokens": 42100,
       "summary_tokens": 900
     },
-    "created_at": "2026-07-06T18:26:10.000Z"
+    "created_at": "2026-09-23T18:26:10.000Z"
   }
 }
 ```
 
 Unlike `session.sendMessage`, this is not wrapped in a `{message, events}`
-envelope — `result` is the event itself. Every event the compaction produces
-(`session.compaction.started`, the compaction's own `provider.request`/
-`provider.response`, the synthetic `server.message.send` holding the
-summary, and `session.compaction.completed`) also streams live to any
-`session.subscribe` watcher through the ordinary broadcast path — this
-method adds no separate streaming protocol of its own.
+envelope — `result` is the event itself. Like `session.sendMessage`, the
+response is an NDJSON stream: once the call holds the turn gate, every event
+the compaction produces (`session.compaction.started`, the compaction's own
+`provider.request`/`provider.response`, the synthetic `server.message.send`
+preamble, the synthetic-free `server.message.send` holding the summary, and
+`session.compaction.completed`, in that order — preceded, when an expired
+pause is reclaimed, by its `session.error`, synthetic `server.message.send`
+and `tool.result` events) is written to the caller as a `session.event`
+notification frame before the terminal frame above. The same events also
+reach any `session.subscribe` watcher through the ordinary broadcast path.
+The errors checked before the gate is taken (`-32001`, a non-open session,
+`-32602`) are answered with a single frame.
 
-**JSON-RPC errors:**
-- `-32001` — caller is not a registered driver.
-- `-32602` — `prompt` is present and not a string or `null`.
-- `-32000` — session is not `open`; the profile was deleted; or the
-  compaction attempt itself failed because all providers were exhausted — message
-  `"compaction failed: <detail>"`. In every `-32000` case the session's
-  previous effective history is untouched and the session remains
-  compactable on a later attempt; see
+**JSON-RPC errors, checked in this order:**
+- `-32001` — caller is not a registered driver:
+  `"call session.registerDriver before session.compact"`.
+- `-32000` — session is not `open`: `"session is <state>, not open"`.
+- `-32602` — `prompt` is present and not a string or `null`:
+  `"Invalid params: <serde error>"`.
+- `-32020 turn_in_progress` — a paused turn is blocking the gate and its
+  timeout has not expired: `"turn in progress: resolve the paused turn
+  before compacting"`. Returned immediately, never waited on — see above. An
+  **expired** pause is reclaimed instead (no error), and compaction proceeds.
+- `-32000` — re-checked once the gate is held: the session no longer exists
+  or is no longer `open` (`"session no longer exists"` / `"session is
+  <state>, not open"`), or its profile was deleted (`"profile_unavailable:
+  the profile bound to this session is no longer available"`).
+- `-32000` — the compaction attempt itself failed, message
+  `"compaction failed: <detail>"` where `<detail>` is one of:
+  - `"provider_config: <detail>"` — the primary provider does not resolve.
+  - `"all <N> providers failed"` — every provider/fallback attempt failed.
+  - `"summary truncated: stop_reason max_tokens"` — the Anthropic response
+    was cut off by its own output-token budget.
+  - `"summary truncated: finish_reason length"` — the OpenAI equivalent.
+  - `"empty summary"` — the response had no non-whitespace text.
+
+  In every `-32000` case above the session's previous effective history is
+  untouched and the session remains compactable on a later attempt; see
   [`session.compaction.completed`](04-message-types.md#sessioncompactioncompleted)
-  for the failure/retry behavior in detail.
-- `-32603` — internal error (e.g. database failure).
+  for the failure/retry behavior in detail, including the backoff a failed
+  **automatic** attempt puts on later automatic triggers (`session.compact`
+  itself always ignores that backoff).
+- `-32603` — internal error, e.g. a database failure while writing the
+  preamble/summary/completed records: `"Internal error"`.
 
 ---
 
