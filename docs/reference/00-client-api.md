@@ -146,7 +146,8 @@ Auth: **client key**.
         { "harness": "codex", "command_template": "codex exec --model {model}", "prompt_via": "stdin", "timeout_secs": 600 }
       ]
     }
-  ]
+  ],
+  "compaction": { "mode": "auto", "size": 128000 }
 }
 ```
 
@@ -175,6 +176,30 @@ Auth: **client key**.
   checked against `available_sandboxes` when the remote launch is dispatched.
   The provider receives only the tool name, description, and input schema.
   Invalid declarations are rejected with `422 invalid_subagent_tools`.
+- `compaction` — optional, default omitted. Configures how this session's
+  history is compacted once it grows large. **Immutable for the life of the
+  session** — set only at creation; see [`POST .../join`](#post-apiv1sessionsidjoin--join-an-existing-session)
+  below for the rejection behavior on `join`. Two wire shapes:
+  ```json
+  {"mode": "auto", "size": 128000}
+  {"mode": "client"}
+  {"mode": "client", "prompt": "custom instruction"}
+  ```
+  - `mode: "auto"` — the server automatically compacts this session's history
+    once a completed turn's own reported usage (`input_tokens + output_tokens`,
+    from the provider's `usage` — see [Message Types —
+    `provider.response`](04-message-types.md#providerresponse)) exceeds
+    `size`. `size` is a **token** count, not bytes or characters, with a
+    minimum of **1,000** — a lower value is rejected with `400 bad_request`
+    before the session is created. See [`session.compaction.started`/`completed`](04-message-types.md#sessioncompactionstarted)
+    for the events this produces and the [Event Streaming
+    guide](../guides/06-event-streaming.md#compaction-auto-vs-client-mode) for
+    the behavior when a provider doesn't report usage.
+  - `mode: "client"` (also the default when `compaction` is omitted or
+    `null`) — the server never auto-compacts; the harness decides when to
+    call [`session.compact`](#sessioncompact). An optional `prompt` is used
+    as this session's default custom compaction instruction for future
+    `session.compact` calls that don't supply their own `prompt`.
 
 At session creation, BAE also connects to any MCP servers named in the
 profile's `mcp_servers` list, runs the MCP `initialize` handshake, and merges
@@ -206,6 +231,9 @@ in the registry is skipped non-fatally (logged as an error).
 
 **Errors:**
 - `401 unauthorized` — bad or revoked client key.
+- `400 bad_request` — `compaction.mode` is `"auto"` and `size` is below the
+  1,000-token minimum. Checked before the profile is even loaded, so no
+  session row (including an error-state audit row) is created for this case.
 - `403 tool_not_allowed` — a declared tool is not in `allowed_tools`.
 - `422 profile_unavailable` — the profile was deleted between key creation and
   session open. A `session.error` event is still recorded for audit.
@@ -239,6 +267,14 @@ exactly like `create`. A joining client declares its own, independent tool
 set — joining never merges with, replaces, or reads any other client's
 declared tools. See [Message Types — `session.join`](04-message-types.md#sessionjoin).
 
+`compaction` is a session-level setting fixed at creation — it cannot be
+changed by a joiner. Supplying a non-null `compaction` object on `join` is
+rejected with `400 bad_request` (checked before auth-adjacent state is even
+loaded), rather than silently ignored, since a joining client that believed
+it had changed the mode would be a silent correctness bug. Omitting the field
+(or sending `null`, indistinguishable from omission on the wire) is the only
+accepted form on `join`.
+
 **Response `201 Created`:** identical shape to `create`:
 
 ```json
@@ -257,23 +293,25 @@ infrastructure established once, at create.
 **Checks, in order (first failure wins):**
 
 1. `401 unauthorized` — bad or missing client key.
-2. `404 not_found` — no session with this id.
-3. `409 session_closed` — the session is `closed` or `error`
+2. `400 bad_request` — a non-null `compaction` field was supplied. Checked
+   immediately after auth, before the session is even looked up.
+3. `404 not_found` — no session with this id.
+4. `409 session_closed` — the session is `closed` or `error`
    (`detail: "session is already <state>"`, same shape as `DELETE`'s
    conflict). A joiner cannot resurrect a terminal session.
-4. `403 profile_mismatch` — the joining client key's `profile_id` differs
+5. `403 profile_mismatch` — the joining client key's `profile_id` differs
    from the session's `profile_id`. This is the hard boundary that keeps a
    client on profile X from ever attaching to a session created under
    profile Y. **No event is logged, no session key is minted, the session is
    untouched** — an authorization failure at the client-key level, same
    posture as `tool_not_allowed`.
-5. `422 profile_unavailable` — the shared profile was deleted. Same audit
+6. `422 profile_unavailable` — the shared profile was deleted. Same audit
    posture as `create`: a separate `state='error'` session row is logged; the
    joined session itself is untouched.
-6. `422 primary_provider_unavailable` — the shared profile's
+7. `422 primary_provider_unavailable` — the shared profile's
    `primary_provider` is not in the registry. Same logging/audit posture as
    `create`'s check above.
-7. `403 tool_not_allowed` — a tool the joiner declared is not in the shared
+8. `403 tool_not_allowed` — a tool the joiner declared is not in the shared
    profile's `allowed_tools` (validated independently of what the creator or
    any other joiner declared).
 
@@ -403,8 +441,9 @@ Content-Type: application/x-ndjson
 {"jsonrpc":"2.0","id":1,"result":{…}}\n
 ```
 
-The eleven supported `method` values are `session.registerDriver`,
-`session.sendMessage`, `session.subscribe`, `session.unsubscribe`,
+The twelve supported `method` values are `session.registerDriver`,
+`session.sendMessage`, `session.compact` (see [Compaction](#sessioncompact)
+below), `session.subscribe`, `session.unsubscribe`,
 `session.startRemoteSandbox`, `session.stopRemoteSandbox`,
 `session.execRemoteSandbox`, `session.reportLocalSandbox` (the last four are
 documented in [Sandboxes](#sandboxes) below; see the
@@ -629,6 +668,85 @@ Apply your own client-side request timeout if you'd rather give up than wait
 indefinitely — the server itself never times out a queued (not yet started)
 message. See [Wire Protocol — FIFO turn ownership](01-wire-protocol.md#fifo-turn-ownership-and-driver-registration)
 for the full ordering, ownership, and abandonment-timeout semantics.
+
+---
+
+### `session.compact`
+
+Trigger compaction manually: ask the model for a single self-contained
+summary of the session's history so far, and make it the new starting point
+for provider-facing history from the next turn onward. This is the
+`mode: "client"` counterpart to `mode: "auto"`'s in-turn check — see
+[Compaction — session creation](#post-apiv1sessions--open-a-session) for the
+`compaction` config and the [Event Streaming guide](../guides/06-event-streaming.md#compaction-auto-vs-client-mode)
+for when to use each mode.
+
+**Requires prior driver registration**, exactly like `session.sendMessage`.
+**Shares the same per-session turn gate** as `session.sendMessage` — a
+compaction can never run concurrently with a live turn on the same session;
+a call arriving while a turn is in flight queues (silent, zero-byte NDJSON
+response) exactly like a second driver's `sendMessage` would.
+
+Permitted regardless of the session's stored `compaction.mode` — a harness
+may force an early compaction on a `mode: "auto"` session — and never mutates
+the session's persisted config.
+
+**Params:**
+
+```json
+{ "prompt": "Summarize focusing on the open TODOs and their file paths." }
+```
+
+- `prompt` — optional string, `null`, or omitted entirely (`{}`).
+- Prompt precedence for this call: this param, if a non-null string, is used
+  as-is (even on a `mode: "auto"` session). Otherwise, the session's stored
+  `compaction: {"mode":"client","prompt":...}` value from creation is used,
+  if any. Otherwise, the server's built-in default compaction prompt is used.
+  `mode: "auto"` sessions have no stored prompt field at all — an auto
+  trigger always uses the built-in default.
+
+**Terminal result:** the produced `session.compaction.completed`
+[event](04-message-types.md#sessioncompactioncompleted):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "id": "evt_…",
+    "session_id": "ses_…",
+    "client_key_id": "key_…",
+    "event_type": "session.compaction.completed",
+    "payload": {
+      "summary_event_id": "evt_…",
+      "compacted_message_count": 17,
+      "input_tokens": 42100,
+      "summary_tokens": 900
+    },
+    "created_at": "2026-07-06T18:26:10.000Z"
+  }
+}
+```
+
+Unlike `session.sendMessage`, this is not wrapped in a `{message, events}`
+envelope — `result` is the event itself. Every event the compaction produces
+(`session.compaction.started`, the compaction's own `provider.request`/
+`provider.response`, the synthetic `server.message.send` holding the
+summary, and `session.compaction.completed`) also streams live to any
+`session.subscribe` watcher through the ordinary broadcast path — this
+method adds no separate streaming protocol of its own.
+
+**JSON-RPC errors:**
+- `-32001` — caller is not a registered driver.
+- `-32602` — `prompt` is present and not a string or `null`.
+- `-32000` — session is not `open`; the profile was deleted; or the
+  compaction attempt itself failed because all providers were exhausted — message
+  `"compaction failed: <detail>"`. In every `-32000` case the session's
+  previous effective history is untouched and the session remains
+  compactable on a later attempt; see
+  [`session.compaction.completed`](04-message-types.md#sessioncompactioncompleted)
+  for the failure/retry behavior in detail.
+- `-32603` — internal error (e.g. database failure).
 
 ---
 

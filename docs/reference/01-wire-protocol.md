@@ -268,6 +268,33 @@ continuation. The server puts synthetic error results for unanswered client
 ids and that fresh content in the single following `user` turn, so role
 alternation and exact tool-result coverage remain valid.
 
+### Compaction shares the same gate
+
+`session.compact` (the manual, `mode: "client"` compaction trigger — see
+[Client API — `session.compact`](00-client-api.md#sessioncompact)) acquires
+the **same** per-session mutex described above, not a separate one: a
+compaction and a live turn both decide what "current history" means, so they
+must never run concurrently on one session. A `session.compact` call that
+arrives while another driver's turn is in flight queues exactly like a
+second `session.sendMessage` call would — silent, zero-byte NDJSON response
+until dequeued.
+
+Automatic (`mode: "auto"`) compaction needs no separate acquisition at all:
+it runs synchronously inside `run_turn`, after that turn's own
+`server.message.send` is persisted and before the terminal response is
+written, while the turn already holds the gate.
+
+Either way, compaction only ever changes what the **next** provider call is
+built from — it never rewrites or deletes anything already in
+`session_events`. `GET /api/v1/sessions/{id}/events` and `session.subscribe`
+replay (`since_event_id`) always return the complete, unmodified append-only
+log, compaction included, exactly like every other event. See [Message
+Types — `session.compaction.started`](04-message-types.md#sessioncompactionstarted)
+/[`.completed`](04-message-types.md#sessioncompactioncompleted) for the event
+payloads, and the `usage` field added to
+[`provider.response`](04-message-types.md#providerresponse) for the token
+accounting `mode: "auto"` compares against its configured `size`.
+
 ### "Remaining connected" is a return-before-timeout guarantee, not a held socket
 
 The summary behind this feature describes a persistent-connection model — "if

@@ -189,7 +189,8 @@ class EventType(str, Enum):
     SESSION_DRIVER_REGISTER = "session.driver.register"
     SESSION_CLOSE = "session.close"
     SESSION_ERROR = "session.error"
-    SESSION_COMPACTION = "session.compaction"
+    SESSION_COMPACTION_STARTED = "session.compaction.started"
+    SESSION_COMPACTION_COMPLETED = "session.compaction.completed"
     # Sandbox lifecycle (WI 0006); ``dispatch`` in the payload is ``remote`` or
     # ``local`` for the running/stopped/error trio.
     SANDBOX_AVAILABLE = "session.sandbox.available"
@@ -411,8 +412,10 @@ def describe_event(event: SessionEvent) -> str:
             return f"session closed ({event.payload.get('reason')})"
         case EventType.SESSION_ERROR:
             return f"session error ({event.payload.get('reason')})"
-        case EventType.SESSION_COMPACTION:
-            return "session history compacted"
+        case EventType.SESSION_COMPACTION_STARTED:
+            return "session compaction started"
+        case EventType.SESSION_COMPACTION_COMPLETED:
+            return "session compaction completed"
         case EventType.SANDBOX_AVAILABLE:
             return "sandbox images available"
         case EventType.SANDBOX_START:

@@ -71,7 +71,8 @@ const BY_EVENT_TYPE: Record<string, EventCategory> = {
   "session.open": LIFECYCLE,
   "session.close": LIFECYCLE,
   "session.error": LIFECYCLE,
-  "session.compaction": LIFECYCLE,
+  "session.compaction.started": LIFECYCLE,
+  "session.compaction.completed": LIFECYCLE,
   "session.join": JOIN,
   "session.driver.register": JOIN,
 };

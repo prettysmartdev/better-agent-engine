@@ -71,10 +71,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_subagent_tools",
         sql: include_str!("migrations/0008_sessions_subagent_tools.sql"),
     },
+    Migration {
+        version: 9,
+        name: "sessions_compaction",
+        sql: include_str!("migrations/0009_sessions_compaction.sql"),
+    },
 ];
 
 /// The highest migration version this binary knows how to apply.
-pub const LATEST_VERSION: i64 = 8;
+pub const LATEST_VERSION: i64 = 9;
 
 /// A migration-runner failure.
 #[derive(Debug)]

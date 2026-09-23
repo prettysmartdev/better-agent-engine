@@ -1242,6 +1242,7 @@ mod tests {
                     &serde_json::json!([]),
                     &serde_json::json!([]),
                     &serde_json::json!([]),
+                    &crate::api::client::sessions::CompactionConfig::default(),
                 )?;
                 Ok::<_, rusqlite::Error>(())
             })
@@ -1262,6 +1263,7 @@ mod tests {
                 guard,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(60),
                 server_tool_results: Vec::new(),
+                pending_auto_compaction: None,
                 span_context: None,
             },
         );

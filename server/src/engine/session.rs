@@ -39,6 +39,17 @@
 //!
 //! The auth token is resolved inside [`super::provider::call`] and never reaches
 //! this module, an event payload, or a log line.
+//!
+//! [`run_compaction`] is the second entrypoint: one provider call that replaces
+//! the session's provider-facing history with a single self-contained summary,
+//! per `aspec/work-items/0016-session-compaction.md`. It is driven either by the
+//! `session.compact` RPC (`mode: client`) or, for a session created with
+//! `compaction: {"mode":"auto","size":N}`, by [`run_turn`] itself once the
+//! provider's own reported token usage for the turn it just finished crosses
+//! `N`. Nothing is rewritten: the summary is appended as an ordinary synthetic
+//! `server.message.send` and `session.compaction.completed` points at it, so a
+//! later [`sessions::stream_history`] starts its scan there while the full
+//! pre-compaction log stays intact for replay.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,6 +63,7 @@ use super::mcp::McpSession;
 use super::provider::{self, ProviderConfig};
 use super::sandbox::{CommandRunner, ExecResult, SandboxDriver, SandboxHandle};
 use super::subagent::{self, SubagentStatus, SubagentTask, SubagentToolDef};
+use crate::api::client::sessions::CompactionConfig;
 use crate::events::EventType;
 use crate::store::sessions::{self, EventRecord, SessionRecord, STATE_ERROR};
 use crate::store::{profiles::ProfileRecord, Store};
@@ -85,19 +97,70 @@ pub struct Turn {
     /// contains at least one client tool alongside sandbox/MCP tools); empty on
     /// every other outcome, including an all-client `Paused`.
     pub pending_tool_results: Vec<Value>,
+    /// An auto-compaction threshold crossing observed immediately before this
+    /// turn paused for a client tool. The compaction cannot run against an
+    /// unresolved `tool_use`, so the RPC layer parks this tiny trigger with the
+    /// turn and passes it back when the client resumes. It is then honored at
+    /// the first safe, completed boundary even if that final provider response
+    /// has lower or unavailable usage.
+    pub pending_auto_compaction: Option<CompactionTrigger>,
 }
 
-/// A turn failed at the persistence layer (distinct from a provider failure,
-/// which is a normal [`Outcome::ProvidersFailed`]).
+/// An engine call failed for a reason the caller must distinguish.
+///
+/// [`TurnError::Store`] is a persistence-layer failure (distinct from a
+/// provider failure, which for an ordinary turn is a normal
+/// [`Outcome::ProvidersFailed`]). [`TurnError::CompactionFailed`] is the
+/// compaction-only logical failure: a [`run_compaction`] attempt that could not
+/// produce a summary because every provider was exhausted. It never closes or
+/// errors the session; the pre-compaction history stays active and the attempt
+/// is retryable. A successful summary with unavailable usage still completes,
+/// recording nullable accounting fields.
 #[derive(Debug)]
-pub struct TurnError(pub rusqlite::Error);
+pub enum TurnError {
+    Store(rusqlite::Error),
+    CompactionFailed(String),
+}
+
+impl From<rusqlite::Error> for TurnError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Store(value)
+    }
+}
 
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "session store error: {}", self.0)
+        match self {
+            TurnError::Store(e) => write!(f, "session store error: {e}"),
+            TurnError::CompactionFailed(detail) => write!(f, "compaction failed: {detail}"),
+        }
     }
 }
 impl std::error::Error for TurnError {}
+
+/// What caused a compaction, for the `session.compaction.started` payload.
+///
+/// [`CompactionTrigger::Auto`] carries the just-completed turn's last successful
+/// provider call usage sum that crossed the session's configured threshold;
+/// [`CompactionTrigger::Client`] carries the best-effort figure read from the
+/// session's newest persisted `provider.response` (`None` when the session has
+/// made no provider call with usable usage yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionTrigger {
+    Auto {
+        token_count: u64,
+        threshold_tokens: u64,
+    },
+    Client {
+        token_count: Option<u64>,
+    },
+}
+
+/// The built-in compaction instruction, used for every auto-triggered
+/// compaction and for a `session.compact` call that supplies no prompt of its
+/// own. It is appended as an ordinary final `user` message — the server has no
+/// system-role concept and this work item deliberately does not add one.
+const DEFAULT_COMPACTION_PROMPT: &str = "Produce a single self-contained compacted summary of this session. Preserve the key facts, decisions, constraints, completed work, open tasks, and any state needed to continue the session. Do not include commentary outside the summary.";
 
 /// Append an event, publish it live, and return the record. Routes through the
 /// shared [`broadcast::insert_and_publish`] choke point so every event the turn
@@ -119,7 +182,19 @@ fn log_event(
         event_type,
         &payload,
     )
-    .map_err(TurnError)
+    .map_err(TurnError::Store)
+}
+
+/// The explicit `usage` member every **successful** `provider.response` payload
+/// carries: the provider's own reported token pair, or JSON `null` when it
+/// omitted usage (or returned a malformed/partial object). Consumers — the
+/// auto-compaction check and `sessions::last_provider_token_count` — read this
+/// small field instead of re-parsing the full raw `body`.
+fn usage_payload(usage: Option<(u64, u64)>) -> Value {
+    match usage {
+        Some((input, output)) => json!({ "input_tokens": input, "output_tokens": output }),
+        None => Value::Null,
+    }
 }
 
 /// Run one client turn. The caller has already inserted the incoming
@@ -160,6 +235,7 @@ pub async fn run_turn(
     subagent_timeout: std::time::Duration,
     max_subagents_per_session: usize,
     acting_client_key_id: &str,
+    pending_auto_compaction: Option<CompactionTrigger>,
     metrics: &crate::telemetry::Metrics,
 ) -> Result<Turn, TurnError> {
     let sid = session.id.as_str();
@@ -245,22 +321,7 @@ pub async fn run_turn(
     // or profile may have changed since): record it and end as ProvidersFailed
     // rather than panicking. Missing fallback names are logged and skipped
     // inside the resolver, never fatal.
-    let fallback_names: Vec<String> = profile
-        .fallback_configs
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let resolved = match profile.provider_config.as_str() {
-        Some(name) => provider::resolve_from_profile(provider_registry, name, &fallback_names),
-        None => Err(provider::ProviderConfigError::Malformed(
-            "primary_provider is not a string".to_string(),
-        )),
-    };
-    let (primary, fallbacks) = match resolved {
+    let (configs, config_names) = match resolve_provider_chain(profile, provider_registry) {
         Ok(v) => v,
         Err(e) => {
             events.push(log_event(
@@ -274,29 +335,22 @@ pub async fn run_turn(
             return finish_failed(store, sid, events);
         }
     };
-    let configs: Vec<ProviderConfig> = std::iter::once(primary).chain(fallbacks).collect();
-    // Registry names aligned with `configs` for the `bae.provider.name` span
-    // attribute: the primary name, then each fallback that actually resolved
-    // (missing fallbacks were skipped in `resolve_from_profile`, same filter).
-    let config_names: Vec<String> = std::iter::once(
-        profile
-            .provider_config
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-    )
-    .chain(
-        fallback_names
-            .iter()
-            .filter(|n| provider_registry.contains_key(*n))
-            .cloned(),
-    )
-    .collect();
 
     // History streamed from the log; extended in-memory across MCP round-trips.
     let mut history: Vec<Value> = store
         .with_conn(|c| sessions::stream_history(c, sid))
-        .map_err(TurnError)?;
+        .map_err(TurnError::Store)?;
+
+    // The most recent **successful** provider call's reported token usage,
+    // carried across the iteration loop so the auto-compaction check at the
+    // turn boundary can compare it against the session's configured threshold
+    // without any SQL aggregate. A later success replaces it (including with
+    // `None`, when that provider omitted usage — the check then skips rather
+    // than reading a stale number); failed attempts leave it untouched.
+    // Deliberately uninitialized: every path that reads it has gone through a
+    // successful provider call first (an exhausted walk returns early), so there
+    // is no "no call yet" state to invent a value for.
+    let mut last_usage: Option<(u64, u64)>;
 
     for _ in 0..MAX_ITERATIONS {
         // Recomputed for every provider iteration: status visibility is live
@@ -314,110 +368,27 @@ pub async fn run_turn(
         let history_value = Value::Array(history.clone());
 
         // --- Provider attempt sequence: primary, then each fallback. ---
-        let mut success: Option<Value> = None;
-        for (i, cfg) in configs.iter().enumerate() {
-            let kind = if i == 0 { "primary" } else { "fallback" };
-            // One `bae.provider.attempt` child span per fallback-walk iteration,
-            // wrapping the `provider::call` await (contract §1.1).
-            let attempt_span = crate::telemetry::provider_attempt_span(
-                config_names.get(i).map(String::as_str).unwrap_or_default(),
-                cfg.provider.as_str(),
-                &cfg.model,
-                i,
-                kind,
-            );
-            events.push(log_event(
-                store,
-                broadcaster,
-                sid,
-                cid,
-                EventType::ProviderRequest,
-                json!({
-                    "attempt": i,
-                    "kind": kind,
-                    "provider": cfg.provider.as_str(),
-                    "base_url": cfg.effective_base_url(),
-                    "model": cfg.model,
-                    "max_tokens": cfg.max_tokens,
-                    "messages": history_value,
-                    "tools": tools_value,
-                }),
-            )?);
-
-            let provider_started = Instant::now();
-            match tracing::Instrument::instrument(
-                provider::call(http, cfg, &history_value, &tools_value),
-                attempt_span.clone(),
-            )
-            .await
-            {
-                Ok(resp) => {
-                    metrics.record_provider_attempt(
-                        cfg.provider.as_str(),
-                        "ok",
-                        provider_started.elapsed(),
-                    );
-                    crate::telemetry::set_i64(
-                        &attempt_span,
-                        crate::telemetry::ATTR_HTTP_STATUS,
-                        200,
-                    );
-                    // The event records the raw, untranslated wire body; the
-                    // loop consumes only the canonical translation.
-                    events.push(log_event(
-                        store,
-                        broadcaster,
-                        sid,
-                        cid,
-                        EventType::ProviderResponse,
-                        json!({ "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": true, "status": 200, "body": resp.raw }),
-                    )?);
-                    success = Some(resp.canonical);
-                    break;
-                }
-                Err(e) => {
-                    metrics.record_provider_attempt(
-                        cfg.provider.as_str(),
-                        "error",
-                        provider_started.elapsed(),
-                    );
-                    if let Some(status) = e.status() {
-                        crate::telemetry::set_i64(
-                            &attempt_span,
-                            crate::telemetry::ATTR_HTTP_STATUS,
-                            status as i64,
-                        );
-                    }
-                    crate::telemetry::set_error(&attempt_span, e.detail());
-                    events.push(log_event(
-                        store,
-                        broadcaster,
-                        sid,
-                        cid,
-                        EventType::ProviderResponse,
-                        json!({
-                            "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": false,
-                            "status": e.status(), "error": e.detail(), "body": e.body(),
-                        }),
-                    )?);
-                    // The primary failing is the trigger for the fallback walk;
-                    // record a session.error context event once, then continue.
-                    if i == 0 {
-                        events.push(log_event(
-                            store,
-                            broadcaster,
-                            sid,
-                            cid,
-                            EventType::SessionError,
-                            json!({ "reason": "provider_call_failed", "provider": cfg.provider.as_str(), "detail": e.detail() }),
-                        )?);
-                    }
-                }
-            }
-        }
+        let success = provider_attempts(
+            store,
+            http,
+            broadcaster,
+            sid,
+            cid,
+            &configs,
+            &config_names,
+            &history_value,
+            &tools_value,
+            metrics,
+            &mut events,
+            true,
+        )
+        .await?;
 
         let body = match success {
-            Some(b) => b,
+            Some((body, usage)) => {
+                last_usage = usage;
+                body
+            }
             None => {
                 events.push(log_event(
                     store,
@@ -446,11 +417,37 @@ pub async fn run_turn(
                 EventType::ServerMessageSend,
                 message.clone(),
             )?);
+            // The one auto-compaction check point: a true turn boundary, with
+            // this turn's own assistant message already persisted, and before
+            // the turn is handed back — so the *next* `session.sendMessage` is
+            // the first to see the compacted history. Never mid-loop (an
+            // unresolved tool exchange only exists in the in-memory `history`
+            // extension above) and never on a `Paused` outcome, whose assistant
+            // `tool_use` message must stay the active history tail until the
+            // client answers it.
+            let auto_trigger =
+                pending_auto_compaction.or_else(|| auto_trigger(session, last_usage));
+            if let Some(record) = maybe_auto_compact(
+                store,
+                http,
+                broadcaster,
+                session,
+                profile,
+                provider_registry,
+                auto_trigger,
+                acting_client_key_id,
+                metrics,
+            )
+            .await?
+            {
+                events.push(record);
+            }
             return Ok(Turn {
                 message,
                 events,
                 outcome: Outcome::Completed,
                 pending_tool_results: Vec::new(),
+                pending_auto_compaction: None,
             });
         }
 
@@ -875,6 +872,11 @@ pub async fn run_turn(
                 events,
                 outcome: Outcome::Paused,
                 pending_tool_results: server_tool_results,
+                // A tool-result turn must remain the active history tail until
+                // the client answers it. Preserve a threshold crossing rather
+                // than appending an invalid compaction instruction here.
+                pending_auto_compaction: pending_auto_compaction
+                    .or_else(|| auto_trigger(session, last_usage)),
             });
         }
 
@@ -899,6 +901,420 @@ pub async fn run_turn(
         json!({ "reason": "loop_limit", "max_iterations": MAX_ITERATIONS }),
     )?);
     finish_failed(store, sid, events)
+}
+
+/// Resolve a profile's provider name references against the startup registry:
+/// the primary config followed by every fallback that resolved, plus the
+/// registry names aligned with that list for the `bae.provider.name` span
+/// attribute. Missing fallback names are logged and skipped inside the resolver;
+/// only an unusable primary is an error.
+///
+/// Shared by [`run_turn`] and [`run_compaction`] so a compaction walks exactly
+/// the same provider chain, in the same order, as an ordinary turn.
+fn resolve_provider_chain(
+    profile: &ProfileRecord,
+    provider_registry: &HashMap<String, ProviderConfig>,
+) -> Result<(Vec<ProviderConfig>, Vec<String>), provider::ProviderConfigError> {
+    let fallback_names: Vec<String> = profile
+        .fallback_configs
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (primary, fallbacks) = match profile.provider_config.as_str() {
+        Some(name) => provider::resolve_from_profile(provider_registry, name, &fallback_names)?,
+        None => {
+            return Err(provider::ProviderConfigError::Malformed(
+                "primary_provider is not a string".to_string(),
+            ))
+        }
+    };
+    let configs: Vec<ProviderConfig> = std::iter::once(primary).chain(fallbacks).collect();
+    let config_names: Vec<String> = std::iter::once(
+        profile
+            .provider_config
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+    .chain(
+        fallback_names
+            .iter()
+            .filter(|n| provider_registry.contains_key(*n))
+            .cloned(),
+    )
+    .collect();
+    Ok((configs, config_names))
+}
+
+/// One provider call's fallback walk: try `configs` in order, inserting a
+/// `provider.request` before and a `provider.response` after **every** attempt
+/// (success or failure), and return the first success as its canonical body plus
+/// that attempt's reported `(input_tokens, output_tokens)` — `None` inside the
+/// tuple when the provider omitted usage. `None` overall means every provider
+/// failed; the caller decides what that means.
+///
+/// `log_primary_failure` is the single behavioural difference between the two
+/// callers: an ordinary turn records a `session.error` context event when the
+/// primary fails (that failure is what starts the fallback walk), while a
+/// compaction attempt writes no session-level error events at all — a failed
+/// compaction is not a session failure.
+#[allow(clippy::too_many_arguments)]
+async fn provider_attempts(
+    store: &Store,
+    http: &reqwest::Client,
+    broadcaster: &EventBroadcaster,
+    sid: &str,
+    cid: &str,
+    configs: &[ProviderConfig],
+    config_names: &[String],
+    messages: &Value,
+    tools: &Value,
+    metrics: &crate::telemetry::Metrics,
+    events: &mut Vec<EventRecord>,
+    log_primary_failure: bool,
+) -> Result<Option<(Value, Option<(u64, u64)>)>, TurnError> {
+    for (i, cfg) in configs.iter().enumerate() {
+        let kind = if i == 0 { "primary" } else { "fallback" };
+        // One `bae.provider.attempt` child span per fallback-walk iteration,
+        // wrapping the `provider::call` await (contract §1.1).
+        let attempt_span = crate::telemetry::provider_attempt_span(
+            config_names.get(i).map(String::as_str).unwrap_or_default(),
+            cfg.provider.as_str(),
+            &cfg.model,
+            i,
+            kind,
+        );
+        events.push(log_event(
+            store,
+            broadcaster,
+            sid,
+            cid,
+            EventType::ProviderRequest,
+            json!({
+                "attempt": i,
+                "kind": kind,
+                "provider": cfg.provider.as_str(),
+                "base_url": cfg.effective_base_url(),
+                "model": cfg.model,
+                "max_tokens": cfg.max_tokens,
+                "messages": messages,
+                "tools": tools,
+            }),
+        )?);
+
+        let provider_started = Instant::now();
+        match tracing::Instrument::instrument(
+            provider::call(http, cfg, messages, tools),
+            attempt_span.clone(),
+        )
+        .await
+        {
+            Ok(resp) => {
+                metrics.record_provider_attempt(
+                    cfg.provider.as_str(),
+                    "ok",
+                    provider_started.elapsed(),
+                );
+                crate::telemetry::set_i64(&attempt_span, crate::telemetry::ATTR_HTTP_STATUS, 200);
+                // Read the provider's own token accounting off the raw body
+                // before it is moved into the event: `usage` is not part of the
+                // canonical content translation, and recording it as an explicit
+                // small field means no consumer ever re-parses `body`.
+                let usage = provider::usage_tokens(cfg.provider, &resp.raw);
+                // The event records the raw, untranslated wire body; the
+                // loop consumes only the canonical translation.
+                events.push(log_event(
+                    store,
+                    broadcaster,
+                    sid,
+                    cid,
+                    EventType::ProviderResponse,
+                    json!({ "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": true, "status": 200, "body": resp.raw, "usage": usage_payload(usage) }),
+                )?);
+                return Ok(Some((resp.canonical, usage)));
+            }
+            Err(e) => {
+                metrics.record_provider_attempt(
+                    cfg.provider.as_str(),
+                    "error",
+                    provider_started.elapsed(),
+                );
+                if let Some(status) = e.status() {
+                    crate::telemetry::set_i64(
+                        &attempt_span,
+                        crate::telemetry::ATTR_HTTP_STATUS,
+                        status as i64,
+                    );
+                }
+                crate::telemetry::set_error(&attempt_span, e.detail());
+                events.push(log_event(
+                    store,
+                    broadcaster,
+                    sid,
+                    cid,
+                    EventType::ProviderResponse,
+                    json!({
+                        "attempt": i, "kind": kind, "provider": cfg.provider.as_str(), "ok": false,
+                        "status": e.status(), "error": e.detail(), "body": e.body(),
+                    }),
+                )?);
+                // The primary failing is the trigger for the fallback walk;
+                // record a session.error context event once, then continue.
+                if log_primary_failure && i == 0 {
+                    events.push(log_event(
+                        store,
+                        broadcaster,
+                        sid,
+                        cid,
+                        EventType::SessionError,
+                        json!({ "reason": "provider_call_failed", "provider": cfg.provider.as_str(), "detail": e.detail() }),
+                    )?);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The auto-mode threshold check, run once per turn at a true turn boundary.
+///
+/// Eligible only for a session created with
+/// `compaction: {"mode":"auto","size":N}` — `Client` mode and a legacy NULL
+/// config (`None`) never auto-trigger, so the server only ever rewrites what it
+/// sends to the model for a session that explicitly asked for it (the bounded
+/// exception to `aspec/architecture/design.md` Principle 2).
+///
+/// `trigger` is either the just-completed turn's threshold crossing or a
+/// crossing preserved while an earlier client-tool exchange was paused.
+///
+/// A logical [`TurnError::CompactionFailed`] is swallowed — the ordinary turn
+/// that just succeeded stays successful and the session stays open, so the next
+/// turn simply checks again. A store failure still propagates.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_auto_compact(
+    store: &Store,
+    http: &reqwest::Client,
+    broadcaster: &EventBroadcaster,
+    session: &SessionRecord,
+    profile: &ProfileRecord,
+    provider_registry: &HashMap<String, ProviderConfig>,
+    trigger: Option<CompactionTrigger>,
+    acting_client_key_id: &str,
+    metrics: &crate::telemetry::Metrics,
+) -> Result<Option<EventRecord>, TurnError> {
+    let Some(trigger) = trigger else {
+        return Ok(None);
+    };
+    match run_compaction(
+        store,
+        http,
+        broadcaster,
+        session,
+        profile,
+        provider_registry,
+        // Auto mode has no custom-prompt field: always the built-in prompt.
+        None,
+        trigger,
+        acting_client_key_id,
+        metrics,
+    )
+    .await
+    {
+        Ok(record) => Ok(Some(record)),
+        Err(TurnError::CompactionFailed(detail)) => {
+            tracing::warn!(
+                session_id = %session.id,
+                "auto compaction attempt failed, leaving the session compactable: {detail}"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Build an auto-compaction trigger from a completed provider call. The strict
+/// comparison lives here so a paused turn can park the exact same decision for
+/// its later safe boundary without re-reading provider events or tokenizing.
+fn auto_trigger(
+    session: &SessionRecord,
+    last_usage: Option<(u64, u64)>,
+) -> Option<CompactionTrigger> {
+    let size = match &session.compaction {
+        Some(CompactionConfig::Auto { size }) => *size,
+        _ => return None,
+    };
+    let Some((input, output)) = last_usage else {
+        tracing::debug!(
+            session_id = %session.id,
+            "auto compaction check skipped: the provider reported no usage for this turn"
+        );
+        return None;
+    };
+    let token_count = input.saturating_add(output);
+    (token_count > size).then_some(CompactionTrigger::Auto {
+        token_count,
+        threshold_tokens: size,
+    })
+}
+
+/// Compact a session: ask the model for a single self-contained summary of the
+/// current effective history and make that summary the new starting point for
+/// everything the server sends the model next.
+///
+/// Nothing is ever rewritten or deleted — `session_events` stays append-only.
+/// The summary is persisted as one ordinary synthetic `server.message.send`, and
+/// the `session.compaction.completed` event points at it; a later
+/// [`sessions::stream_history`] scopes its message scan to start at that event,
+/// so the pre-compaction log remains fully intact for replay while the
+/// provider-facing history becomes "compacted summary, then everything after".
+///
+/// Event order on success:
+/// `session.compaction.started` → one or more (`provider.request` →
+/// `provider.response`) attempts → `server.message.send` (the summary) →
+/// `session.compaction.completed` (returned).
+///
+/// On provider exhaustion, the attempt stops after its provider events: no
+/// summary and no completed marker are written, [`TurnError::CompactionFailed`]
+/// is returned, and the session keeps its previous effective history. A
+/// successful response without usage still commits its summary; its completion
+/// fields are null because accounting is unavailable.
+///
+/// `prompt` is the already-resolved compaction instruction (a `session.compact`
+/// caller's own prompt, else the session's stored client-mode prompt); `None`
+/// uses [`DEFAULT_COMPACTION_PROMPT`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_compaction(
+    store: &Store,
+    http: &reqwest::Client,
+    broadcaster: &EventBroadcaster,
+    session: &SessionRecord,
+    profile: &ProfileRecord,
+    provider_registry: &HashMap<String, ProviderConfig>,
+    prompt: Option<&str>,
+    trigger: CompactionTrigger,
+    acting_client_key_id: &str,
+    metrics: &crate::telemetry::Metrics,
+) -> Result<EventRecord, TurnError> {
+    let sid = session.id.as_str();
+    let cid = acting_client_key_id;
+    // Compaction's own events are broadcast live through the same choke point as
+    // every other event; only the completed record is returned to the caller.
+    let mut events: Vec<EventRecord> = Vec::new();
+
+    // Resolved before anything is logged: a profile whose primary provider no
+    // longer resolves cannot start a compaction at all, so no `started` event is
+    // written for an attempt that never reaches the model.
+    let (configs, config_names) = match resolve_provider_chain(profile, provider_registry) {
+        Ok(v) => v,
+        Err(e) => return Err(TurnError::CompactionFailed(format!("provider_config: {e}"))),
+    };
+
+    // The current effective history — already scoped to the most recent
+    // completed compaction, so a second compaction never re-summarizes
+    // already-compacted content.
+    let history: Vec<Value> = store
+        .with_conn(|c| sessions::stream_history(c, sid))
+        .map_err(TurnError::Store)?;
+    let compacted_message_count = history.len() as u64;
+
+    let started_payload = match trigger {
+        CompactionTrigger::Auto {
+            token_count,
+            threshold_tokens,
+        } => json!({
+            "trigger": "auto",
+            "reason": "token_threshold",
+            "token_count": token_count,
+            "threshold_tokens": threshold_tokens,
+        }),
+        // A manual call is governed by no threshold, even on an auto session;
+        // its `token_count` is the caller-supplied best-effort figure.
+        CompactionTrigger::Client { token_count } => json!({
+            "trigger": "client",
+            "reason": "manual",
+            "token_count": token_count,
+            "threshold_tokens": Value::Null,
+        }),
+    };
+    log_event(
+        store,
+        broadcaster,
+        sid,
+        cid,
+        EventType::SessionCompactionStarted,
+        started_payload,
+    )?;
+
+    // History plus one final synthetic `user` turn carrying the instruction.
+    // The server has no system-role concept and this work item deliberately
+    // does not add one, so compaction uses the same message shapes as every
+    // other provider call. No tools are advertised: the model's only job here is
+    // to write the summary.
+    let mut messages = history;
+    messages.push(json!({
+        "role": "user",
+        "content": prompt.unwrap_or(DEFAULT_COMPACTION_PROMPT),
+    }));
+    let messages_value = Value::Array(messages);
+    let tools_value = Value::Array(Vec::new());
+
+    let success = provider_attempts(
+        store,
+        http,
+        broadcaster,
+        sid,
+        cid,
+        &configs,
+        &config_names,
+        &messages_value,
+        &tools_value,
+        metrics,
+        &mut events,
+        false,
+    )
+    .await?;
+    let Some((canonical, usage)) = success else {
+        return Err(TurnError::CompactionFailed(format!(
+            "all {} providers failed",
+            configs.len()
+        )));
+    };
+    // The single message containing the fully compacted session. Persisted as an
+    // ordinary assistant `server.message.send`, which is exactly why the scoped
+    // `stream_history` query picks it up as the first message of the new
+    // effective history with no separate "prepend a synthetic message" logic.
+    let summary = json!({
+        "role": "assistant",
+        "content": canonical.get("content").cloned().unwrap_or_else(|| json!([])),
+    });
+    let summary_event = log_event(
+        store,
+        broadcaster,
+        sid,
+        cid,
+        EventType::ServerMessageSend,
+        summary,
+    )?;
+
+    // The summary text itself is not duplicated here — it lives in the event
+    // this marker points at.
+    log_event(
+        store,
+        broadcaster,
+        sid,
+        cid,
+        EventType::SessionCompactionCompleted,
+        json!({
+            "summary_event_id": summary_event.id,
+            "compacted_message_count": compacted_message_count,
+            "input_tokens": usage.map(|(input_tokens, _)| input_tokens),
+            "summary_tokens": usage.map(|(_, summary_tokens)| summary_tokens),
+        }),
+    )
 }
 
 /// Server-form tool-result content: a compact JSON object in one text block.
@@ -1263,7 +1679,7 @@ fn finish_failed(
 ) -> Result<Turn, TurnError> {
     store
         .with_conn(|c| sessions::close_session(c, session_id, STATE_ERROR))
-        .map_err(TurnError)?;
+        .map_err(TurnError::Store)?;
     Ok(Turn {
         message: json!({
             "role": "assistant",
@@ -1272,6 +1688,7 @@ fn finish_failed(
         events,
         outcome: Outcome::ProvidersFailed,
         pending_tool_results: Vec::new(),
+        pending_auto_compaction: None,
     })
 }
 

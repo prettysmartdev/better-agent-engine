@@ -148,7 +148,8 @@ export type EventType =
   | "session.driver.register"
   | "session.close"
   | "session.error"
-  | "session.compaction"
+  | "session.compaction.started"
+  | "session.compaction.completed"
   | "session.sandbox.available"
   | "session.sandbox.start"
   | "session.sandbox.running"
@@ -280,7 +281,20 @@ export interface SessionErrorPayload {
     | "profile_unavailable";
   [key: string]: unknown;
 }
-export interface SessionCompactionPayload {
+export interface SessionCompactionStartedPayload {
+  trigger: "auto" | "client";
+  reason: "token_threshold" | "manual";
+  token_count: number | null;
+  threshold_tokens: number | null;
+  [key: string]: unknown;
+}
+export interface SessionCompactionCompletedPayload {
+  summary_event_id: string;
+  compacted_message_count: number;
+  /** Provider-reported compaction input usage, or null when unavailable. */
+  input_tokens: number | null;
+  /** Provider-reported summary output usage, or null when unavailable. */
+  summary_tokens: number | null;
   [key: string]: unknown;
 }
 
@@ -398,7 +412,8 @@ interface EventPayloads {
   "session.driver.register": SessionDriverRegisterPayload;
   "session.close": SessionClosePayload;
   "session.error": SessionErrorPayload;
-  "session.compaction": SessionCompactionPayload;
+  "session.compaction.started": SessionCompactionStartedPayload;
+  "session.compaction.completed": SessionCompactionCompletedPayload;
   "session.sandbox.available": SandboxAvailablePayload;
   "session.sandbox.start": SandboxStartPayload;
   "session.sandbox.running": SandboxLifecyclePayload;
@@ -467,8 +482,10 @@ export function describeEvent(event: SessionEvent): string {
       return `session closed (${event.payload.reason})`;
     case "session.error":
       return `session error (${event.payload.reason})`;
-    case "session.compaction":
-      return "session compaction";
+    case "session.compaction.started":
+      return "session compaction started";
+    case "session.compaction.completed":
+      return "session compaction completed";
     case "session.sandbox.available":
       return `sandbox images available (${event.payload.images.length})`;
     case "session.sandbox.start":

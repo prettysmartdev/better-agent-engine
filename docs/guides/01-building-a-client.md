@@ -418,3 +418,15 @@ terminal response.
 The SDK handles all NDJSON framing internally. You never interact with raw
 JSON-RPC objects unless you are building a custom transport. See
 [Wire Protocol](../reference/01-wire-protocol.md) for the full specification.
+
+**`session.compact`** — the manual compaction trigger for `mode: "client"`
+sessions (see [Event Streaming — Compaction: auto vs. client
+mode](06-event-streaming.md#compaction-auto-vs-client-mode) and [Client API —
+`session.compact`](../reference/00-client-api.md#sessioncompact)) has no
+dedicated `Session` method in any of the three SDKs yet, unlike
+`sendMessage`/`subscribe`/the sandbox and subagent methods above. A harness
+that wants to drive `mode: "client"` compaction today issues that JSON-RPC
+call itself against `/rpc` using the session's own key. `mode: "auto"` needs
+no client-side call at all — the server compacts inline, and the SDK's
+`on_event` hook still sees the resulting `session.compaction.*` events like
+any other.

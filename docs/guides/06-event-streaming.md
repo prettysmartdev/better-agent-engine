@@ -200,6 +200,84 @@ the `session.close` or `session.error` event but the replay still works.
 
 ---
 
+## Compaction: auto vs. client mode
+
+A session's history grows with every turn. Compaction summarizes it into a
+single message so later turns keep fitting in the model's context window.
+Configure it once, at session creation, via the `compaction` field ([Client
+API — session creation](../reference/00-client-api.md#post-apiv1sessions--open-a-session));
+it is fixed for the life of the session and rejected on `join`.
+
+**`mode: "auto"`** — pass `{"mode": "auto", "size": <token threshold>}`. The
+server does the rest: after each turn it reads that turn's own
+provider-reported usage (the `usage` field now on
+[`provider.response`](../reference/04-message-types.md#providerresponse),
+`input_tokens + output_tokens`), and once that crosses `size` it compacts
+before returning the turn's terminal result. Your harness doesn't need to
+track token counts or context-window limits itself — the next
+`session.sendMessage` you send just works against the compacted history. All
+you may want to do is watch for
+[`session.compaction.started`/`completed`](../reference/04-message-types.md#sessioncompactionstarted)
+in the stream to reflect a compaction in a UI.
+
+If a threshold-crossing response pauses for a client-dispatched tool, BAE keeps
+the crossing in the parked turn but waits to compact until the tool-result
+continuation reaches a final assistant response. A compaction instruction
+cannot be appended after an unresolved `tool_use`; the saved trigger is still
+honored even if that final response reports lower (or no) usage.
+
+> **Behavior gap to know about:** the server never runs its own tokenizer —
+> `size` is only ever compared against a provider's own reported `usage`. If
+> the configured provider omits `usage` on a response (true of some
+> OpenAI-compatible/proxy endpoints), the threshold check is silently
+> **skipped** for that turn — never treated as `0` (which would disable
+> auto-compaction forever) and never treated as over-threshold (which would
+> compact on every turn). The next turn whose response does carry `usage`
+> resumes normal checking. If you rely on `mode: "auto"` for long sessions,
+> confirm your configured provider reliably reports usage.
+
+**`mode: "client"`** (also the default when `compaction` is omitted or
+`null`) — the server never auto-compacts. Your harness decides when, by
+calling [`session.compact`](../reference/00-client-api.md#sessioncompact)
+explicitly — on your own cost/token budget, a UI affordance, a fixed turn
+count, or any other signal you choose. Optionally supply a domain-specific
+`prompt` (stored at session creation, or passed per-call) in place of the
+server's generic built-in compaction prompt. `session.compact` shares the
+same driver-registration gate and per-session turn-serialization as
+`session.sendMessage` (see [Wire Protocol — Compaction shares the same
+gate](../reference/01-wire-protocol.md#compaction-shares-the-same-gate)), so
+it can never race a live turn on the same session.
+
+**In both modes**, compaction only changes what the **next** provider call is
+built from. `GET /api/v1/sessions/{id}/events` and `session.subscribe`
+replay always return the complete, unmodified append-only event log —
+nothing before a compaction is ever deleted or hidden from the audit trail,
+it is simply excluded from what gets sent to the model going forward.
+
+**Typical notification sequence for an auto-triggered compaction:**
+
+```
+session.event notification: client.message.send
+session.event notification: provider.request
+session.event notification: provider.response      (usage crosses the configured size)
+session.event notification: server.message.send    (the turn's own reply)
+terminal result: {message, events}                 -- this turn's own terminal result
+session.event notification: session.compaction.started   (trigger: auto)
+session.event notification: provider.request             (compaction call)
+session.event notification: provider.response
+session.event notification: server.message.send          (compacted summary)
+session.event notification: session.compaction.completed
+```
+
+A manual `session.compact` call produces the same
+`started → provider.request → provider.response → server.message.send →
+completed` sequence, streamed the same way, with its own terminal result
+being the `session.compaction.completed` event itself rather than a
+`{message, events}` body — see [Client API —
+`session.compact`](../reference/00-client-api.md#sessioncompact).
+
+---
+
 ## Typical event sequences
 
 **Simple text turn (inline notifications on `sendMessage`):**

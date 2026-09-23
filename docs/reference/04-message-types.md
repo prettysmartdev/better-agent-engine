@@ -132,7 +132,8 @@ The raw response received from the LLM provider (or the failure reason).
   "provider": "anthropic",
   "ok":       true,
   "status":   200,
-  "body":     { "role": "assistant", "stop_reason": "end_turn", "content": [ … ] }
+  "body":     { "role": "assistant", "stop_reason": "end_turn", "content": [ … ] },
+  "usage":    { "input_tokens": 1200, "output_tokens": 200 }
 }
 ```
 
@@ -153,6 +154,15 @@ The raw response received from the LLM provider (or the failure reason).
 - `status` is the HTTP status code, or `null` on a transport-level failure.
 - `error` is a human-readable failure reason.
 - Inserted **after** each attempt, success or failure.
+- `usage` is `{"input_tokens", "output_tokens"}`, read from the provider's own
+  raw response — Anthropic: `usage.input_tokens`/`usage.output_tokens`;
+  OpenAI: `usage.prompt_tokens`/`usage.completion_tokens`. It is `null` when
+  the provider omitted usage entirely or reported only one of the two fields
+  (a partial usage object is treated the same as no usage, never as a partial
+  number). Only **successful** responses carry a `usage` member at all —
+  failure payloads never gain one. This is the number `mode: auto` compares
+  against a session's configured compaction `size`; see
+  [`session.compaction.started`](#sessioncompactionstarted) below.
 
 #### Raw-logged vs. canonical-returned (OpenAI-kind providers)
 
@@ -758,10 +768,110 @@ carries this event in `result.events` — not a JSON-RPC error object.
 
 ---
 
-### `session.compaction`
+### `session.compaction.started`
 
-Reserved — not emitted yet. Will be used when session history is compacted
-into a summary to manage context length. No payload schema defined.
+Emitted when a session's history is about to be compacted — either
+automatically by the server (`compaction: {"mode":"auto"}`, once a completed
+turn's reported usage crosses the configured `size`) or explicitly via the
+[`session.compact`](00-client-api.md#sessioncompact) JSON-RPC method
+(`mode: "client"`, or a manual call on a `mode: "auto"` session).
+
+**Auto trigger:**
+
+```json
+{
+  "trigger": "auto",
+  "reason": "token_threshold",
+  "token_count": 128001,
+  "threshold_tokens": 128000
+}
+```
+
+**Manual trigger (`session.compact`), with usable prior usage:**
+
+```json
+{
+  "trigger": "client",
+  "reason": "manual",
+  "token_count": 42000,
+  "threshold_tokens": null
+}
+```
+
+**Manual trigger, no usable prior usage yet:**
+
+```json
+{
+  "trigger": "client",
+  "reason": "manual",
+  "token_count": null,
+  "threshold_tokens": null
+}
+```
+
+- `trigger` is `"auto"` or `"client"`.
+- `reason` is `"token_threshold"` for an auto trigger, `"manual"` for a
+  `session.compact` call — including a manual call on a session configured
+  for `mode: "auto"`.
+- `token_count`: for `trigger: "auto"`, the just-completed turn's
+  `input_tokens + output_tokens` that crossed the threshold. For
+  `trigger: "client"`, a **best-effort** figure read from the session's most
+  recently persisted `provider.response` event's `usage`, or `null` if that
+  event has no usage or the session has made no provider calls yet. This
+  never scans further back than that single newest response.
+- `threshold_tokens` is the session's configured `size` for an auto trigger;
+  always `null` for a manual trigger, since no auto config governs a
+  `session.compact` call.
+
+---
+
+### `session.compaction.completed`
+
+Emitted when the compaction provider call finishes and the compacted summary
+has been recorded as a synthetic `server.message.send` event.
+
+```json
+{
+  "summary_event_id": "evt_…",
+  "compacted_message_count": 17,
+  "input_tokens": 42100,
+  "summary_tokens": 900
+}
+```
+
+- `summary_event_id` — the id of the `server.message.send` event immediately
+  preceding this one, holding the compacted summary text itself. The summary
+  text is **not** duplicated into this payload.
+- `compacted_message_count` — the number of effective history messages that
+  were summarized (the length of the pre-compaction history the server built
+  the compaction request from); it excludes both the appended compaction
+  instruction and the produced summary.
+- `input_tokens` / `summary_tokens` — the compaction call's **own**
+  provider-reported usage: `input_tokens` is that request's input usage
+  (necessarily including the appended compaction instruction — the server has
+  no way to subtract it out and does not attempt to), `summary_tokens` is the
+  summary's `output_tokens`.
+- All four fields are always present. `input_tokens` and `summary_tokens` are
+  `null` when a provider returned a valid summary without usage accounting;
+  the summary is still committed, because missing metrics must not discard a
+  completed model result. If the compaction's provider call fails, no summary
+  message and no `session.compaction.completed` event are written at all — only
+  the `session.compaction.started` event from the attempt remains as an audit
+  trail. The session remains compactable on the next attempt.
+
+**Effect on subsequent turns:** starting with the next `session.sendMessage`
+or `session.compact` call, the history sent to the **model** begins at this
+event's referenced summary message, followed by every message recorded after
+it — the pre-compaction messages are no longer sent upstream. This changes
+only what is sent to the model. `GET /api/v1/sessions/{id}/events` (and any
+`session.subscribe` replay via `since_event_id`) always returns the complete,
+unmodified append-only log, including every event before the compaction —
+compaction never rewrites or deletes history, it only changes which rows a
+later turn's request is built from.
+
+See [Client API — session creation](00-client-api.md#post-apiv1sessions--open-a-session)
+for the `compaction` config and [Client API — `session.compact`](00-client-api.md#sessioncompact)
+for the manual-trigger RPC method.
 
 ---
 
@@ -952,3 +1062,37 @@ server.message.send             (client_key_id: key_B)
 participant — every event is attributed to whichever client key actually
 produced it. See [Multi-Client Sessions](../guides/07-multi-client-sessions.md)
 for the full walkthrough.
+
+**Auto compaction (`compaction: {"mode":"auto","size":...}`, triggered inside
+a turn once that turn's own usage crosses `size`):**
+
+```
+client.message.send
+provider.request
+provider.response      (ok: true; usage crosses the configured size)
+server.message.send                                 -- the turn's own reply, persisted first
+session.compaction.started    (trigger: auto)
+provider.request               (compaction call: history + compaction instruction)
+provider.response      (ok: true)
+server.message.send            (compacted summary)
+session.compaction.completed
+```
+
+The *next* turn's `provider.request` contains only the compacted summary plus
+whatever was recorded after it — never the pre-compaction messages.
+
+**Manual compaction (`session.compact` RPC call):**
+
+```
+session.compact                                     -- session.compaction.started
+provider.request               (compaction call: history + compaction instruction)
+provider.response      (ok: true)
+server.message.send            (compacted summary)
+                                                     -- session.compaction.completed
+```
+
+Unlike `session.sendMessage`, `session.compact` is not itself an
+`event_type` — it is the RPC call whose terminal result is the
+`session.compaction.completed` event. Every event above still streams to
+`session.subscribe` watchers exactly like any other event. See [Client API —
+`session.compact`](00-client-api.md#sessioncompact).

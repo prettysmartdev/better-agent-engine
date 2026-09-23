@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use super::{generate_id, NOW_SQL};
+use crate::api::client::sessions::CompactionConfig;
 use crate::events::EventType;
 
 /// Prefix on every session id.
@@ -49,6 +50,11 @@ pub struct SessionRecord {
     /// Per-client remote-subagent declarations. Unlike `client_tools`, these
     /// are executed by the server in the session's existing remote sandbox.
     pub subagent_tools: Value,
+    /// Session-level compaction config, fixed at creation. A newly created row
+    /// is always `Some`; a pre-migration or hand-seeded NULL/malformed value
+    /// reads as `None` and is semantically equivalent to client mode with no
+    /// stored prompt.
+    pub compaction: Option<CompactionConfig>,
     pub created_at: String,
     pub closed_at: Option<String>,
 }
@@ -65,7 +71,7 @@ pub struct EventRecord {
 }
 
 const SESSION_COLS: &str = "id, client_key_id, profile_id, state, client_version, client_tools, \
-     sandbox_tools, subagent_tools, created_at, closed_at";
+     sandbox_tools, subagent_tools, compaction, created_at, closed_at";
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
@@ -89,6 +95,11 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Value::Null),
+        // NULL (pre-migration/hand-seeded) or malformed JSON reads back as
+        // `None` — semantically client mode with no stored prompt.
+        compaction: row
+            .get::<_, Option<String>>("compaction")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
         created_at: row.get("created_at")?,
         closed_at: row.get("closed_at")?,
     })
@@ -110,16 +121,22 @@ pub fn create_session(
     client_tools: &Value,
     sandbox_tools: &Value,
     subagent_tools: &Value,
+    compaction: &CompactionConfig,
 ) -> rusqlite::Result<SessionRecord> {
     let id = generate_id(SESSION_ID_PREFIX);
     let tools_by_client = serde_json::json!({ client_key_id: client_tools });
     let sandbox_by_client = serde_json::json!({ client_key_id: sandbox_tools });
     let subagent_by_client = serde_json::json!({ client_key_id: subagent_tools });
+    // Serialize the normalized compaction config to JSON TEXT. Serialization of
+    // this small tagged enum cannot fail; fall back to the client-mode default
+    // rather than panicking if it somehow did.
+    let compaction_json = serde_json::to_string(compaction)
+        .unwrap_or_else(|_| serde_json::to_string(&CompactionConfig::default()).unwrap());
     let sql = format!(
         "INSERT INTO sessions \
            (id, client_key_id, profile_id, state, client_version, client_tools, \
-            sandbox_tools, subagent_tools, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW_SQL}) \
+            sandbox_tools, subagent_tools, compaction, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, {NOW_SQL}) \
          RETURNING {SESSION_COLS}"
     );
     conn.query_row(
@@ -133,6 +150,7 @@ pub fn create_session(
             tools_by_client.to_string(),
             sandbox_by_client.to_string(),
             subagent_by_client.to_string(),
+            compaction_json,
         ],
         row_to_session,
     )
@@ -319,12 +337,19 @@ pub fn insert_event(
 /// `client.message.send` keeps its stored role (defaulting to `user`), a
 /// `server.message.send` is always `assistant`.
 pub fn stream_history(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<Value>> {
+    // Scope the message scan to the most recent *completed* compaction, if any.
+    // The lower bound is the summary message's own rowid (not the completed
+    // marker's), because the synthetic summary `server.message.send` is inserted
+    // just *before* the completed marker — so the first returned message is the
+    // compacted summary itself, followed by everything sent after it.
+    let lower_bound = history_lower_bound(conn, session_id)?;
     let sql = "SELECT event_type, payload FROM session_events \
                WHERE session_id = ?1 \
                  AND event_type IN ('client.message.send', 'server.message.send') \
+                 AND rowid >= ?2 \
                ORDER BY rowid";
     let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query(params![session_id])?;
+    let mut rows = stmt.query(params![session_id, lower_bound])?;
     let mut history = Vec::new();
     while let Some(row) = rows.next()? {
         let event_type: String = row.get(0)?;
@@ -399,6 +424,107 @@ pub fn rowid_of_event(
     .optional()
 }
 
+/// The rowid of the newest `session.compaction.completed` marker for a session,
+/// or `None` if the session has never completed a compaction. Keys strictly off
+/// the **completed** marker — a `session.compaction.started` without a matching
+/// completion (a failed attempt) is deliberately ignored, so history keeps
+/// scoping from the previous successful compaction (or session start).
+pub fn rowid_of_last_compaction(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT rowid FROM session_events \
+         WHERE session_id = ?1 AND event_type = 'session.compaction.completed' \
+         ORDER BY rowid DESC LIMIT 1",
+        params![session_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+}
+
+/// Best-effort accumulated context token count for a session: the `input_tokens
+/// + output_tokens` recorded on the session's **newest** `provider.response`
+/// event's `usage` field (added by the engine). Returns `None` when there is no
+/// provider response yet, or the newest one has no usable `usage` (a failed
+/// response, `usage: null`, or a malformed/partial object) — it does **not**
+/// search backward for an older usable response. Used only for the informational
+/// `token_count` on a manually-triggered `session.compaction.started` event.
+pub fn last_provider_token_count(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<u64>> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM session_events \
+             WHERE session_id = ?1 AND event_type = 'provider.response' \
+             ORDER BY rowid DESC LIMIT 1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    let usage = payload.get("usage");
+    let input = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let output = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_u64);
+    match (input, output) {
+        (Some(i), Some(o)) => Ok(Some(i.saturating_add(o))),
+        _ => Ok(None),
+    }
+}
+
+/// The inclusive rowid lower bound for [`stream_history`]'s provider-facing
+/// message scan. Resolves the most recent `session.compaction.completed`
+/// marker's `payload.summary_event_id` to the summary message's own rowid.
+///
+/// Falls back to `0` (full history) when there is no completed marker, its
+/// payload is malformed, the `summary_event_id` is missing/foreign to this
+/// session, or the referenced event is not a message event — never dropping
+/// context on a broken reference.
+fn history_lower_bound(conn: &Connection, session_id: &str) -> rusqlite::Result<i64> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM session_events \
+             WHERE session_id = ?1 AND event_type = 'session.compaction.completed' \
+             ORDER BY rowid DESC LIMIT 1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(0);
+    };
+    let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    let Some(summary_id) = payload.get("summary_event_id").and_then(Value::as_str) else {
+        return Ok(0);
+    };
+    // Resolve the summary event and confirm it is a message row in this session.
+    let resolved: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT rowid, event_type FROM session_events \
+             WHERE session_id = ?1 AND id = ?2",
+            params![session_id, summary_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match resolved {
+        Some((rowid, event_type))
+            if event_type == EventType::ClientMessageSend.as_str()
+                || event_type == EventType::ServerMessageSend.as_str() =>
+        {
+            Ok(rowid)
+        }
+        _ => Ok(0),
+    }
+}
+
 /// One page of a session's events, ordered by insertion (rowid), for replay.
 /// `after` is the exclusive rowid cursor; `limit` rows are returned. The bool is
 /// true when more rows remain after this page.
@@ -452,6 +578,168 @@ mod tests {
         .unwrap();
     }
 
+    fn test_session(c: &Connection) -> SessionRecord {
+        seed_parents(c);
+        create_session(
+            c,
+            "key_a",
+            "pro_1",
+            STATE_OPEN,
+            None,
+            &json!([]),
+            &json!([]),
+            &json!([]),
+            &CompactionConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn message(
+        c: &Connection,
+        session_id: &str,
+        event_type: EventType,
+        content: &str,
+    ) -> EventRecord {
+        insert_event(
+            c,
+            session_id,
+            Some("key_a"),
+            event_type,
+            &json!({ "role": "user", "content": content }),
+        )
+        .unwrap()
+    }
+
+    fn completed(c: &Connection, session_id: &str, summary_event_id: &str) -> EventRecord {
+        insert_event(
+            c,
+            session_id,
+            Some("key_a"),
+            EventType::SessionCompactionCompleted,
+            &json!({
+                "summary_event_id": summary_event_id,
+                "compacted_message_count": 1,
+                "input_tokens": 100,
+                "summary_tokens": 10,
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rowid_of_last_compaction_is_none_without_completed_event() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            assert_eq!(rowid_of_last_compaction(c, &session.id).unwrap(), None);
+
+            insert_event(
+                c,
+                &session.id,
+                Some("key_a"),
+                EventType::SessionCompactionStarted,
+                &json!({ "trigger": "client", "reason": "manual" }),
+            )
+            .unwrap();
+            assert_eq!(
+                rowid_of_last_compaction(c, &session.id).unwrap(),
+                None,
+                "a failed/started-only attempt must not move the history boundary"
+            );
+        });
+    }
+
+    #[test]
+    fn rowid_of_last_compaction_returns_the_newest_completed_marker() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            let first = completed(c, &session.id, "summary-1");
+            assert_eq!(
+                rowid_of_last_compaction(c, &session.id).unwrap(),
+                rowid_of_event(c, &session.id, &first.id).unwrap()
+            );
+
+            // Started events are intentionally irrelevant, even when they are
+            // newer than the last successful completion.
+            insert_event(
+                c,
+                &session.id,
+                Some("key_a"),
+                EventType::SessionCompactionStarted,
+                &json!({ "trigger": "client", "reason": "manual" }),
+            )
+            .unwrap();
+            let second = completed(c, &session.id, "summary-2");
+            assert_eq!(
+                rowid_of_last_compaction(c, &session.id).unwrap(),
+                rowid_of_event(c, &session.id, &second.id).unwrap()
+            );
+            assert_ne!(first.id, second.id);
+        });
+    }
+
+    #[test]
+    fn stream_history_returns_full_message_history_without_compaction() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            message(c, &session.id, EventType::ClientMessageSend, "first");
+            message(c, &session.id, EventType::ServerMessageSend, "answer");
+
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![
+                    json!({ "role": "user", "content": "first" }),
+                    json!({ "role": "assistant", "content": "answer" }),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn stream_history_starts_at_compacted_summary_and_keeps_later_messages() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            message(c, &session.id, EventType::ClientMessageSend, "before");
+            let summary = message(c, &session.id, EventType::ServerMessageSend, "summary");
+            completed(c, &session.id, &summary.id);
+            message(c, &session.id, EventType::ClientMessageSend, "after");
+
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![
+                    json!({ "role": "assistant", "content": "summary" }),
+                    json!({ "role": "user", "content": "after" }),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn stream_history_uses_only_the_most_recent_compaction_summary() {
+        let store = Store::open_in_memory().unwrap();
+        store.with_conn(|c| {
+            let session = test_session(c);
+            message(c, &session.id, EventType::ClientMessageSend, "before-1");
+            let summary_one = message(c, &session.id, EventType::ServerMessageSend, "summary-1");
+            completed(c, &session.id, &summary_one.id);
+            message(c, &session.id, EventType::ClientMessageSend, "between");
+            let summary_two = message(c, &session.id, EventType::ServerMessageSend, "summary-2");
+            completed(c, &session.id, &summary_two.id);
+            message(c, &session.id, EventType::ClientMessageSend, "after-2");
+
+            assert_eq!(
+                stream_history(c, &session.id).unwrap(),
+                vec![
+                    json!({ "role": "assistant", "content": "summary-2" }),
+                    json!({ "role": "user", "content": "after-2" }),
+                ]
+            );
+        });
+    }
+
     /// `set_client_tools` writes exactly one client's entry in the per-client
     /// `client_tools` object: other clients' entries are left byte-for-byte
     /// untouched, and a second call for the same client *replaces* (does not
@@ -472,6 +760,7 @@ mod tests {
                 &json!([{ "name": "only_a" }]),
                 &json!([]),
                 &json!([]),
+                &CompactionConfig::default(),
             )
             .unwrap();
 
@@ -518,6 +807,7 @@ mod tests {
                 &json!([]),
                 &json!([]),
                 &json!([]),
+                &CompactionConfig::default(),
             )
             .unwrap();
             let s_closed = create_session(
@@ -529,6 +819,7 @@ mod tests {
                 &json!([]),
                 &json!([]),
                 &json!([]),
+                &CompactionConfig::default(),
             )
             .unwrap();
             let s_error = create_session(
@@ -540,6 +831,7 @@ mod tests {
                 &json!([]),
                 &json!([]),
                 &json!([]),
+                &CompactionConfig::default(),
             )
             .unwrap();
 

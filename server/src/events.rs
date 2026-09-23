@@ -51,9 +51,14 @@ pub enum EventType {
     /// Session terminated due to error.
     #[serde(rename = "session.error")]
     SessionError,
-    /// Session history was compacted (summary event).
-    #[serde(rename = "session.compaction")]
-    SessionCompaction,
+    /// A session-history compaction has begun (server auto-trigger or a
+    /// client-driven `session.compact`); the summary has not been produced yet.
+    #[serde(rename = "session.compaction.started")]
+    SessionCompactionStarted,
+    /// A session-history compaction finished: the compacted summary message has
+    /// been persisted and later provider-facing history starts from it.
+    #[serde(rename = "session.compaction.completed")]
+    SessionCompactionCompleted,
     /// A second (or further) client key minted a session key for an existing
     /// session via `POST /api/v1/sessions/{id}/join`.
     #[serde(rename = "session.join")]
@@ -111,7 +116,7 @@ pub enum EventType {
 
 impl EventType {
     /// Every variant, in definition order. Handy for tests and documentation.
-    pub const ALL: [EventType; 27] = [
+    pub const ALL: [EventType; 28] = [
         EventType::ClientMessageSend,
         EventType::ServerMessageSend,
         EventType::ProviderRequest,
@@ -123,7 +128,8 @@ impl EventType {
         EventType::SessionOpen,
         EventType::SessionClose,
         EventType::SessionError,
-        EventType::SessionCompaction,
+        EventType::SessionCompactionStarted,
+        EventType::SessionCompactionCompleted,
         EventType::SessionJoin,
         EventType::SessionDriverRegistered,
         EventType::SandboxAvailable,
@@ -158,7 +164,8 @@ impl EventType {
             EventType::SessionOpen => "session.open",
             EventType::SessionClose => "session.close",
             EventType::SessionError => "session.error",
-            EventType::SessionCompaction => "session.compaction",
+            EventType::SessionCompactionStarted => "session.compaction.started",
+            EventType::SessionCompactionCompleted => "session.compaction.completed",
             EventType::SessionJoin => "session.join",
             EventType::SessionDriverRegistered => "session.driver.register",
             EventType::SandboxAvailable => "session.sandbox.available",
@@ -217,9 +224,9 @@ mod tests {
         for ev in EventType::ALL {
             assert!(seen.insert(ev.as_str()), "duplicate wire string: {ev}");
         }
-        assert_eq!(seen.len(), 27);
+        assert_eq!(seen.len(), 28);
         assert_eq!(
-            &EventType::ALL[22..],
+            &EventType::ALL[23..],
             &[
                 EventType::SubagentStart,
                 EventType::SubagentRunning,
@@ -241,8 +248,14 @@ mod tests {
     fn serde_uses_wire_strings() {
         let json = serde_json::to_string(&EventType::ClientMessageSend).unwrap();
         assert_eq!(json, "\"client.message.send\"");
-        let back: EventType = serde_json::from_str("\"session.compaction\"").unwrap();
-        assert_eq!(back, EventType::SessionCompaction);
+        // The compaction pair replaced the single `session.compaction` variant.
+        let started: EventType = serde_json::from_str("\"session.compaction.started\"").unwrap();
+        assert_eq!(started, EventType::SessionCompactionStarted);
+        let completed: EventType =
+            serde_json::from_str("\"session.compaction.completed\"").unwrap();
+        assert_eq!(completed, EventType::SessionCompactionCompleted);
+        // The old single wire string is now unknown.
+        assert!("session.compaction".parse::<EventType>().is_err());
     }
 
     #[test]

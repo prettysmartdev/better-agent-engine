@@ -7193,3 +7193,920 @@ async fn admin_sessions_events_readable_for_terminal_sessions_and_404_unknown() 
         "the 404 names the missing id: {raw}"
     );
 }
+
+// ===========================================================================
+// Session compaction (WI 0016)
+// ===========================================================================
+//
+// These tests drive the compaction feature end to end against a dedicated
+// in-process mock provider that records every request body (a [`Recorder`], as
+// the FIFO/multi-client suite already uses) and — unlike [`mock_handler`] —
+// attaches a controllable `usage` object to each response, the signal the
+// auto-trigger and the manual `started` event read. Behaviour is keyed by the
+// leading path segment, exactly like [`mock_handler`]:
+//
+// - `/high`     — text turn, usage `900 + 200 = 1100` tokens (crosses a 1000
+//   threshold).
+// - `/low`      — text turn, usage `400 + 200 = 600` tokens (stays under 1000).
+// - `/nousage`  — text turn, no `usage` field at all.
+// - `/togusage` — text turn; usage present only when the user turn carries the
+//   marker `WITHUSAGE` (or on the compaction call itself), so a session can go
+//   from usage-less to usage-reporting mid-stream.
+// - `/failcompact` — ordinary turns carry usage; the *compaction* call returns
+//   HTTP 500.
+// - `/summarynousage` — ordinary turns report usage but a successful
+//   compaction response omits it.
+// - `/pausedhigh` — first response is a client `tool_use` with threshold-
+//   crossing usage; the resumed final response omits usage.
+// - `/equal` — every response reports exactly 1,000 total tokens.
+// - `/openai`   — the same, in OpenAI Chat-Completions shape with
+//   `usage.prompt_tokens`/`completion_tokens`, exercising the OpenAI usage path.
+//
+// A request is treated as the compaction call when its final message text
+// contains "summar" (the built-in prompt says "compacted summary"; every custom
+// prompt these tests pass also contains "summarize"). Ordinary user turns here
+// are "first"/"second"/"third" and never match.
+
+async fn compaction_mock(
+    axum::extract::State(requests): axum::extract::State<Recorder>,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    requests.lock().unwrap().push(body.clone());
+
+    let role = path.trim_start_matches('/').split('/').next().unwrap_or("");
+
+    // The text of the final message, whether a plain string (a user turn or the
+    // compaction instruction) or an array of content blocks (a replayed
+    // assistant summary).
+    let last_text = body["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .and_then(|m| m.get("content"))
+        .map(|c| match c {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    let is_compaction = last_text.to_lowercase().contains("summar");
+    let has_tool_result = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_array())
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block["type"] == json!("tool_result"))
+        });
+
+    if role == "failcompact" && is_compaction {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "boom" })),
+        )
+            .into_response();
+    }
+
+    // This special shape drives a client-tool pause. Its first response crosses
+    // the auto threshold, while the resumed final response intentionally has
+    // no usage — proving the parked threshold trigger cannot be lost.
+    if role == "pausedhigh" && !has_tool_result {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "role": "assistant",
+                "stop_reason": "tool_use",
+                "content": [{ "type": "tool_use", "id": "tu_paused_high",
+                              "name": "get_current_time", "input": {} }],
+                "usage": { "input_tokens": 900, "output_tokens": 200 },
+            })),
+        )
+            .into_response();
+    }
+
+    let text = if is_compaction {
+        "SUMMARY of everything"
+    } else {
+        "ordinary reply"
+    };
+    let (input, output) = if role == "low" {
+        (400u64, 200u64)
+    } else if role == "equal" {
+        (800u64, 200u64)
+    } else {
+        (900u64, 200u64)
+    };
+    let include_usage = match role {
+        "nousage" => false,
+        "summarynousage" => !is_compaction,
+        "pausedhigh" => false,
+        "togusage" => is_compaction || last_text.contains("WITHUSAGE"),
+        _ => true,
+    };
+
+    let out = if role == "openai" {
+        let mut o = json!({
+            "id": "chatcmpl-mock",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                          "message": { "role": "assistant", "content": text } }],
+        });
+        if include_usage {
+            o["usage"] = json!({ "prompt_tokens": input, "completion_tokens": output });
+        }
+        o
+    } else {
+        let mut o = json!({
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [{ "type": "text", "text": text }],
+        });
+        if include_usage {
+            o["usage"] = json!({ "input_tokens": input, "output_tokens": output });
+        }
+        o
+    };
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+/// Start the compaction mock on an ephemeral port; returns `(base_url, recorder)`.
+async fn start_compaction_mock() -> (String, Recorder) {
+    let requests: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(compaction_mock)
+        .with_state(requests.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests)
+}
+
+/// Boot a server whose provider registry has one entry per compaction-mock
+/// behaviour, all pointing at a single recording mock, built through the real
+/// config loader exactly as startup would. Returns the server and the request
+/// recorder.
+async fn boot_compaction_server() -> (TestServer, Recorder) {
+    let (mock, requests) = start_compaction_mock().await;
+    let toml = [
+        provider_entry_toml("high", "anthropic", &format!("{mock}/high"), "test-token"),
+        provider_entry_toml("low", "anthropic", &format!("{mock}/low"), "test-token"),
+        provider_entry_toml(
+            "nousage",
+            "anthropic",
+            &format!("{mock}/nousage"),
+            "test-token",
+        ),
+        provider_entry_toml(
+            "togusage",
+            "anthropic",
+            &format!("{mock}/togusage"),
+            "test-token",
+        ),
+        provider_entry_toml(
+            "failcompact",
+            "anthropic",
+            &format!("{mock}/failcompact"),
+            "test-token",
+        ),
+        provider_entry_toml(
+            "summarynousage",
+            "anthropic",
+            &format!("{mock}/summarynousage"),
+            "test-token",
+        ),
+        provider_entry_toml(
+            "pausedhigh",
+            "anthropic",
+            &format!("{mock}/pausedhigh"),
+            "test-token",
+        ),
+        provider_entry_toml("equal", "anthropic", &format!("{mock}/equal"), "test-token"),
+        provider_entry_toml("openai", "openai", &format!("{mock}/openai"), "test-token"),
+    ]
+    .concat();
+    let providers = provider_registry_from_toml(&toml);
+    let ts = boot_server(HashMap::new(), providers, None).await;
+    (ts, requests)
+}
+
+impl TestServer {
+    /// Create a session carrying the given `compaction` config (pass
+    /// [`Value::Null`] for none), registering the opener as a driver so
+    /// `session.sendMessage`/`session.compact` are permitted. Returns `(id, key)`.
+    async fn open_compaction_session(
+        &self,
+        client_key: &str,
+        compaction: Value,
+    ) -> (String, String) {
+        let mut body = json!({ "client_version": "1.0.0", "tools": [] });
+        if !compaction.is_null() {
+            body["compaction"] = compaction;
+        }
+        let (status, v, raw) = self
+            .client_post("/api/v1/sessions", Some(client_key), body)
+            .await;
+        assert_eq!(status, 201, "open compaction session failed: {raw}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let skey = v["session_key"].as_str().unwrap().to_string();
+        self.register_driver(&sid, &skey).await;
+        (sid, skey)
+    }
+
+    /// The full ordered event list from the replay endpoint.
+    async fn replay_events(&self, session_id: &str, session_key: &str) -> Vec<Value> {
+        let (status, v, raw) = self
+            .client_get(
+                &format!("/api/v1/sessions/{session_id}/events?limit=500"),
+                Some(session_key),
+            )
+            .await;
+        assert_eq!(status, 200, "events replay failed: {raw}");
+        v["items"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Call `session.compact` with `params`; returns the single terminal frame
+    /// (`session.compact` responds with one frame — the produced event or an
+    /// error — never a stream; its `started`/`completed` pair reaches watchers
+    /// through the broadcast/replay path instead).
+    async fn compact(&self, session_id: &str, token: &str, params: Value) -> Value {
+        let (status, frames, raw) = self
+            .rpc(
+                session_id,
+                token,
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "session.compact", "params": params }),
+            )
+            .await;
+        assert_eq!(status, 200, "compact rpc transport: {raw}");
+        let terminal = frames.into_iter().find(|f| f["id"] == json!(1));
+        assert!(terminal.is_some(), "no terminal frame from compact: {raw}");
+        terminal.unwrap()
+    }
+}
+
+/// The ordered `event_type` list of a replayed event slice.
+fn compaction_types(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .map(|e| e["event_type"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+/// The first event of the given type in a replayed slice.
+fn find_event<'a>(items: &'a [Value], event_type: &str) -> &'a Value {
+    items
+        .iter()
+        .find(|e| e["event_type"] == json!(event_type))
+        .unwrap_or_else(|| panic!("no {event_type} event present"))
+}
+
+/// A) Auto mode compacts *after* a threshold-crossing turn, and the next turn's
+/// provider request carries the compacted history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_auto_triggers_at_token_threshold() {
+    let (ts, requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    // One turn whose usage (1100) crosses the 1000-token threshold.
+    let (status, resp, raw) = ts
+        .send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    assert_eq!(status, 200, "send: {raw}");
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("ordinary reply")
+    );
+
+    // The turn's own events complete FIRST, then the compaction sequence — the
+    // exact ordered log, extending `session_lifecycle_exact_event_sequence_and_replay`.
+    let items = ts.replay_events(&sid, &skey).await;
+    assert_eq!(
+        compaction_types(&items),
+        vec![
+            "session.open",
+            "session.driver.register",
+            "client.message.send",
+            "provider.request",
+            "provider.response",
+            "server.message.send",
+            "session.compaction.started",
+            "provider.request",
+            "provider.response",
+            "server.message.send",
+            "session.compaction.completed",
+        ],
+        "auto compaction fires strictly after the triggering turn completes"
+    );
+
+    // Usage rides along on the ordinary provider.response (the auto-trigger's input).
+    let ordinary_resp = find_event(&items, "provider.response");
+    assert_eq!(
+        ordinary_resp["payload"]["usage"],
+        json!({ "input_tokens": 900, "output_tokens": 200 })
+    );
+
+    // The started payload names the trigger, reason, and the token figures.
+    let started = find_event(&items, "session.compaction.started");
+    assert_eq!(
+        started["payload"],
+        json!({ "trigger": "auto", "reason": "token_threshold",
+                "token_count": 1100, "threshold_tokens": 1000 })
+    );
+
+    // The completed payload points at the summary message and reports the
+    // compaction call's own usage; the summary text is not duplicated here.
+    let completed = items.last().unwrap();
+    assert_eq!(
+        completed["event_type"],
+        json!("session.compaction.completed")
+    );
+    assert_eq!(completed["payload"]["compacted_message_count"], json!(2));
+    assert_eq!(completed["payload"]["input_tokens"], json!(900));
+    assert_eq!(completed["payload"]["summary_tokens"], json!(200));
+    assert!(
+        completed["payload"].get("summary").is_none(),
+        "the summary text lives only in the message event it points at"
+    );
+    let summary_id = completed["payload"]["summary_event_id"].as_str().unwrap();
+    let summary = &items[items.len() - 2];
+    assert_eq!(summary["event_type"], json!("server.message.send"));
+    assert_eq!(summary["id"].as_str().unwrap(), summary_id);
+    assert_eq!(
+        summary["payload"]["content"][0]["text"],
+        json!("SUMMARY of everything")
+    );
+
+    // The compaction request itself: full prior history + the built-in prompt,
+    // advertising no tools.
+    let reqs = requests.lock().unwrap().clone();
+    let comp_req = &reqs[1];
+    let msgs = comp_req["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3, "history + instruction: {comp_req:#?}");
+    assert_eq!(msgs[2]["role"], json!("user"));
+    assert!(
+        msgs[2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Produce a single self-contained compacted summary"),
+        "auto compaction uses the built-in default prompt: {comp_req:#?}"
+    );
+    assert_eq!(comp_req["tools"], json!([]));
+
+    // The NEXT turn starts from the compacted summary, not the pre-compaction
+    // history.
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "second" }))
+        .await;
+    let reqs = requests.lock().unwrap().clone();
+    let next_req = &reqs[2];
+    let msgs = next_req["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "compacted history + new turn: {next_req:#?}");
+    assert_eq!(msgs[0]["role"], json!("assistant"));
+    assert_eq!(
+        msgs[0]["content"][0]["text"],
+        json!("SUMMARY of everything")
+    );
+    assert_eq!(msgs[1]["content"], json!("second"));
+}
+
+/// B) Auto mode does not compact while usage stays under the threshold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_auto_does_not_trigger_under_threshold() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("low", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    for content in ["first", "second", "third"] {
+        let (status, _v, raw) = ts
+            .send_message(&sid, &skey, json!({ "role": "user", "content": content }))
+            .await;
+        assert_eq!(status, 200, "send {content}: {raw}");
+    }
+
+    let items = ts.replay_events(&sid, &skey).await;
+    let types = compaction_types(&items);
+    assert!(
+        !types.iter().any(|e| e.starts_with("session.compaction")),
+        "usage under the threshold must never compact: {types:?}"
+    );
+    // Usage was reported (600) — it simply stayed under `size`.
+    assert_eq!(
+        find_event(&items, "provider.response")["payload"]["usage"],
+        json!({ "input_tokens": 400, "output_tokens": 200 })
+    );
+}
+
+/// The threshold comparison is strict: usage equal to `size` must not compact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_auto_does_not_trigger_at_exact_threshold() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("equal", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    let items = ts.replay_events(&sid, &skey).await;
+    assert!(
+        !compaction_types(&items)
+            .iter()
+            .any(|e| e.starts_with("session.compaction")),
+        "usage equal to the threshold must not compact: {items:#?}"
+    );
+}
+
+/// A threshold crossing before a client-tool pause is retained until the
+/// tool-result exchange reaches a valid completed boundary, even when the
+/// resumed provider response omits usage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_auto_preserves_threshold_trigger_across_paused_tool_turn() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts
+        .create_profile("pausedhigh", json!([]), json!(["get_current_time"]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    // Create through the real API so this paused client-tool session carries
+    // the same auto config production clients use.
+    let (status, opened, raw) = ts
+        .client_post(
+            "/api/v1/sessions",
+            Some(&key),
+            json!({
+                "client_version": "1.0.0",
+                "tools": [{
+                    "name": "get_current_time",
+                    "description": "Return the current time",
+                    "input_schema": { "type": "object", "properties": {} }
+                }],
+                "compaction": { "mode": "auto", "size": 1000 }
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "open paused-auto session: {raw}");
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    let skey = opened["session_key"].as_str().unwrap().to_string();
+    ts.register_driver(&sid, &skey).await;
+
+    let (status, first, raw) = ts
+        .send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    assert_eq!(status, 200, "paused first turn: {raw}");
+    let tool_use_id = first["message"]["content"][0]["id"].as_str().unwrap();
+    let initial_items = ts.replay_events(&sid, &skey).await;
+    assert!(
+        !compaction_types(&initial_items)
+            .iter()
+            .any(|e| e.starts_with("session.compaction")),
+        "the unresolved tool_use must not be compacted"
+    );
+
+    let (status, _second, raw) = ts
+        .send_message(
+            &sid,
+            &skey,
+            json!({ "role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": tool_use_id, "content": "12:00 UTC"
+            }] }),
+        )
+        .await;
+    assert_eq!(status, 200, "tool continuation: {raw}");
+    let items = ts.replay_events(&sid, &skey).await;
+    let started = find_event(&items, "session.compaction.started");
+    assert_eq!(
+        started["payload"],
+        json!({ "trigger": "auto", "reason": "token_threshold",
+                "token_count": 1100, "threshold_tokens": 1000 }),
+        "the first, paused response's crossing is retained"
+    );
+    assert!(
+        compaction_types(&items).contains(&"session.compaction.completed".to_string()),
+        "the safe completed boundary runs the saved compaction"
+    );
+}
+
+/// C) A turn whose response omits `usage` skips the auto check entirely; a later
+/// turn that *does* report usage resumes normal checking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_auto_skips_check_when_usage_missing() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("togusage", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    // Two turns with no `usage` at all — enough that a byte/character proxy would
+    // long since have "crossed" a small threshold.
+    for content in ["first", "second"] {
+        ts.send_message(&sid, &skey, json!({ "role": "user", "content": content }))
+            .await;
+    }
+    let items = ts.replay_events(&sid, &skey).await;
+    assert!(
+        !compaction_types(&items)
+            .iter()
+            .any(|e| e.starts_with("session.compaction")),
+        "usage-less turns never auto-compact"
+    );
+    for e in items
+        .iter()
+        .filter(|e| e["event_type"] == json!("provider.response"))
+    {
+        assert_eq!(
+            e["payload"]["usage"],
+            Value::Null,
+            "these responses carried no usage"
+        );
+    }
+
+    // A later turn that reports usage (via the `WITHUSAGE` marker) resumes the
+    // check and crosses the threshold.
+    ts.send_message(
+        &sid,
+        &skey,
+        json!({ "role": "user", "content": "third WITHUSAGE" }),
+    )
+    .await;
+    let items = ts.replay_events(&sid, &skey).await;
+    let types = compaction_types(&items);
+    assert!(
+        types.contains(&"session.compaction.started".to_string()),
+        "a usage-bearing turn resumes the auto check: {types:?}"
+    );
+    assert!(
+        types.contains(&"session.compaction.completed".to_string()),
+        "and the resumed compaction completes: {types:?}"
+    );
+}
+
+/// D) `mode: client` never auto-compacts, and an explicit `session.compact`
+/// produces the started/completed pair (with `token_count` from the prior turn's
+/// stored usage) and scopes the next turn's request to the compacted summary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_client_manual_rpc() {
+    let (ts, requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    // No `compaction` field at all — equivalent to `mode: client`.
+    let (sid, skey) = ts.open_compaction_session(&key, Value::Null).await;
+
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "second" }))
+        .await;
+    let items = ts.replay_events(&sid, &skey).await;
+    assert!(
+        !compaction_types(&items)
+            .iter()
+            .any(|e| e.starts_with("session.compaction")),
+        "client mode performs no server-side auto compaction"
+    );
+
+    // Explicit client-driven compaction.
+    let terminal = ts.compact(&sid, &skey, json!({})).await;
+    assert_eq!(
+        terminal["result"]["event_type"],
+        json!("session.compaction.completed"),
+        "compact returns the completed event: {terminal:#?}"
+    );
+
+    let items = ts.replay_events(&sid, &skey).await;
+    let started = find_event(&items, "session.compaction.started");
+    assert_eq!(
+        started["payload"],
+        json!({ "trigger": "client", "reason": "manual",
+                "token_count": 1100, "threshold_tokens": Value::Null }),
+        "manual started carries the prior turn's stored usage and no threshold"
+    );
+
+    // A subsequent turn's provider request is scoped to the summary + the new turn.
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "third" }))
+        .await;
+    let reqs = requests.lock().unwrap().clone();
+    let next_req = reqs.last().unwrap();
+    let msgs = next_req["messages"].as_array().unwrap();
+    assert_eq!(
+        msgs.len(),
+        2,
+        "compacted summary + the post-compaction turn only: {next_req:#?}"
+    );
+    assert_eq!(msgs[0]["role"], json!("assistant"));
+    assert_eq!(
+        msgs[0]["content"][0]["text"],
+        json!("SUMMARY of everything")
+    );
+    assert_eq!(msgs[1]["content"], json!("third"));
+}
+
+/// A successful model summary is committed even when its provider omits usage;
+/// unavailable accounting is represented as null rather than discarding work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_completes_when_summary_response_omits_usage() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts
+        .create_profile("summarynousage", json!([]), json!([]))
+        .await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    let items = ts.replay_events(&sid, &skey).await;
+    let completed = find_event(&items, "session.compaction.completed");
+    assert_eq!(completed["payload"]["input_tokens"], Value::Null);
+    assert_eq!(completed["payload"]["summary_tokens"], Value::Null);
+    let summary_id = completed["payload"]["summary_event_id"].as_str().unwrap();
+    assert!(
+        items.iter().any(|e| e["id"] == json!(summary_id)),
+        "the usage-less summary is persisted and becomes the history boundary"
+    );
+}
+
+/// E) A per-call `prompt` on `session.compact` reaches the provider as the final
+/// message verbatim, in place of the built-in default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_custom_prompt() {
+    let (ts, requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "client" }))
+        .await;
+
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+
+    let custom = "Custom instruction: please summarize this session as a haiku.";
+    let terminal = ts.compact(&sid, &skey, json!({ "prompt": custom })).await;
+    assert_eq!(
+        terminal["result"]["event_type"],
+        json!("session.compaction.completed"),
+        "{terminal:#?}"
+    );
+
+    let reqs = requests.lock().unwrap().clone();
+    let comp_req = reqs.last().unwrap();
+    let msgs = comp_req["messages"].as_array().unwrap();
+    let final_content = msgs.last().unwrap()["content"].as_str().unwrap();
+    assert_eq!(
+        final_content, custom,
+        "the custom prompt is used verbatim: {comp_req:#?}"
+    );
+    assert!(
+        !final_content.starts_with("Produce a single self-contained"),
+        "and it replaces the built-in default"
+    );
+}
+
+/// With no per-call override, client mode uses the prompt stored at session
+/// creation rather than silently falling back to the built-in instruction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_uses_stored_client_prompt() {
+    let (ts, requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let stored = "Stored instruction: summarize as a field report.";
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "client", "prompt": stored }))
+        .await;
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    let terminal = ts.compact(&sid, &skey, json!({})).await;
+    assert_eq!(
+        terminal["result"]["event_type"],
+        json!("session.compaction.completed")
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.last().unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"],
+        json!(stored),
+        "the stored client-mode prompt is the fallback when RPC omits prompt"
+    );
+}
+
+/// `session.compact` is driver-gated before it can create any compaction event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_requires_registered_driver() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (status, opened, raw) = ts
+        .client_post(
+            "/api/v1/sessions",
+            Some(&key),
+            json!({ "client_version": "1.0.0", "tools": [] }),
+        )
+        .await;
+    assert_eq!(status, 201, "open unregistered session: {raw}");
+    let sid = opened["session_id"].as_str().unwrap();
+    let skey = opened["session_key"].as_str().unwrap();
+    let terminal = ts.compact(sid, skey, json!({})).await;
+    assert_eq!(terminal["error"]["code"], json!(-32001));
+    let items = ts.replay_events(sid, skey).await;
+    assert!(
+        !compaction_types(&items)
+            .iter()
+            .any(|e| e.starts_with("session.compaction")),
+        "an unregistered caller must not persist compaction events"
+    );
+}
+
+/// F) Compaction only changes what is sent to the model; the append-only replay
+/// log still carries every pre-compaction event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_replay_preserves_full_history() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "client" }))
+        .await;
+
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "second" }))
+        .await;
+    ts.compact(&sid, &skey, json!({})).await;
+
+    let items = ts.replay_events(&sid, &skey).await;
+
+    // Both pre-compaction client messages are still present, in order.
+    let client_msgs: Vec<String> = items
+        .iter()
+        .filter(|e| e["event_type"] == json!("client.message.send"))
+        .map(|e| e["payload"]["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        client_msgs,
+        vec!["first", "second"],
+        "replay retains every pre-compaction client message"
+    );
+
+    // Nothing was deleted: two ordinary turns' responses plus the compaction
+    // call's own all survive, alongside the compaction markers.
+    let types = compaction_types(&items);
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| t.as_str() == "provider.response")
+            .count(),
+        3,
+        "two turns + one compaction provider.response all retained: {types:?}"
+    );
+    assert!(types.contains(&"session.compaction.started".to_string()));
+    assert!(types.contains(&"session.compaction.completed".to_string()));
+}
+
+/// G) A `compaction` field on `join` is rejected — compaction is fixed at session
+/// creation, and a joining client must not be able to change it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_join_rejects_compaction_field() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("high", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let joiner_key = ts.create_key(&profile).await; // same profile → join is otherwise allowed
+    let (sid, _skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "client" }))
+        .await;
+
+    let (status, v, raw) = ts
+        .client_post(
+            &format!("/api/v1/sessions/{sid}/join"),
+            Some(&joiner_key),
+            json!({
+                "client_version": "1.0.0",
+                "tools": [],
+                "compaction": { "mode": "auto", "size": 2000 }
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "join must reject a compaction field rather than silently ignore it: {v} {raw}"
+    );
+}
+
+/// H) A provider failure *during compaction* leaves the triggering turn
+/// successful, persists `started` with no matching `completed`, and leaves the
+/// session compactable — the next turn still scopes history from before the
+/// failed attempt (which set no boundary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_provider_failure_leaves_started_without_completed() {
+    let (ts, requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("failcompact", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    // The ordinary turn still returns its assistant message even though the
+    // compaction it triggers fails.
+    let (status, resp, raw) = ts
+        .send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+    assert_eq!(status, 200, "send: {raw}");
+    assert_eq!(
+        resp["message"]["content"][0]["text"],
+        json!("ordinary reply")
+    );
+
+    // `started` is persisted; the compaction's provider.response failed, so no
+    // summary message and no `completed` marker follow — and no `session.error`.
+    let items = ts.replay_events(&sid, &skey).await;
+    assert_eq!(
+        compaction_types(&items),
+        vec![
+            "session.open",
+            "session.driver.register",
+            "client.message.send",
+            "provider.request",
+            "provider.response",
+            "server.message.send",
+            "session.compaction.started",
+            "provider.request",
+            "provider.response",
+        ],
+        "a failed compaction stops after its provider.response — no completed, no session.error"
+    );
+    let failed = items.last().unwrap();
+    assert_eq!(failed["event_type"], json!("provider.response"));
+    assert_eq!(failed["payload"]["ok"], json!(false));
+    assert!(
+        failed["payload"].get("usage").is_none(),
+        "a failed response gains no usage member"
+    );
+
+    // The session stays open and compactable: the next turn's history still
+    // scopes from the start (the orphaned `started` established no boundary),
+    // and the compaction is retried unprompted.
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "second" }))
+        .await;
+    let reqs = requests.lock().unwrap().clone();
+    // 0: turn 1 ordinary, 1: turn 1 compaction (failed),
+    // 2: turn 2 ordinary, 3: turn 2 compaction (retried).
+    let turn2 = reqs[2]["messages"].as_array().unwrap();
+    assert_eq!(
+        turn2.len(),
+        3,
+        "history still spans the full pre-compaction log: {:#?}",
+        reqs[2]
+    );
+    assert_eq!(turn2[0]["content"], json!("first"));
+    assert_eq!(reqs.len(), 4, "the next turn retries the compaction");
+}
+
+/// I) The OpenAI usage shape (`prompt_tokens`/`completion_tokens`) drives the
+/// same auto-compaction path end to end, normalized into the stored
+/// `input_tokens`/`output_tokens` usage member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compaction_openai_usage_shape_triggers_auto() {
+    let (ts, _requests) = boot_compaction_server().await;
+    let profile = ts.create_profile("openai", json!([]), json!([])).await;
+    let key = ts.create_key(&profile).await;
+    let (sid, skey) = ts
+        .open_compaction_session(&key, json!({ "mode": "auto", "size": 1000 }))
+        .await;
+
+    ts.send_message(&sid, &skey, json!({ "role": "user", "content": "first" }))
+        .await;
+
+    let items = ts.replay_events(&sid, &skey).await;
+    let types = compaction_types(&items);
+    assert!(
+        types.contains(&"session.compaction.completed".to_string()),
+        "the OpenAI usage shape crosses the threshold and compacts: {types:?}"
+    );
+    // The OpenAI `prompt_tokens`/`completion_tokens` are normalized on the stored
+    // provider.response usage member.
+    assert_eq!(
+        find_event(&items, "provider.response")["payload"]["usage"],
+        json!({ "input_tokens": 900, "output_tokens": 200 }),
+        "OpenAI usage is read via usage_tokens and stored canonically"
+    );
+    let completed = find_event(&items, "session.compaction.completed");
+    assert_eq!(completed["payload"]["input_tokens"], json!(900));
+    assert_eq!(completed["payload"]["summary_tokens"], json!(200));
+}

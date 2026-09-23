@@ -16,6 +16,14 @@
 //!   old route returned. Concurrent turns on one session are serialized by a
 //!   per-session FIFO gate (see [`drive_send_message`]): a queued driver's
 //!   NDJSON response stays open with zero bytes written until it is dequeued.
+//! - `session.compact` (`{prompt?}`) — the client-driven compaction trigger
+//!   (`mode: client`): asks the model for a single self-contained summary of the
+//!   session so far and makes it the new starting point for provider-facing
+//!   history. Requires driver registration and takes the **same** per-session
+//!   turn gate as `session.sendMessage`, so a compaction can never race a live
+//!   turn. Returns the produced `session.compaction.completed` event; its
+//!   `session.compaction.started`/`completed` pair reaches watchers through the
+//!   ordinary broadcast path (see [`compact_rpc`]).
 //! - `session.subscribe` (`{since_event_id?}`) — a non-driving observer feed
 //!   (subscribing **is** the observer registration act; no driver registration
 //!   needed): replay persisted events after `since_event_id`, then live
@@ -50,7 +58,7 @@ use tokio::sync::mpsc;
 
 use super::sessions::{
     auth_session, enforce_tool_allowlist, event_view, stop_remote_sandbox, tool_result_blocks,
-    ClientToolDef, MessageBody, SandboxStopOutcome,
+    ClientToolDef, CompactionConfig, MessageBody, SandboxStopOutcome,
 };
 use crate::api::AppState;
 use crate::engine::{broadcast, session};
@@ -321,6 +329,17 @@ pub async fn rpc(
             )
             .await
         }
+        "session.compact" => {
+            compact_rpc(
+                &state,
+                &session,
+                &acting_client_key_id,
+                id_present,
+                req_id,
+                &params,
+            )
+            .await
+        }
         "session.reportLocalSandbox" => report_local_sandbox_rpc(
             &state,
             &session,
@@ -461,6 +480,10 @@ async fn drive_send_message(
     // turn); empty unless this request resumes such a turn. Merged with the
     // client's own results below, before the turn is recorded.
     let mut stashed_server_results: Vec<Value> = Vec::new();
+    // A threshold crossing cannot compact an unresolved tool_use. Carry its
+    // tiny trigger with the parked gate so a later final response cannot erase
+    // the decision merely by reporting lower/no usage.
+    let mut pending_auto_compaction = None;
     // The paused turn's span context, for the resume Link on the new turn span.
     let mut resumed_span_context: Option<opentelemetry::trace::SpanContext> = None;
     let reclaimed = {
@@ -479,6 +502,7 @@ async fn drive_send_message(
             pending.remove(&session.id).map(|pt| {
                 resumed_paused_turn = true;
                 stashed_server_results = pt.server_tool_results;
+                pending_auto_compaction = pt.pending_auto_compaction;
                 resumed_span_context = pt.span_context;
                 pt.guard
             })
@@ -489,6 +513,7 @@ async fn drive_send_message(
                     resumed_paused_turn = true;
                     timed_out_paused_turn = true;
                     stashed_server_results = pt.server_tool_results;
+                    pending_auto_compaction = pt.pending_auto_compaction;
                     resumed_span_context = pt.span_context;
                     // Reclaim the parked guard for this request. This retires
                     // the expired exchange before any queued message can
@@ -748,6 +773,7 @@ async fn drive_send_message(
             state.subagent_timeout,
             state.max_subagents_per_session,
             &acting_client_key_id,
+            pending_auto_compaction,
             &state.telemetry_metrics,
         ),
         turn_span.clone(),
@@ -833,6 +859,7 @@ async fn drive_send_message(
                                 // this owner resumes (empty on an all-client
                                 // pause). Freed with the PendingTurn if abandoned.
                                 server_tool_results: turn.pending_tool_results,
+                                pending_auto_compaction: turn.pending_auto_compaction,
                                 span_context,
                             },
                         );
@@ -1032,6 +1059,177 @@ fn is_voluntary_abandonment(content: &Value) -> bool {
                     .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
         }
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// session.compact
+// ---------------------------------------------------------------------------
+
+/// `session.compact` params. `{}`, `{"prompt":null}`, and `{"prompt":"..."}` are
+/// all accepted; anything else in `prompt` is `-32602`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct CompactParams {
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// `session.compact` (`params: {"prompt"?: string}`) — the client-driven
+/// compaction trigger, the `mode: client` counterpart to auto mode's in-turn
+/// check.
+///
+/// Gated exactly like the other driver methods (`-32001` without
+/// `session.registerDriver`) and, unlike them, serialized through the **same**
+/// per-session `turn_gates` mutex `session.sendMessage` uses: compaction and a
+/// live turn both decide what "current history" means, so they must never run
+/// concurrently on one session. Waiting on that gate is also why the session and
+/// profile are re-read after it is acquired, exactly as [`drive_send_message`]
+/// does — a queued caller must not compact a session that has since gone
+/// terminal.
+///
+/// Permitted on either stored mode: a harness may force an early compaction on
+/// an `auto` session, and a `prompt` given here applies to that one call without
+/// touching the session's persisted config. Prompt precedence is this call's
+/// `prompt`, then the session's stored `mode: client` prompt, then the engine's
+/// built-in default.
+///
+/// The result is the produced `session.compaction.completed` event record. Every
+/// event the compaction logs (started, the provider exchange, the synthetic
+/// summary, completed) already reaches `session.subscribe` watchers live through
+/// the shared broadcaster; this method adds no streaming protocol of its own.
+async fn compact_rpc(
+    state: &AppState,
+    session: &SessionRecord,
+    acting_client_key_id: &str,
+    id_present: bool,
+    req_id: Value,
+    params: &Value,
+) -> Response {
+    if let Some((code, msg)) =
+        require_registered_driver(state, session, acting_client_key_id, "session.compact")
+    {
+        return single_or_empty(id_present, error_obj(req_id, code, msg));
+    }
+    if session.state != STATE_OPEN {
+        let state_str = session.state.clone();
+        return single_or_empty(
+            id_present,
+            error_obj(req_id, -32000, format!("session is {state_str}, not open")),
+        );
+    }
+    // Validated before queuing on the gate, so a malformed request fails fast
+    // instead of waiting out another driver's turn.
+    let call_params: CompactParams = match serde_json::from_value(params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return single_or_empty(
+                id_present,
+                error_obj(req_id, -32602, format!("Invalid params: {e}")),
+            )
+        }
+    };
+
+    // The point where a compaction genuinely waits for an in-flight turn (and
+    // vice versa). Held across the history read, the provider call, and every
+    // event insert below.
+    let _gate = state.turn_gate(&session.id).lock_owned().await;
+
+    // Re-read the session now the gate is held: the turn that was in flight
+    // while this call queued may have moved it to `error`, or a close may have
+    // ended it. The fresh record also carries the authoritative compaction
+    // config for the stored-prompt fallback.
+    let session = match state
+        .store
+        .with_conn(|c| sessions::get_session(c, &session.id))
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return single_or_empty(
+                id_present,
+                error_obj(req_id, -32000, "session no longer exists"),
+            )
+        }
+        Err(e) => {
+            tracing::error!("database error in /rpc: {e}");
+            return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+        }
+    };
+    if session.state != STATE_OPEN {
+        let state_str = session.state.clone();
+        return single_or_empty(
+            id_present,
+            error_obj(req_id, -32000, format!("session is {state_str}, not open")),
+        );
+    }
+    let profile =
+        match state
+            .store
+            .with_conn(|c| profiles::get(c, &session.profile_id))
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => return single_or_empty(
+                id_present,
+                error_obj(
+                    req_id,
+                    -32000,
+                    "profile_unavailable: the profile bound to this session is no longer available",
+                ),
+            ),
+            Err(e) => {
+                tracing::error!("database error in /rpc: {e}");
+                return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+            }
+        };
+
+    // A manual trigger has no "call that just happened" to read usage from, so
+    // the `started` event's `token_count` is the best-effort figure from the
+    // session's newest persisted `provider.response` — informational only, and
+    // `None` when the session has made no provider call with usable usage yet.
+    let token_count = match state
+        .store
+        .with_conn(|c| sessions::last_provider_token_count(c, &session.id))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("database error in /rpc: {e}");
+            return single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"));
+        }
+    };
+
+    // This call's prompt wins; otherwise a `mode: client` session's stored
+    // prompt; otherwise the engine's built-in default (`None` here). An `auto`
+    // session has no stored prompt field at all.
+    let prompt = call_params.prompt.or_else(|| match &session.compaction {
+        Some(CompactionConfig::Client { prompt }) => prompt.clone(),
+        _ => None,
+    });
+
+    match session::run_compaction(
+        &state.store,
+        &state.http,
+        &state.broadcaster,
+        &session,
+        &profile,
+        &state.provider_registry,
+        prompt.as_deref(),
+        session::CompactionTrigger::Client { token_count },
+        acting_client_key_id,
+        &state.telemetry_metrics,
+    )
+    .await
+    {
+        Ok(completed) => single_or_empty(id_present, result_obj(req_id, event_view(&completed))),
+        // A logical failure (providers exhausted, or a response with no usage to
+        // record): the session stays open and compactable, and its previous
+        // effective history is untouched.
+        Err(session::TurnError::CompactionFailed(detail)) => single_or_empty(
+            id_present,
+            error_obj(req_id, -32000, format!("compaction failed: {detail}")),
+        ),
+        Err(e) => {
+            tracing::error!("session compaction failed: {e}");
+            single_or_empty(id_present, error_obj(req_id, -32603, "Internal error"))
+        }
     }
 }
 

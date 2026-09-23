@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::error::ApiError;
@@ -96,6 +96,38 @@ fn auth_key_err(e: keys::KeyError) -> ApiError {
 // POST /api/v1/sessions
 // ---------------------------------------------------------------------------
 
+/// The smallest `size` an auto-mode session may configure. Below this a
+/// compaction would fire on nearly every turn (and likely exceed the compaction
+/// call's own output before it can summarize), so it is rejected at creation.
+pub const MIN_AUTO_COMPACTION_TOKENS: u64 = 1_000;
+
+/// Session-level compaction settings, fixed at creation time.
+///
+/// Tagged by `mode` so the wire shape is exactly `{"mode":"auto","size":128000}`
+/// / `{"mode":"client"}` / `{"mode":"client","prompt":"..."}`. `size` is a
+/// **token** threshold (not bytes/chars): it is compared against the provider's
+/// own reported `input_tokens + output_tokens` for the most recently completed
+/// turn. An absent `compaction` field on session creation is normalized to
+/// [`CompactionConfig::Client { prompt: None }`](CompactionConfig::Client), so
+/// downstream code only ever branches on the two variants.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum CompactionConfig {
+    Auto {
+        size: u64,
+    },
+    Client {
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self::Client { prompt: None }
+    }
+}
+
 /// A tool the client declares it can execute.
 #[derive(Debug, Deserialize)]
 pub struct ClientToolDef {
@@ -125,6 +157,12 @@ pub struct CreateSession {
     /// fields are persisted but never advertised to the provider.
     #[serde(default)]
     pub subagent_tools: Vec<SubagentToolDef>,
+    /// Optional session-level compaction settings, fixed at creation time.
+    /// Absent (or JSON `null`) means no auto compaction — equivalent to
+    /// `{"mode":"client"}` — and is normalized to
+    /// [`CompactionConfig::default`] before persistence.
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
 }
 
 /// Client-safe projection of a profile (no `auth_token`, no env var names).
@@ -301,6 +339,18 @@ pub async fn create(
         .clone()
         .ok_or_else(|| ApiError::internal("client key has no profile"))?;
 
+    // Normalize and validate compaction config once, up front, so every row this
+    // request may create (including the profile/provider error-state rows below)
+    // is persisted with a non-NULL, already-validated config.
+    let compaction = body.compaction.clone().unwrap_or_default();
+    if let CompactionConfig::Auto { size } = compaction {
+        if size < MIN_AUTO_COMPACTION_TOKENS {
+            return Err(ApiError::bad_request(format!(
+                "compaction size {size} is below the minimum of {MIN_AUTO_COMPACTION_TOKENS} tokens"
+            )));
+        }
+    }
+
     // Load the profile. It may have been deleted between key creation and now.
     let profile = state
         .store
@@ -308,7 +358,15 @@ pub async fn create(
         .map_err(ApiError::from_db)?;
     let profile = match profile {
         Some(p) => p,
-        None => return profile_unavailable_at_open(&state, &client_key, &profile_id, &body),
+        None => {
+            return profile_unavailable_at_open(
+                &state,
+                &client_key,
+                &profile_id,
+                &body,
+                &compaction,
+            )
+        }
     };
 
     // The profile's primary provider must resolve against the startup registry
@@ -323,6 +381,7 @@ pub async fn create(
             &profile,
             primary_provider,
             &body,
+            &compaction,
         );
     }
 
@@ -366,6 +425,7 @@ pub async fn create(
             &client_tools,
             &sandbox_tools,
             &subagent_tools,
+            &compaction,
         )
         .map_err(ApiError::from_db)?;
         keys::insert_session_key(c, &session.id, &client_key.id, &profile_id, &session_key)
@@ -446,6 +506,17 @@ pub async fn join(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let client_key = auth_client(&state, &headers)?;
 
+    // Compaction is a session-level setting fixed at creation, exactly like the
+    // profile. A joining client may not add or change it — reject rather than
+    // silently ignore, since a joiner believing it altered the mode would be a
+    // silent correctness bug. An absent/`null` field is indistinguishable from
+    // "not supplied" by the `Option` wire type and is treated as absent.
+    if body.compaction.is_some() {
+        return Err(ApiError::bad_request(
+            "compaction is a session-level setting fixed at creation and cannot be set on join",
+        ));
+    }
+
     let session = state
         .store
         .with_conn(|c| sessions::get_session(c, &id))
@@ -477,7 +548,13 @@ pub async fn join(
     let profile = match profile {
         Some(p) => p,
         None => {
-            return profile_unavailable_at_open(&state, &client_key, &session.profile_id, &body)
+            return profile_unavailable_at_open(
+                &state,
+                &client_key,
+                &session.profile_id,
+                &body,
+                &CompactionConfig::default(),
+            )
         }
     };
 
@@ -491,6 +568,7 @@ pub async fn join(
             &profile,
             primary_provider,
             &body,
+            &CompactionConfig::default(),
         );
     }
 
@@ -669,6 +747,7 @@ fn profile_unavailable_at_open(
     client_key: &KeyRecord,
     profile_id: &str,
     body: &CreateSession,
+    compaction: &CompactionConfig,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let client_tools = json!(body
         .tools
@@ -685,6 +764,7 @@ fn profile_unavailable_at_open(
             &client_tools,
             &json!([]),
             &json!([]),
+            compaction,
         )?;
         sessions::insert_event(
             c,
@@ -714,6 +794,7 @@ fn primary_provider_unavailable_at_open(
     profile: &ProfileRecord,
     primary_provider: &str,
     body: &CreateSession,
+    compaction: &CompactionConfig,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     tracing::error!(
         profile_id = %profile.id,
@@ -736,6 +817,7 @@ fn primary_provider_unavailable_at_open(
             &client_tools,
             &json!([]),
             &json!([]),
+            compaction,
         )?;
         sessions::insert_event(
             c,
@@ -1033,6 +1115,10 @@ pub async fn close(
 mod tests {
     use super::*;
     use crate::config_file::McpTransport;
+    use crate::engine::provider::{ProviderConfig, ProviderKind};
+    use crate::store::{keys, profiles, Store};
+    use axum::http::{header, HeaderValue};
+    use serde_json::json;
 
     fn stdio_cfg(name: &str) -> McpServerConfig {
         McpServerConfig {
@@ -1050,6 +1136,132 @@ mod tests {
             .iter()
             .map(|n| (n.to_string(), stdio_cfg(n)))
             .collect()
+    }
+
+    fn session_test_state() -> (AppState, String) {
+        let store = Store::open_in_memory().unwrap();
+        let generated = keys::generate_client_key();
+        store.with_conn(|c| {
+            let profile = profiles::create(
+                c,
+                &profiles::ProfileInput {
+                    name: "test-profile".into(),
+                    provider_config: json!("primary"),
+                    fallback_configs: json!([]),
+                    mcp_servers: json!([]),
+                    allowed_tools: json!([]),
+                    available_sandboxes: json!([]),
+                },
+            )
+            .unwrap();
+            keys::insert_client_key(c, "test-client", &profile.id, &generated).unwrap();
+        });
+        let provider = ProviderConfig {
+            provider: ProviderKind::Anthropic,
+            base_url: Some("http://127.0.0.1:1".into()),
+            model: "test-model".into(),
+            auth_token: "test-token".into(),
+            max_tokens: 32,
+        };
+        let mut providers = HashMap::new();
+        providers.insert("primary".into(), provider);
+        (
+            AppState::with_registries(store, HashMap::new(), providers),
+            generated.plaintext,
+        )
+    }
+
+    fn auth_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn compaction_config_deserializes_auto_and_client_shapes() {
+        let auto: CompactionConfig = serde_json::from_value(json!({
+            "mode": "auto",
+            "size": 128000,
+        }))
+        .unwrap();
+        assert!(matches!(auto, CompactionConfig::Auto { size: 128000 }));
+
+        let client: CompactionConfig = serde_json::from_value(json!({ "mode": "client" })).unwrap();
+        assert!(matches!(client, CompactionConfig::Client { prompt: None }));
+
+        let custom: CompactionConfig = serde_json::from_value(json!({
+            "mode": "client",
+            "prompt": "Preserve the deployment constraints",
+        }))
+        .unwrap();
+        assert!(matches!(
+            custom,
+            CompactionConfig::Client {
+                prompt: Some(ref prompt)
+            } if prompt == "Preserve the deployment constraints"
+        ));
+    }
+
+    #[tokio::test]
+    async fn absent_create_session_compaction_normalizes_to_default_client_mode() {
+        let body: CreateSession = serde_json::from_value(json!({})).unwrap();
+        assert!(
+            body.compaction.is_none(),
+            "serde preserves the absent field"
+        );
+        assert!(matches!(
+            body.compaction.clone().unwrap_or_default(),
+            CompactionConfig::Client { prompt: None }
+        ));
+
+        let (state, token) = session_test_state();
+        let (_, Json(response)) = create(State(state.clone()), auth_headers(&token), Json(body))
+            .await
+            .unwrap();
+        let session_id = response["session_id"].as_str().unwrap();
+        let session = state
+            .store
+            .with_conn(|c| sessions::get_session(c, session_id))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            session.compaction,
+            Some(CompactionConfig::Client { prompt: None })
+        ));
+    }
+
+    #[test]
+    fn invalid_compaction_mode_is_rejected_with_a_deserialization_error() {
+        let error = serde_json::from_value::<CompactionConfig>(json!({
+            "mode": "server",
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
+        assert!(error.to_string().contains("server"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_auto_compaction_size_below_minimum() {
+        let (state, token) = session_test_state();
+        let body = CreateSession {
+            client_version: None,
+            tools: vec![],
+            sandbox_tools: vec![],
+            subagent_tools: vec![],
+            compaction: Some(CompactionConfig::Auto {
+                size: MIN_AUTO_COMPACTION_TOKENS - 1,
+            }),
+        };
+
+        let error = create(State(state), auth_headers(&token), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.detail.contains("below the minimum"));
+        assert!(error.detail.contains("1000"));
     }
 
     #[test]

@@ -145,6 +145,10 @@ pub struct PendingTurn {
     /// preserving a replayable provider transcript. See
     /// `crate::engine::session::Turn::pending_tool_results`.
     pub server_tool_results: Vec<serde_json::Value>,
+    /// An auto-compaction threshold crossing observed before this client-tool
+    /// exchange paused. It is held with the parked turn (not persisted) and
+    /// consumed at the first safe completed boundary after resume.
+    pub pending_auto_compaction: Option<crate::engine::session::CompactionTrigger>,
     /// The paused `bae.turn` span's own context, captured when the turn parked.
     /// On resume a new `bae.turn` span opens Linked back to this
     /// (`bae.link.kind="resume"`) — two linked spans is the deliberate topology

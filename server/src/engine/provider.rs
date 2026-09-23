@@ -594,6 +594,24 @@ fn from_openai_response(raw: &Value) -> Result<Value, String> {
     Ok(json!({ "content": blocks }))
 }
 
+/// Returns `(input_tokens, output_tokens)` from a raw provider response.
+///
+/// Anthropic reads `usage.input_tokens` / `usage.output_tokens`.
+/// OpenAI reads `usage.prompt_tokens` / `usage.completion_tokens`.
+/// Missing or partial/malformed usage returns `None`.
+pub fn usage_tokens(provider: ProviderKind, raw: &Value) -> Option<(u64, u64)> {
+    let usage = raw.get("usage")?;
+    let (input_field, output_field) = match provider {
+        ProviderKind::Anthropic => ("input_tokens", "output_tokens"),
+        ProviderKind::OpenAi => ("prompt_tokens", "completion_tokens"),
+    };
+
+    Some((
+        usage.get(input_field)?.as_u64()?,
+        usage.get(output_field)?.as_u64()?,
+    ))
+}
+
 /// reqwest errors can embed the request URL; strip it defensively so a resolved
 /// token can never ride along in an error string that gets persisted.
 fn sanitize_reqwest_error(e: reqwest::Error) -> String {
@@ -920,5 +938,58 @@ mod tests {
     #[test]
     fn openai_missing_choices_is_an_error() {
         assert!(from_openai_response(&json!({})).is_err());
+    }
+
+    // -- Provider usage extraction -------------------------------------------
+
+    #[test]
+    fn usage_tokens_extracts_anthropic_usage() {
+        let raw = json!({
+            "content": [],
+            "usage": { "input_tokens": 1200, "output_tokens": 300 },
+        });
+        assert_eq!(
+            usage_tokens(ProviderKind::Anthropic, &raw),
+            Some((1200, 300))
+        );
+    }
+
+    #[test]
+    fn usage_tokens_extracts_openai_usage() {
+        let raw = json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 900, "completion_tokens": 125 },
+        });
+        assert_eq!(usage_tokens(ProviderKind::OpenAi, &raw), Some((900, 125)));
+    }
+
+    #[test]
+    fn usage_tokens_returns_none_when_usage_is_absent() {
+        assert_eq!(
+            usage_tokens(ProviderKind::Anthropic, &json!({ "content": [] })),
+            None
+        );
+        assert_eq!(
+            usage_tokens(ProviderKind::OpenAi, &json!({ "choices": [] })),
+            None
+        );
+    }
+
+    #[test]
+    fn usage_tokens_returns_none_for_partial_usage() {
+        assert_eq!(
+            usage_tokens(
+                ProviderKind::Anthropic,
+                &json!({ "usage": { "input_tokens": 1200 } }),
+            ),
+            None
+        );
+        assert_eq!(
+            usage_tokens(
+                ProviderKind::OpenAi,
+                &json!({ "usage": { "completion_tokens": 125 } }),
+            ),
+            None
+        );
     }
 }
