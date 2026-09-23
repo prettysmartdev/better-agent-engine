@@ -12,6 +12,8 @@
 #   docker run -p 8080:8080 -p 3000:3000 -v bae-data:/var/lib/bae better-agent-engine:max
 
 FROM rust:1-bookworm AS rust-build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 # See Dockerfile's identical stage for why server/ and baectl/ are COPYed into
 # distinct subdirectories rather than flattened.

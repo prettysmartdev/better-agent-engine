@@ -63,6 +63,7 @@ export function useSessionStream(
   const socketRef = useRef<SocketLike | null>(null);
 
   useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- reset when the selected session changes.
     setState({ events: [], status: "connecting" });
     let done = false;
 

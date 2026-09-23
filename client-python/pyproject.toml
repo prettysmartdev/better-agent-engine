@@ -38,3 +38,7 @@ asyncio_mode = "auto"
 [tool.ruff]
 src = ["src", "tests"]
 line-length = 100
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

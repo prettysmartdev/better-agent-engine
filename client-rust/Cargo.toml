@@ -12,9 +12,9 @@ publish = false
 # harness developer supplies `allow_regex`/`deny_regex` constraints validated
 # against each requested path's file name.
 regex = "1"
-# HTTP transport to the BAE client API (`/api/v1`). `rustls-tls` keeps the TLS
+# HTTP transport to the BAE client API (`/api/v1`). `rustls` keeps the TLS
 # stack pure-Rust (no OpenSSL); `json` gives typed request/response bodies.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 # API (de)serialization — mirrors the server's snake_case wire contract.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,7 +23,7 @@ thiserror = "2"
 # Cryptographically-random bytes for locally-generated subagent ids
 # ([`subagent`]): 16 OS-random bytes rendered as `sba_<hex>`, the same id shape
 # the server mints for remote subagents. Already in the tree via reqwest/rustls.
-getrandom = "0.2"
+getrandom = "0.4"
 # The local sandbox driver ([`sandbox`]) shells out to the `docker`/`container`
 # CLI via `tokio::process`, exactly as the server's driver does — no Docker SDK.
 # `process` gives async subprocesses; `io-util` is required by `Command::output`.

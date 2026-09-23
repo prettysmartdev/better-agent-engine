@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use rusqlite::Connection;
 
 /// SQL expression that renders "now" as a millisecond-precision UTC ISO-8601
@@ -35,7 +35,9 @@ pub const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 /// `aspec/architecture/apis.md`).
 pub fn generate_id(prefix: &str) -> String {
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS random number generator failed");
     let mut out = String::with_capacity(prefix.len() + 32);
     out.push_str(prefix);
     const HEX: &[u8; 16] = b"0123456789abcdef";

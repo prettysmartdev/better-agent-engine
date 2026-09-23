@@ -19,8 +19,8 @@
 //! parameters — there's nothing to tune and no shared secret, so every replica
 //! ingests it identically.
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 
 /// Plaintext prefix on every admin key — matches `keys::ADMIN_KEY_PREFIX`.
@@ -46,9 +46,10 @@ pub struct AdminKeyMaterial {
 /// preserved so a future change fails loudly rather than being unwrapped.
 pub fn generate() -> Result<AdminKeyMaterial, String> {
     let mut bytes = [0u8; KEY_ENTROPY_BYTES];
-    // `OsRng` is a cryptographically secure, OS-backed RNG; `fill_bytes` cannot
-    // partially fill or silently fall back.
-    OsRng.fill_bytes(&mut bytes);
+    // `SysRng` is a cryptographically secure, OS-backed RNG.
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS random number generator failed");
     let hex = to_hex(&bytes);
     let plaintext = format!("{ADMIN_KEY_PREFIX}{hex}");
     // `bae_admin_` (10 chars) + 4 hex, matching the documented `admin-key-hash.pem`

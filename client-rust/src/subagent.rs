@@ -1389,7 +1389,7 @@ fn truncate_output(s: String) -> (String, bool) {
 fn generate_subagent_id() -> String {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS RNG unavailable");
+    getrandom::fill(&mut bytes).expect("OS RNG unavailable");
     let mut s = String::with_capacity(4 + 32);
     s.push_str("sba_");
     for b in bytes {
