@@ -33,8 +33,21 @@ fn baectl_generated_api_and_webapp_configs_load_through_the_real_parser() {
         assert_eq!(agent.config.name, "reference-assistant");
         assert_eq!(agent.config.command, "/usr/local/bin/reference-assistant");
         assert_eq!(agent.config.env_template.len(), 1);
-        assert_eq!(agent.config.env_template[0].field, "AGENT_PROMPT");
+        assert_eq!(agent.config.env_template[0].field, "prompt");
         assert_eq!(agent.config.env_template[0].env, "AGENT_PROMPT");
+        // Regression: the chat box posts `{<chat_input_field>: text}`, so that
+        // field must be the one the schema requires — baectl once keyed the
+        // schema on the env var name, and every chat message was rejected.
+        let required = agent.config.request_schema.as_ref().unwrap()["required"]
+            .as_array()
+            .unwrap();
+        assert!(
+            required
+                .iter()
+                .any(|f| f.as_str() == Some(agent.config.chat_input_field.as_str())),
+            "{name}: chat_input_field {:?} is not in request_schema.required {required:?}",
+            agent.config.chat_input_field
+        );
         // The compiled validator proves the generated request_schema is a valid
         // JSON Schema, not merely parseable TOML.
         assert!(agent.validator.is_some(), "{name}");

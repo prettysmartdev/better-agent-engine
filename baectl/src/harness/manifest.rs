@@ -148,7 +148,7 @@ pub struct ContainerOverrides {
     pub build: Option<String>,
     /// TypeScript/Python: the command the generated shim `exec`s, run from the
     /// staged harness tree. Rust: the image path of the built binary,
-    /// replacing `/build/target/release/<name>`.
+    /// replacing `/build/target/release/examples/<name>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
 }

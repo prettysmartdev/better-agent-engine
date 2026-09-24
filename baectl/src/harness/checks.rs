@@ -31,7 +31,9 @@
 //! for the missing values instead.)
 
 use std::io::{self, Write};
+use std::net::Ipv4Addr;
 use std::path::Path;
+use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -39,7 +41,10 @@ use crate::engine::{detect_engine, Engine, EngineKind, Prompter, APPLE_SCRIPT, C
 use crate::error::CliError;
 use crate::harness::artifact::{artifact_dir, harness_env_path, resolved_path, write_private};
 use crate::harness::manifest::{BuildManifest, Requires, Resolved};
-use crate::setup::{parse_config_registry, parse_max_port, ConfigRegistry, CONFIG_FILE, ENV_FILE};
+use crate::setup::{
+    load_setup_profile, parse_config_registry, parse_max_port, ConfigRegistry, CONFIG_FILE,
+    ENV_FILE,
+};
 
 /// How the check pass may mutate server state to resolve checks #2 and #4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,17 +114,74 @@ fn host_client_port(dir: &Path) -> u16 {
     8080
 }
 
-/// The URL a `run`-launched harness uses to reach `baesrv`:
-/// - `kind: "local"` runs on the host → the published `localhost` port.
-/// - `kind: "container"` runs in a standalone container off `setup`'s network →
-///   the host gateway alias (`host.docker.internal`, which `run` maps in on
-///   Linux via `--add-host`). This is the documented rough edge `--server-url`
-///   overrides when detection guesses wrong.
-pub(crate) fn default_server_url(manifest: &BuildManifest, port: u16) -> String {
-    match manifest {
-        BuildManifest::Local(_) => format!("http://localhost:{port}"),
-        BuildManifest::Container(_) => format!("http://host.docker.internal:{port}"),
+/// Resolve the address in the harness's network namespace. Apple containers
+/// share the default network with the server; Docker uses the published host
+/// port. Inspect Apple addresses afresh because they can change on restart.
+pub(crate) fn default_server_url(
+    dir: &Path,
+    manifest: &BuildManifest,
+    server: &ServerTarget,
+) -> Result<String, CliError> {
+    let port = server.host_client_port;
+    if matches!(manifest, BuildManifest::Local(_)) {
+        return Ok(format!("http://localhost:{port}"));
     }
+    match &server.engine {
+        Engine::Docker { .. } => Ok(format!("http://host.docker.internal:{port}")),
+        Engine::Apple { container } => {
+            let guidance = format!(
+                "could not resolve Apple container {container}'s address on the default network; \
+                 check `container inspect {container}` or use `baectl run --server-url <url>`"
+            );
+            let output = Command::new("container")
+                .args(["inspect", container])
+                .current_dir(dir)
+                .output()
+                .map_err(|e| CliError::runtime(format!("{guidance}: {e}")))?;
+            if !output.status.success() {
+                return Err(CliError::runtime(guidance));
+            }
+            // Inspect includes environment secrets: never echo its output.
+            let inspected: Value = serde_json::from_slice(&output.stdout)
+                .map_err(|_| CliError::runtime(guidance.clone()))?;
+            let ip = apple_server_ip(&inspected).ok_or_else(|| CliError::runtime(guidance))?;
+            // Direct traffic uses the listener port, not BAE_ADDR_PORT's host
+            // remapping. setup passes BAE_ADDR through its .env file.
+            let env = std::fs::read_to_string(dir.join(ENV_FILE)).unwrap_or_default();
+            let port = env
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix("BAE_ADDR=")?
+                        .trim()
+                        .parse::<std::net::SocketAddr>()
+                        .ok()
+                        .map(|a| a.port())
+                })
+                .unwrap_or(8080);
+            Ok(format!("http://{ip}:{port}"))
+        }
+    }
+}
+
+fn apple_server_ip(inspected: &Value) -> Option<Ipv4Addr> {
+    let container = inspected.as_array()?.first()?;
+    // Apple 1.x nests attachments in status; older releases use networks.
+    let networks = container
+        .pointer("/status/networks")
+        .or_else(|| container.get("networks"))?
+        .as_array()?;
+    networks.iter().find_map(|network| {
+        if network.get("network")?.as_str()? != "default" {
+            return None;
+        }
+        let address = network
+            .get("ipv4Address")
+            .or_else(|| network.get("address"))?
+            .as_str()?;
+        let ip: Ipv4Addr = address.split('/').next()?.parse().ok()?;
+        (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+    })
 }
 
 /// The result of a check pass.
@@ -171,12 +233,14 @@ pub(crate) fn provider_key_env(registry: Option<&ConfigRegistry>, primary: &str)
 /// builds so a check #5 failure prompts for the missing values (saved to the
 /// `0600` `harness.env`) instead of aborting. `None`, or a non-interactive
 /// prompter, keeps #5 print-only.
+/// `server_url_override` lets `run --server-url` bypass address discovery.
 pub(crate) fn evaluate(
     dir: &Path,
     manifest: &BuildManifest,
     prior: Option<&Resolved>,
     mode: FixMode,
     env_prompt: Option<&Prompter>,
+    server_url_override: Option<&str>,
 ) -> Result<Outcome, CliError> {
     let requires = manifest.requires();
 
@@ -207,6 +271,12 @@ pub(crate) fn evaluate(
         }
     };
     let exec = exec_prefix(&server.engine, dir);
+    // Resolve before applying profile/key mutations. An explicit URL also
+    // supports operators using a custom Apple network.
+    let server_url = match server_url_override {
+        Some(url) => url.to_string(),
+        None => default_server_url(dir, manifest, &server)?,
+    };
 
     let registry = load_registry(dir)?;
 
@@ -216,15 +286,21 @@ pub(crate) fn evaluate(
         .filter(|p| profile_compatible(p, requires))
         .collect();
     // Prefer the previously resolved profile when it is still compatible, for
-    // stability across runs; else the first compatible profile.
+    // stability across runs; else the profile `setup` created/reused in this
+    // `--dir`; else the first compatible profile.
+    let setup_profile = load_setup_profile(dir);
     let mut resolved_profile: Option<Value> = prior
         .and_then(|pr| compatible.iter().find(|p| field(p, "id") == pr.profile_id))
+        .or_else(|| {
+            let name = setup_profile.as_deref()?;
+            compatible.iter().find(|p| field(p, "name") == name)
+        })
         .or_else(|| compatible.first())
         .map(|p| (*p).clone());
 
     let profile_fix = if resolved_profile.is_some() {
         None
-    } else if let Some(target) = pick_widen_target(&profiles, prior) {
+    } else if let Some(target) = pick_widen_target(&profiles, prior, setup_profile.as_deref()) {
         Some(ProfileFix::Update {
             target: target.clone(),
         })
@@ -436,7 +512,7 @@ pub(crate) fn evaluate(
         // just created, or one carried forward from a prior `resolved.json`. It
         // never fabricates a secret for a pre-existing key it cannot recover.
         client_key_plaintext: Some(plaintext),
-        server_url: default_server_url(manifest, server.host_client_port),
+        server_url,
         max_url: server.max_url,
         // Recorded by *name* only, never by value: `run` re-reads the value from
         // `.env`/the host env at launch time so a container gets the same
@@ -499,13 +575,22 @@ enum ProfileFix {
 }
 
 /// Pick the profile to widen when none is compatible: the previously resolved
-/// one if it still exists, else a profile named `default`, else the first.
-fn pick_widen_target<'a>(profiles: &'a [Value], prior: Option<&Resolved>) -> Option<&'a Value> {
+/// one if it still exists, else the profile `setup` recorded for this `--dir`
+/// (`setup_profile`), else a profile named `default`, else the first.
+fn pick_widen_target<'a>(
+    profiles: &'a [Value],
+    prior: Option<&Resolved>,
+    setup_profile: Option<&str>,
+) -> Option<&'a Value> {
     if profiles.is_empty() {
         return None;
     }
     prior
         .and_then(|pr| profiles.iter().find(|p| field(p, "id") == pr.profile_id))
+        .or_else(|| {
+            let name = setup_profile?;
+            profiles.iter().find(|p| field(p, "name") == name)
+        })
         .or_else(|| profiles.iter().find(|p| field(p, "name") == "default"))
         .or_else(|| profiles.first())
 }
@@ -1366,7 +1451,17 @@ mod tests {
     #[test]
     fn default_server_url_differs_by_kind() {
         let local = local_manifest();
-        assert_eq!(default_server_url(&local, 8080), "http://localhost:8080");
+        let mut server = ServerTarget {
+            kind: EngineKind::Docker,
+            engine: Engine::docker("baesrv"),
+            host_client_port: 18080,
+            max_url: None,
+        };
+        let dir = Path::new("/nonexistent");
+        assert_eq!(
+            default_server_url(dir, &local, &server).unwrap(),
+            "http://localhost:18080"
+        );
         let container = BuildManifest::Container(crate::harness::manifest::ContainerManifest {
             id: "ref-rust-api".to_string(),
             name: "reference-assistant".to_string(),
@@ -1380,9 +1475,38 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         });
         assert_eq!(
-            default_server_url(&container, 8080),
-            "http://host.docker.internal:8080"
+            default_server_url(dir, &container, &server).unwrap(),
+            "http://host.docker.internal:18080"
         );
+        server.kind = EngineKind::Apple;
+        server.engine = Engine::apple("bae");
+        assert_eq!(
+            default_server_url(dir, &local, &server).unwrap(),
+            "http://localhost:18080"
+        );
+    }
+
+    #[test]
+    fn apple_inspect_accepts_current_and_legacy_default_network_addresses() {
+        for networks in [
+            json!({"status": {"networks": [{"network": "default", "ipv4Address": "192.168.64.3/24"}]}}),
+            json!({"networks": [{"network": "default", "ipv4Address": "192.168.64.3/24"}]}),
+            json!({"networks": [{"network": "custom", "address": "10.0.0.2/24"}, {"network": "default", "address": "192.168.64.3/24"}]}),
+        ] {
+            assert_eq!(
+                apple_server_ip(&json!([networks])),
+                Some(Ipv4Addr::new(192, 168, 64, 3))
+            );
+        }
+        for invalid in [
+            json!([]),
+            json!([{"networks": []}]),
+            json!([{"networks": [{"network": "custom", "ipv4Address": "10.0.0.2/24"}]}]),
+            json!([{"networks": [{"network": "default", "ipv4Address": "bad"}]}]),
+            json!([{"networks": [{"network": "default", "ipv4Address": "127.0.0.1"}]}]),
+        ] {
+            assert_eq!(apple_server_ip(&invalid), None);
+        }
     }
 
     #[test]

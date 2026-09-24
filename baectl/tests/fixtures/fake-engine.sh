@@ -106,6 +106,13 @@ admin() {
 }
 
 case "$1" in
+    inspect)
+        [ -f "$state/fail_inspect" ] && exit 1
+        if [ -f "$state/inspect.json" ]; then
+            while IFS= read -r line; do printf '%s\n' "$line"; done <"$state/inspect.json"
+        else
+            printf '[{"status":{"networks":[{"network":"default","ipv4Address":"192.168.64.3/24"}]}}]\n'
+        fi ;;
     compose)
         shift
         case "$1" in

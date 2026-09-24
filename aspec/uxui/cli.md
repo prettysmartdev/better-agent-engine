@@ -137,7 +137,12 @@ and container-mode `run` may prompt for missing harness secrets. When stdin
 isn't a TTY (piped/CI), every setup question falls back to its default with
 nothing printed, and the launch question specifically defaults to declining
 rather than the interactive default. `--yes` takes the same defaulted path
-explicitly (even on a TTY) and additionally implies **Launch: yes** — see
+explicitly (even on a TTY) and additionally implies **Launch: yes**. If the
+launched server already holds a `default` profile (the `bae-data` volume
+outlives the generated files), the launch step asks whether to **replace**,
+**reuse** (the default), or create a **new** profile under a prompted name.
+It records the result in `<dir>/.baectl/setup.json`, and `ready`/`run`
+prefer that profile — see
 [baectl reference — `baectl setup`](../../docs/reference/03-baectl.md#baectl-setup)
 for the full question list, generated-file shapes, and exit codes. Every
 other `baectl` command's "stdin: unused" line stays accurate unless one of

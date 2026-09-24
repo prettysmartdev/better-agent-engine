@@ -760,6 +760,29 @@ Launch choice on a re-run):
    warning `create key` gives directly, followed by a ready-to-copy
    `BAE_URL`/`BAE_API_KEY` export example.
 
+   The `bae-data` volume outlives the generated files, so the server may
+   already hold a `default` profile from an earlier setup. In that case
+   `setup` shows its id and current primary provider, then asks
+   **replace, reuse or new?** (default **reuse**):
+   - **replace** — runs `baectl update profile` with the provider you just
+     chose. The update replaces the whole profile, so it also resets the
+     profile's fallbacks, MCP servers, allowed tools and sandboxes.
+   - **reuse** — leaves the profile as it is and uses it.
+   - **new** — leaves `default` alone and asks for a **new profile name**
+     (suggested: the first free `default-2`, `default-3`, …; a name that is
+     already taken is rejected and asked again). That profile, and a client
+     key with the same name, are created instead.
+
+   After **replace** or **reuse**, `setup` asks **Issue a new client key for
+   it?** (default **Yes**). Existing keys stay valid; **No** prints the
+   `create key` command so you can make one later. Under `--yes` every
+   question takes its default: the existing profile is reused and a new key
+   is issued.
+
+   Whichever profile results is recorded in `<dir>/.baectl/setup.json`
+   (`{"profile": "<name>"}`). [`baectl ready`](#baectl-ready)/`run` prefer
+   that profile for harnesses in the same `--dir`.
+
    The **Launch**-only re-run path (existing, unedited config) does **not**
    repeat this step — it assumes the profile/key from the original run still
    exist. If they were deleted, re-run `baectl setup` and choose **Edit**
@@ -867,7 +890,7 @@ on `PATH` for a container-mode build — only `docker`/`container`:
 
    | `sdk` | Base image | Build command | Default artifact path |
    |---|---|---|---|
-   | `rust` | `rust:1-bookworm` | `cargo build --release --example <name>` | `/build/target/release/<name>` |
+   | `rust` | `rust:1-bookworm` | `cargo build --release --example <name>` | `/build/target/release/examples/<name>` |
    | `typescript` | `node:22-bookworm` | `npm ci && npm run build` | `/opt/bae-harness/bae-harness-entrypoint` |
    | `python` | `debian:bookworm-slim` + `python3`/`python3-venv` | `python3 -m venv /opt/bae-harness/venv && … pip install .` | `/opt/bae-harness/bae-harness-entrypoint` |
 
@@ -946,8 +969,10 @@ on `PATH` for a container-mode build — only `docker`/`container`:
    [`examples/launchers/{schedule,api,webapp}/`](06-launchers.md) uses: one
    `[[agents]]` entry named after the harness with
    `command = "/usr/local/bin/<name>"`, and for `api`/`webapp` a one-field
-   `request_schema`/`env_template` keyed on `[harness.launcher].prompt_env`,
-   listening on `0.0.0.0:9090`. `--launcher schedule` additionally requires
+   `request_schema` requiring a string body field `prompt`, an `env_template`
+   that passes it to the harness as the env var named by
+   `[harness.launcher].prompt_env`, and (webapp) `chat_input_field = "prompt"`
+   so the chat box fills that field — listening on `0.0.0.0:9090`. `--launcher schedule` additionally requires
    `[harness.launcher].default_schedule`
    (`[harness.launcher].default_schedule is required for --launcher schedule`
    if absent — checked at this point, after the harness build stage has
@@ -1024,8 +1049,11 @@ the loopback-only admin port. The global `--admin-addr`/`--admin-token`/
    and `available_sandboxes` (see [Sandboxes](../guides/03-sandboxes.md) and
    [Harness manifest — `[harness.requires]`](07-harness-manifest.md#harnessrequires))
    are all supersets of the build's `requires`. Prefers the profile from a
-   prior `resolved.json` if it's still compatible, else the first compatible
-   one found. On `⚠`/`✗`, prints the exact `baectl update profile …` (widen
+   prior `resolved.json` if it's still compatible, else the profile `setup`
+   recorded in `<dir>/.baectl/setup.json`, else the first compatible one
+   found. When none is compatible, the profile to widen is picked in the same
+   order (prior, then `setup`'s, then one named `default`, then the first).
+   On `⚠`/`✗`, prints the exact `baectl update profile …` (widen
    an existing profile additively — the union of its current tools/servers/
    sandboxes with the harness's `requires`, never a drop) or
    `baectl create profile …` command that would fix it, in the exec form
@@ -1159,7 +1187,7 @@ report. **Runs on the host**, same admin-API access path as `ready`.
 | `<id>` (positional, required) | The build id to launch. |
 | `--dir <path>` | Workspace directory holding `.baectl/` and the files `setup` generated. Default `.`. |
 | `--no-ready` | Skip the check pass entirely and launch straight from the existing `resolved.json`. Fails loudly if it's absent, or present but missing a stored plaintext key (a hand-edited or stale file). |
-| `--server-url <url>` | Override the server URL the harness is given, in place of `resolved.json`'s `server_url` (the auto-derived container address). Does not rewrite `resolved.json`. |
+| `--server-url <url>` | Override server address discovery. Normal `run` records this URL in `resolved.json`; with `--no-ready`, it applies only to this launch. |
 | `--dev` | Consistency guard only — see [above](#dev-on-ready-and-run). |
 
 **`kind: "local"`** — runs in the **foreground** with inherited stdio (the
@@ -1257,13 +1285,21 @@ Then prints the "where/how" summary:
 
 — followed in every case by `` logs:  <docker|container> logs -f <id> ``.
 
-**Container→server reachability is a best-effort default, not a guarantee.**
-A `build`-produced image is a standalone container, not joined to `setup`'s
-compose network, so by default it reaches `baesrv` at
-`http://host.docker.internal:<port>` (the host's published client port);
-Docker launches add `--add-host` so this alias also resolves on Linux, not
-just Docker Desktop. If detection guesses wrong for your engine/OS, override
-with `--server-url`.
+**Container→server addressing follows the engine selected by `setup`.**
+Docker launches reach `baesrv` at `http://host.docker.internal:<host-port>`;
+`--add-host` provides that alias on Linux. Apple launches use the server's IP
+on the shared `default` network, read from `container inspect bae` (or
+`bae-max`), and its listener port (`BAE_ADDR`, default `8080`). A host port
+remap through `BAE_ADDR_PORT` does not affect this direct connection. This
+uses Apple's [container-to-container networking](https://github.com/apple/container/blob/main/docs/networking.md#container-to-container-networking)
+without requiring a host DNS alias.
+
+Apple's address is refreshed on each `run`, including `--no-ready`, so saved
+Docker aliases and addresses from before a server restart are replaced for
+the launch. Rerun the harness after restarting the server if its IP changes.
+If inspection fails or the server has no address on `default`, launch fails
+before replacing the existing harness container. For a custom network or
+server, pass a reachable URL with `--server-url` to bypass discovery.
 
 **Exit codes:**
 

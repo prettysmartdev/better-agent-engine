@@ -121,6 +121,9 @@ ensure-dev-image: ensure-engine
 shell: ensure-dev-image ## Interactive shell inside the dev container
 	$(CONTAINER_RUN) bash
 
+# Apple `container` streams .dockerignore'd paths too, so multi-GB cargo
+# target/ dirs break its context transfer ("/server": not found, invalid tar
+# header, or a hang). Fix: `make clean image`. See DEVELOPING.md.
 image: ensure-engine ## Build the production server image (Dockerfile)
 	$(ENGINE) build --file Dockerfile --tag $(IMAGE) .
 

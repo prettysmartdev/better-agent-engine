@@ -123,7 +123,7 @@ baectl: harness 'issue-triage' has no [harness.launcher] section; --launcher api
 | `dockerfile` | string | no | none — `build` synthesizes a per-SDK default (see below) | `build`, as the `-f` argument to the harness's build-stage `docker build`. Path is relative to the harness directory. |
 | `target` | string | no | none | `build`, as `docker build`'s `--target`, only meaningful if `dockerfile` is itself multi-stage. |
 | `binary_path` | string | conditionally — **required whenever `dockerfile` is set**; optional (and defaulted) when it isn't | a per-SDK default when `dockerfile` is omitted (see [`baectl build`](03-baectl.md#baectl-build)) | `build`'s generated launcher Dockerfile, as the `COPY --from=<harness-build image>` source path. |
-| `prompt_env` | string | **yes, whenever `[harness.launcher]` is present at all** | — | `build`'s generated `bae-api.toml`/`bae-app.toml` (`request_schema`/`env_template` are keyed on this name). Required even if you only ever intend `--launcher schedule`, which doesn't itself use it — the struct has no default. |
+| `prompt_env` | string | **yes, whenever `[harness.launcher]` is present at all** | — | The env var `build`'s generated `bae-api.toml`/`bae-app.toml` pass the prompt in: a trigger's `prompt` body field is copied into it via `env_template` (the body field itself is always `prompt`). Required even if you only ever intend `--launcher schedule`, which doesn't itself use it — the struct has no default. |
 | `default_schedule` | string (six-field cron expression) | no in the schema, but **`build` fails if it's absent and you request `--launcher schedule`** | none | `build`'s generated `bae-schedules.toml`. Validated at build time (after the harness build stage has already run), not at manifest-parse time. |
 
 ### `[harness.container]`
@@ -146,7 +146,7 @@ either is a usage error, exit `2`:
 **`entrypoint`'s meaning is SDK-specific:**
 
 - **Rust:** the image path of the already-built binary, replacing
-  `/build/target/release/<name>` in the `COPY --from=<harness-build>`
+  `/build/target/release/examples/<name>` in the `COPY --from=<harness-build>`
   instruction.
 - **TypeScript:** the command the generated shim `exec`s in place of
   `./node_modules/.bin/tsx examples/<name>/main.ts`, run from
@@ -204,7 +204,7 @@ escape hatch, not a requirement every harness author must satisfy.
 The manifest actually shipped for the bundled Rust reference assistant. It
 omits `dockerfile`/`target`/`binary_path` entirely to exercise `baectl`'s
 generated Rust default (`rust:1-bookworm`, `cargo build --release --example
-reference-assistant`, artifact at `/build/target/release/reference-assistant`):
+reference-assistant`, artifact at `/build/target/release/examples/reference-assistant`):
 
 ```toml
 [harness]
@@ -336,7 +336,7 @@ env = []
 [harness.launcher]
 dockerfile = "Dockerfile.build"
 target = "build"
-binary_path = "/build/target/release/reference-assistant"
+binary_path = "/build/target/release/examples/reference-assistant"
 prompt_env = "AGENT_PROMPT"
 default_schedule = "0 0 3 * * *"
 ```

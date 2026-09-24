@@ -642,7 +642,9 @@ fn generated_build_dockerfile(sdk: Sdk, name: &str, overrides: &ContainerOverrid
 /// the generated Dockerfile actually produces this exact path.
 fn default_binary_path(sdk: Sdk, name: &str) -> String {
     match sdk {
-        Sdk::Rust => format!("{BUILD_WORKDIR}/target/release/{name}"),
+        // Cargo writes `--example` builds under `target/<profile>/examples/`,
+        // not beside `--bin` targets in `target/<profile>/`.
+        Sdk::Rust => format!("{BUILD_WORKDIR}/target/release/examples/{name}"),
         Sdk::Typescript | Sdk::Python => HARNESS_SHIM.to_string(),
     }
 }
@@ -747,6 +749,10 @@ fn launcher_dockerfile(
     out
 }
 
+/// The request-body field an api/webapp trigger carries its prompt in — the
+/// field the webapp's chat box fills (`chat_input_field`'s default).
+const PROMPT_FIELD: &str = "prompt";
+
 fn launcher_config_toml(
     launcher: Launcher,
     harness_name: &str,
@@ -767,9 +773,19 @@ fn launcher_config_toml(
             ))
         }
         Launcher::Api | Launcher::Webapp => {
-            let field = toml_string(&config.prompt_env);
+            // The request body carries the prompt as `prompt` (the webapp's
+            // chat box fills that field); `env_template` hands it to the harness
+            // under the env var the manifest names. Using `prompt_env` as the
+            // body field too would make the schema reject every chat message.
+            let field = toml_string(PROMPT_FIELD);
+            let env = toml_string(&config.prompt_env);
+            // Scalar `[[agents]]` keys must precede the agent's nested tables.
+            let chat_input = match launcher {
+                Launcher::Webapp => format!("chat_input_field = {field}\n"),
+                _ => String::new(),
+            };
             Ok(format!(
-                "[server]\naddr = \"0.0.0.0:9090\"\n\n[[agents]]\nname = {name}\ncommand = {command}\n\n[agents.request_schema]\ntype = \"object\"\nrequired = [{field}]\n[agents.request_schema.properties.{field}]\ntype = \"string\"\n\n[[agents.env_template]]\nfield = {field}\nenv = {field}\n"
+                "[server]\naddr = \"0.0.0.0:9090\"\n\n[[agents]]\nname = {name}\ncommand = {command}\n{chat_input}\n[agents.request_schema]\ntype = \"object\"\nrequired = [{field}]\n[agents.request_schema.properties.{field}]\ntype = \"string\"\n\n[[agents.env_template]]\nfield = {field}\nenv = {env}\n"
             ))
         }
         Launcher::Local => Err(CliError::usage("local builds have no launcher config")),
@@ -889,13 +905,13 @@ mod tests {
             );
             assert!(dockerfile.contains(&format!("WORKDIR {BUILD_WORKDIR}")));
             match sdk {
-                // Cargo lands the compiled example at
-                // `<WORKDIR>/target/release/<name>` — a real ELF binary.
+                // Cargo lands a compiled example at
+                // `<WORKDIR>/target/release/examples/<name>` — a real ELF binary.
                 Sdk::Rust => {
                     assert!(dockerfile.contains("cargo build --release --example assistant"));
                     assert_eq!(
                         binary_path,
-                        format!("{BUILD_WORKDIR}/target/release/assistant")
+                        format!("{BUILD_WORKDIR}/target/release/examples/assistant")
                     );
                 }
                 // The interpreted SDKs reach an executable through a shim the

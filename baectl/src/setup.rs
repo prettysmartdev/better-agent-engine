@@ -86,6 +86,12 @@ const DATA_VOLUME: &str = "bae-data";
 /// [`crate::engine`], the single owner of the launcher-file convention).
 pub(crate) const ENV_FILE: &str = ".env";
 pub(crate) const CONFIG_FILE: &str = "bae-config.toml";
+/// Where the launch step records which profile it created or reused, so
+/// `ready`/`run` prefer that profile for harnesses built in the same `--dir`.
+/// Lives beside the per-build artifacts under `.baectl/`.
+pub(crate) const SETUP_STATE_FILE: &str = ".baectl/setup.json";
+/// The profile name `setup` creates on a clean server.
+const DEFAULT_PROFILE: &str = "default";
 
 /// The documented `BAE_*` questions of step 5 and their server defaults
 /// (`docs/reference/05-configuration.md`'s Environment Variables table). Only a
@@ -1590,7 +1596,7 @@ fn finish(
     wait_healthy(config.client_port)?;
 
     if fresh {
-        create_first_profile_and_key(dir, config)?;
+        create_first_profile_and_key(prompt, dir, config)?;
     } else {
         println!(
             "Re-launched the saved configuration. (The prior profile/key are \
@@ -1703,34 +1709,41 @@ fn wait_healthy(port: u16) -> Result<(), CliError> {
     )))
 }
 
-/// Create the first profile (`default`) and client key (`default`) *inside* the
-/// container — the admin port is never reachable from the host.
-fn create_first_profile_and_key(dir: &Path, config: &SetupConfig) -> Result<(), CliError> {
+/// Create the first profile and client key *inside* the container — the admin
+/// port is never reachable from the host. Both are named `default` unless the
+/// user picks another profile name (see [`resolve_setup_profile`]).
+///
+/// The `bae-data` volume outlives the generated files, so a "fresh" setup can
+/// still land on a server that already holds a `default` profile. That case is
+/// resolved by [`resolve_setup_profile`] rather than failing on the server's
+/// `duplicate_name` conflict. Whichever profile results is recorded in
+/// [`SETUP_STATE_FILE`] so `ready`/`run` prefer it for harnesses built here.
+fn create_first_profile_and_key(
+    prompt: &Prompter,
+    dir: &Path,
+    config: &SetupConfig,
+) -> Result<(), CliError> {
     let primary = config
         .providers
         .first()
         .map(|p| p.name.clone())
         .ok_or_else(|| CliError::runtime("no provider was configured; cannot create a profile"))?;
 
-    let profile_json = exec_baectl(
-        dir,
-        config,
-        &["create", "profile", "default", &primary, "--json"],
-    )?;
-    let profile: Value = serde_json::from_str(&profile_json)
-        .map_err(|e| CliError::runtime(format!("could not parse `create profile` output: {e}")))?;
-    let profile_id = profile
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::runtime("`create profile` output had no id"))?
-        .to_string();
-    println!("created profile 'default' ({profile_id})");
+    let mut exec = |args: &[&str]| exec_baectl(dir, config, args);
+    let profile = resolve_setup_profile(prompt, &primary, &mut exec)?;
+    save_setup_profile(dir, &profile.name)?;
 
-    let key_json = exec_baectl(
-        dir,
-        config,
-        &["create", "key", "default", &profile_id, "--json"],
-    )?;
+    if !profile.issue_key {
+        let exec_hint = crate::harness::checks::exec_prefix(&config.engine(), dir);
+        println!(
+            "No new key issued. Create one later with:\n  \
+             {exec_hint} create key {} {}",
+            profile.name, profile.id
+        );
+        return Ok(());
+    }
+
+    let key_json = exec(&["create", "key", &profile.name, &profile.id, "--json"])?;
     let key: Value = serde_json::from_str(&key_json)
         .map_err(|e| CliError::runtime(format!("could not parse `create key` output: {e}")))?;
     let plaintext = key
@@ -1739,13 +1752,208 @@ fn create_first_profile_and_key(dir: &Path, config: &SetupConfig) -> Result<(), 
         .ok_or_else(|| CliError::runtime("`create key` output had no key"))?;
 
     // The plaintext key is shown exactly once (same posture as `create key`).
-    println!("created client key 'default':");
+    println!("created client key '{}':", profile.name);
     println!("  {plaintext}");
     eprintln!("baectl: copy the key now — it cannot be retrieved again");
     println!("Point a client at it with:");
     println!("  export BAE_URL=http://localhost:{}", config.client_port);
     println!("  export BAE_API_KEY={plaintext}");
     Ok(())
+}
+
+/// The profile `setup` settled on, and whether to issue it a client key.
+#[derive(Debug, PartialEq, Eq)]
+struct SetupProfile {
+    id: String,
+    name: String,
+    issue_key: bool,
+}
+
+/// What to do about a `default` profile that already exists on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingProfileChoice {
+    /// Overwrite it (full `update profile`) with setup's default profile body.
+    Replace,
+    /// Keep it untouched and use it.
+    Reuse,
+    /// Leave it alone and create a new profile under another name.
+    New,
+}
+
+/// Resolve the profile `setup` hands its first client key to.
+///
+/// - No `default` profile → create one with `primary` (the fresh-server path).
+/// - An existing `default` profile (left in the persistent data volume by an
+///   earlier setup) → show it and ask whether to **replace** it, **reuse** it,
+///   or create a **new** profile under a different name (prompted for, and
+///   required not to clash with any existing profile).
+///   - *replace* runs `update profile`, a full replacement, so it also resets
+///     the profile's fallbacks/MCP servers/tools/sandboxes to match a freshly
+///     created profile.
+///   - *reuse* is the default (and the only answer under `--yes` /
+///     non-interactive), since the profile may carry customizations.
+///
+///   For replace/reuse the user is then asked whether to issue a new client key
+///   (the earlier key's plaintext cannot be recovered); that defaults to yes so
+///   a `--yes` run still ends with a usable key. A new profile always gets one.
+///
+/// `exec` runs `baectl <args>` in-container and returns its stdout.
+fn resolve_setup_profile(
+    prompt: &Prompter,
+    primary: &str,
+    exec: &mut dyn FnMut(&[&str]) -> Result<String, CliError>,
+) -> Result<SetupProfile, CliError> {
+    let list = exec(&["list", "profiles", "--json"])?;
+    let profiles: Value = serde_json::from_str(list.trim())
+        .map_err(|e| CliError::runtime(format!("could not parse `list profiles` output: {e}")))?;
+    let items = match &profiles {
+        Value::Array(items) => items.as_slice(),
+        Value::Object(obj) => obj
+            .get("items")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice),
+        _ => &[],
+    };
+    let names: Vec<&str> = items
+        .iter()
+        .filter_map(|p| p.get("name").and_then(Value::as_str))
+        .collect();
+    let existing = items
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(DEFAULT_PROFILE));
+
+    let Some(existing) = existing else {
+        return create_setup_profile(exec, DEFAULT_PROFILE, primary);
+    };
+
+    let id = existing
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::runtime("existing 'default' profile had no id"))?
+        .to_string();
+    let current = existing
+        .get("primary_provider")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    println!(
+        "A profile named '{DEFAULT_PROFILE}' already exists ({id}, primary provider \
+         '{current}') — likely left in the {DATA_VOLUME} volume by an earlier setup."
+    );
+    println!("  replace — overwrite it with provider '{primary}' (resets its fallbacks, MCP");
+    println!("            servers, allowed tools and sandboxes)");
+    println!("  reuse   — keep it as-is and use it");
+    println!("  new     — leave it alone and create a new profile with another name");
+
+    let choice =
+        prompt.ask_validated(
+            "Existing profile: replace, reuse or new?",
+            "reuse",
+            |a| match a.trim().to_ascii_lowercase().as_str() {
+                "replace" => Ok(ExistingProfileChoice::Replace),
+                "reuse" => Ok(ExistingProfileChoice::Reuse),
+                "new" => Ok(ExistingProfileChoice::New),
+                _ => Err("answer replace, reuse or new".to_string()),
+            },
+        );
+
+    match choice {
+        ExistingProfileChoice::Replace => {
+            let updated = exec(&["update", "profile", &id, primary, "--json"])?;
+            profile_id(&updated, "update profile")?;
+            println!("replaced profile '{DEFAULT_PROFILE}' ({id}) — primary provider '{primary}'");
+        }
+        ExistingProfileChoice::Reuse => {
+            println!("reusing existing profile '{DEFAULT_PROFILE}' ({id}) unchanged");
+        }
+        ExistingProfileChoice::New => {
+            let suggested = unused_profile_name(&names);
+            let name = prompt.ask_validated("New profile name?", &suggested, |a| {
+                let a = a.trim();
+                if a.is_empty() {
+                    Err("the profile name must not be empty".to_string())
+                } else if names.contains(&a) {
+                    Err(format!("a profile named '{a}' already exists"))
+                } else {
+                    Ok(a.to_string())
+                }
+            });
+            return create_setup_profile(exec, &name, primary);
+        }
+    }
+
+    let issue_key = prompt.ask_yes_no(
+        "Issue a new client key for it? (existing keys stay valid)",
+        true,
+    );
+    Ok(SetupProfile {
+        id,
+        name: DEFAULT_PROFILE.to_string(),
+        issue_key,
+    })
+}
+
+/// Create profile `name` with `primary` as its only provider.
+fn create_setup_profile(
+    exec: &mut dyn FnMut(&[&str]) -> Result<String, CliError>,
+    name: &str,
+    primary: &str,
+) -> Result<SetupProfile, CliError> {
+    let created = exec(&["create", "profile", name, primary, "--json"])?;
+    let id = profile_id(&created, "create profile")?;
+    println!("created profile '{name}' ({id})");
+    Ok(SetupProfile {
+        id,
+        name: name.to_string(),
+        issue_key: true,
+    })
+}
+
+/// The first of `default-2`, `default-3`, … not already taken — the suggested
+/// answer to the new-profile-name question.
+fn unused_profile_name(taken: &[&str]) -> String {
+    (2..)
+        .map(|n| format!("{DEFAULT_PROFILE}-{n}"))
+        .find(|candidate| !taken.contains(&candidate.as_str()))
+        .expect("an unbounded range always yields an unused name")
+}
+
+/// Record the profile `setup` resolved in `<dir>/`[`SETUP_STATE_FILE`], so
+/// `ready`/`run` prefer it over other compatible profiles on the server.
+fn save_setup_profile(dir: &Path, name: &str) -> Result<(), CliError> {
+    let path = dir.join(SETUP_STATE_FILE);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CliError::runtime(format!("could not create {}: {e}", parent.display()))
+        })?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "profile": name }))
+        .map_err(|e| CliError::runtime(format!("could not serialize {SETUP_STATE_FILE}: {e}")))?;
+    std::fs::write(&path, format!("{body}\n"))
+        .map_err(|e| CliError::runtime(format!("could not write {}: {e}", path.display())))
+}
+
+/// The profile name recorded by the last launched `setup` in `dir`, if any. A
+/// missing or malformed [`SETUP_STATE_FILE`] is `None` (callers fall back to
+/// their own selection).
+pub(crate) fn load_setup_profile(dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join(SETUP_STATE_FILE)).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("profile")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Parse the `id` out of a profile JSON object printed by `baectl <what> --json`.
+fn profile_id(json: &str, what: &str) -> Result<String, CliError> {
+    let profile: Value = serde_json::from_str(json.trim())
+        .map_err(|e| CliError::runtime(format!("could not parse `{what}` output: {e}")))?;
+    profile
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| CliError::runtime(format!("`{what}` output had no id")))
 }
 
 /// Run `baectl <args>` inside the launched container and return its stdout,
@@ -1859,6 +2067,109 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    /// Drive [`resolve_setup_profile`] against a fake in-container `baectl`
+    /// whose `list profiles` returns `listed`; returns the resolved profile and
+    /// every exec'd argv.
+    fn resolve_profile(prompt: &Prompter, listed: &str) -> (SetupProfile, Vec<Vec<String>>) {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut exec = |args: &[&str]| -> Result<String, CliError> {
+            calls.push(args.iter().map(|a| a.to_string()).collect());
+            Ok(match args {
+                ["list", "profiles", ..] => listed.to_string(),
+                ["create", "profile", name, ..] => format!(r#"{{"id":"pro_new","name":"{name}"}}"#),
+                ["update", "profile", id, ..] => format!(r#"{{"id":"{id}","name":"default"}}"#),
+                other => panic!("unexpected exec {other:?}"),
+            })
+        };
+        let profile = resolve_setup_profile(prompt, "openai-default", &mut exec).unwrap();
+        (profile, calls)
+    }
+
+    const EXISTING_DEFAULT: &str = r#"[
+        {"id":"pro_old","name":"default","primary_provider":"anthropic-default"},
+        {"id":"pro_2","name":"default-2","primary_provider":"anthropic-default"}
+    ]"#;
+
+    fn setup_profile(id: &str, name: &str, issue_key: bool) -> SetupProfile {
+        SetupProfile {
+            id: id.to_string(),
+            name: name.to_string(),
+            issue_key,
+        }
+    }
+
+    #[test]
+    fn default_profile_is_created_when_absent() {
+        let (profile, calls) = resolve_profile(
+            &Prompter::non_interactive(),
+            r#"[{"id":"pro_x","name":"other","primary_provider":"p"}]"#,
+        );
+        assert_eq!(profile, setup_profile("pro_new", "default", true));
+        assert_eq!(
+            calls[1],
+            ["create", "profile", "default", "openai-default", "--json"]
+        );
+    }
+
+    #[test]
+    fn existing_default_profile_is_reused_non_interactively() {
+        // `--yes` / no TTY: never overwrite, but still issue a usable key.
+        let (profile, calls) = resolve_profile(&Prompter::non_interactive(), EXISTING_DEFAULT);
+        assert_eq!(profile, setup_profile("pro_old", "default", true));
+        assert_eq!(calls.len(), 1, "only the list call: {calls:?}");
+    }
+
+    #[test]
+    fn existing_default_profile_can_be_replaced() {
+        // An invalid answer re-prompts rather than aborting.
+        let prompt = Prompter::scripted(&["overwrite", "replace", ""]);
+        let (profile, calls) = resolve_profile(&prompt, EXISTING_DEFAULT);
+        assert_eq!(profile, setup_profile("pro_old", "default", true));
+        assert_eq!(
+            calls[1],
+            ["update", "profile", "pro_old", "openai-default", "--json"]
+        );
+    }
+
+    #[test]
+    fn existing_default_profile_can_be_reused_without_a_new_key() {
+        let prompt = Prompter::scripted(&["reuse", "n"]);
+        let (profile, calls) =
+            resolve_profile(&prompt, r#"{"items":[{"id":"pro_old","name":"default"}]}"#);
+        assert_eq!(profile, setup_profile("pro_old", "default", false));
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn new_profile_name_rejects_taken_names_and_is_created() {
+        let prompt = Prompter::scripted(&["new", "default", "", "  team-a  "]);
+        let (profile, calls) = resolve_profile(&prompt, EXISTING_DEFAULT);
+        assert_eq!(profile, setup_profile("pro_new", "team-a", true));
+        assert_eq!(
+            calls[1],
+            ["create", "profile", "team-a", "openai-default", "--json"]
+        );
+    }
+
+    #[test]
+    fn new_profile_name_suggestion_skips_taken_names() {
+        assert_eq!(unused_profile_name(&["default"]), "default-2");
+        assert_eq!(
+            unused_profile_name(&["default", "default-2", "default-3"]),
+            "default-4"
+        );
+    }
+
+    #[test]
+    fn setup_profile_round_trips_through_the_state_file() {
+        let dir = TempDir::new("state");
+        assert_eq!(load_setup_profile(dir.path()), None);
+        save_setup_profile(dir.path(), "team-a").unwrap();
+        assert_eq!(load_setup_profile(dir.path()).as_deref(), Some("team-a"));
+        std::fs::write(dir.path().join(SETUP_STATE_FILE), "not json").unwrap();
+        assert_eq!(load_setup_profile(dir.path()), None);
+    }
 
     struct TempDir(std::path::PathBuf);
 

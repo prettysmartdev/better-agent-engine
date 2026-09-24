@@ -83,6 +83,19 @@ docker run -p 8080:8080 -p 3000:3000 -v bae-data:/var/lib/bae better-agent-engin
 Or build-and-run in one step with the detected engine: `make run/baesrv` or
 `make run/baemax`.
 
+> **Image build failing on Apple `container`? Run `make clean image`.**
+> Apple's `container build` walks and streams the *entire* build context —
+> including paths `.dockerignore` excludes — before the ignore rules apply.
+> Once `make build`/`make test` have grown the cargo `target/` dirs to many GB
+> (`server/target` and `baectl/target` alone reach ~20GB), the context transfer
+> stalls or breaks partway through. Symptoms: `COPY server/ ...` fails with
+> `"/server": not found`, `error from sender: archive/tar: invalid tar header`,
+> or the build hangs at `load build context`. Editing `.dockerignore` does not
+> help; shrinking the tree does. `make clean` wipes every component's build
+> artifacts (`target/`, `node_modules/`, `.venv/`), so the next `make test`
+> rebuilds from scratch. Substitute `make clean image-max` (etc.) for other
+> image targets. Docker is unaffected.
+
 > These are **local** build tags. The published images live at
 > `ghcr.io/prettysmartdev/better-agent-engine` — `:latest` / `:<semver>` for the
 > server and `:max` / `:<semver>-max` for the bae-max variant. Cutting a release
@@ -93,6 +106,30 @@ You can also run the server directly in the dev container during development:
 ```sh
 make run            # runs baesrv in the dev container (port $PORT)
 ```
+
+## Rebuilding API and webapp harness images
+
+`make image-launcher-api` and `make image-launcher-webapp` build the launcher
+**base images**: `launchers/core/`, `launchers/api/`, and (for webapp) the
+frontend under `launchers/webapp/web/`. Changes to the configuration and
+Dockerfile generators in `baectl/src/harness/build.rs` require rebuilding the
+host CLI and rerunning `baectl build`. Those generators are not part of the
+base images, so their edits do not invalidate the base-image build cache.
+
+For example, from the repository root:
+
+```sh
+make build-baectl
+make image-launcher-api image-launcher-webapp
+./baectl/target/host/release/baectl build reference-assistant --launcher api --dev
+./baectl/target/host/release/baectl build reference-assistant --launcher webapp --dev
+```
+
+Use the freshly built CLI path so an older installed `baectl` cannot generate
+stale files. `--dev` selects the local launcher base tags built by Make.
+The harness build regenerates its Dockerfile and `bae-api.toml` or
+`bae-app.toml` under `.baectl/builds/<id>/`, then builds the final harness
+image. Run the rebuilt artifact with `baectl run <id> --dev` using the same CLI.
 
 ## Configuration
 

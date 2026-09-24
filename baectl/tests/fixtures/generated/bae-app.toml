@@ -4,13 +4,14 @@ addr = "0.0.0.0:9090"
 [[agents]]
 name = "reference-assistant"
 command = "/usr/local/bin/reference-assistant"
+chat_input_field = "prompt"
 
 [agents.request_schema]
 type = "object"
-required = ["AGENT_PROMPT"]
-[agents.request_schema.properties."AGENT_PROMPT"]
+required = ["prompt"]
+[agents.request_schema.properties."prompt"]
 type = "string"
 
 [[agents.env_template]]
-field = "AGENT_PROMPT"
+field = "prompt"
 env = "AGENT_PROMPT"

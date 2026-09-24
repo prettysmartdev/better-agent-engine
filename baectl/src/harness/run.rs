@@ -9,9 +9,9 @@
 //! - `kind: "local"` runs the optional `prepare` command when needed (e.g.
 //!   `npm install`), then `run_command` on the host in the foreground with
 //!   inherited stdio (Ctrl-C reaches the child) and propagates its exit code.
-//! - `kind: "container"` launches a detached container off `setup`'s network,
-//!   reaching `baesrv` via the published host port, and prints the launcher's
-//!   "where/how" summary.
+//! - `kind: "container"` launches detached, reaching `baesrv` via Docker's
+//!   published host port or Apple's default container network, and prints
+//!   the launcher's "where/how" summary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +22,9 @@ use crate::harness::artifact::{
     artifact_dir, harness_env_path, load_manifest, load_resolved, warn_dev_mismatch, write_private,
     write_resolved,
 };
-use crate::harness::checks::{evaluate, FixMode, Outcome, PROVIDER_KEY_ENV};
+use crate::harness::checks::{
+    default_server_url, evaluate, resolve_server, FixMode, Outcome, PROVIDER_KEY_ENV,
+};
 use crate::harness::manifest::{
     BuildManifest, ContainerManifest, Launcher, LocalManifest, Resolved,
 };
@@ -72,6 +74,7 @@ pub fn run(opts: RunOptions) -> Result<(), CliError> {
             prior.as_ref(),
             FixMode::Auto,
             Some(&prompt),
+            opts.server_url.as_deref(),
         )? {
             Outcome::Ready(resolved) => {
                 write_resolved(&opts.dir, &opts.id, &resolved)?;
@@ -152,13 +155,20 @@ fn run_container(
     resolved: &Resolved,
 ) -> Result<(), CliError> {
     let key = client_key(resolved)?;
-    let server_url = opts
-        .server_url
-        .clone()
-        .unwrap_or_else(|| resolved.server_url.clone());
     let dir = &opts.dir;
     let kind = detect_engine(dir).unwrap_or(EngineKind::Docker);
     let bin = engine_binary(kind);
+    let server_url = match &opts.server_url {
+        Some(url) => url.clone(),
+        None if opts.no_ready && kind == EngineKind::Apple => {
+            // --no-ready skips admin checks, but an old saved Docker alias or
+            // an IP from before a server restart must not reach the harness.
+            let server = resolve_server(dir)
+                .ok_or_else(|| CliError::runtime("could not resolve the Apple server"))?;
+            default_server_url(dir, &BuildManifest::Container(m.clone()), &server)?
+        }
+        None => resolved.server_url.clone(),
+    };
 
     // Resolve every required env var → harness.env, prompting for what is
     // missing (failing loudly, naming the var, when there is no TTY).
@@ -704,7 +714,7 @@ mod tests {
         std::fs::create_dir_all(&build).unwrap();
         std::fs::write(
             build.join("bae-api.toml"),
-            "[[agents]]\nname = \"reference-assistant\"\ncommand = \"/usr/local/bin/reference-assistant\"\n\n[agents.request_schema]\ntype = \"object\"\nrequired = [\"AGENT_PROMPT\"]\n[agents.request_schema.properties.AGENT_PROMPT]\ntype = \"string\"\n",
+            "[[agents]]\nname = \"reference-assistant\"\ncommand = \"/usr/local/bin/reference-assistant\"\n\n[agents.request_schema]\ntype = \"object\"\nrequired = [\"prompt\"]\n[agents.request_schema.properties.prompt]\ntype = \"string\"\n",
         )
         .unwrap();
 
@@ -720,10 +730,7 @@ mod tests {
             requires: Default::default(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        assert_eq!(
-            read_prompt_field(&dir, &api).as_deref(),
-            Some("AGENT_PROMPT")
-        );
+        assert_eq!(read_prompt_field(&dir, &api).as_deref(), Some("prompt"));
 
         let sched_build = artifact_dir(&dir, "ref-rust-schedule");
         std::fs::create_dir_all(&sched_build).unwrap();

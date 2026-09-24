@@ -151,6 +151,18 @@ impl Ws {
         fs::write(self.dir().join("bae-config.toml"), text).unwrap();
     }
 
+    /// Record `name` as the profile `setup` created/reused, as its launch step
+    /// does in `<dir>/.baectl/setup.json`.
+    fn setup_profile(&self, name: &str) {
+        let state = self.dir().join(".baectl");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("setup.json"),
+            json!({ "profile": name }).to_string(),
+        )
+        .unwrap();
+    }
+
     fn add_profile(&self, profile: Value) {
         append_line(&self.state().join("profiles.jsonl"), &profile.to_string());
     }
@@ -423,6 +435,68 @@ fn unwritable_build_dir_refuses_to_create_a_key_before_any_mutation() {
     );
     assert!(ws.keys().is_empty());
     assert!(ws.mutations().is_empty(), "mutations: {:?}", ws.mutations());
+}
+
+// ---------------------------------------------------------------------------
+// Setup's recorded profile (`.baectl/setup.json`)
+// ---------------------------------------------------------------------------
+
+/// `setup` may create a profile under a non-`default` name when `default`
+/// already exists; `ready`/`run` must then pick *that* profile over another
+/// compatible one.
+#[test]
+fn ready_prefers_the_profile_setup_recorded_among_compatible_ones() {
+    let ws = Ws::new("setup-profile-compatible");
+    ws.server("anthropic-default", "anthropic", "ANTHROPIC_API_KEY");
+    ws.add_profile(profile(
+        "pro_1",
+        "default",
+        "anthropic-default",
+        &["get_current_time"],
+    ));
+    ws.add_profile(profile(
+        "pro_2",
+        "team-a",
+        "anthropic-default",
+        &["get_current_time"],
+    ));
+    ws.setup_profile("team-a");
+    ws.harness(PROBE_HARNESS);
+    ws.build("probe-local", "local");
+
+    let out = ws.run(ws.ready("probe-local", &[]).env("ANTHROPIC_API_KEY", "sk"));
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stdout
+            .lines()
+            .any(|l| l == "✓ compatible profile (pro_2, team-a)"),
+        "{}",
+        out.stdout
+    );
+}
+
+/// With no compatible profile, the widen fix targets setup's recorded profile
+/// rather than one named `default`.
+#[test]
+fn ready_widens_the_profile_setup_recorded() {
+    let ws = Ws::new("setup-profile-widen");
+    ws.server("anthropic-default", "anthropic", "ANTHROPIC_API_KEY");
+    ws.add_profile(profile("pro_1", "default", "anthropic-default", &[]));
+    ws.add_profile(profile("pro_2", "team-a", "anthropic-default", &[]));
+    ws.setup_profile("team-a");
+    ws.harness(PROBE_HARNESS);
+    ws.build("probe-local", "local");
+
+    let out = ws.run(ws.ready("probe-local", &[]).env("ANTHROPIC_API_KEY", "sk"));
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stdout
+            .contains("update profile pro_2 anthropic-default --name team-a"),
+        "{}",
+        out.stdout
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +992,83 @@ fn run_container_writes_provider_key_env_into_harness_env() {
         .find(|c| c.contains("argv=run -d "))
         .unwrap();
     assert!(!launch.contains("sk-openai-host-only") && !launch.contains("bae_fake_secret"));
+}
+
+#[test]
+fn apple_run_uses_server_ip_and_listener_port_and_refreshes_saved_addresses() {
+    let ws = Ws::new("apple-network");
+    ws.server("openai-default", "openai", "OPENAI_API_KEY");
+    fs::remove_file(ws.dir().join("docker-compose.yml")).unwrap();
+    write_exe(
+        &ws.dir().join("bae-setup.sh"),
+        "#!/bin/sh\n# --publish 3000:3000\n",
+    );
+    fs::write(
+        ws.dir().join(".env"),
+        "BAE_ADDR=0.0.0.0:8181\nBAE_ADDR_PORT=18080\nOPENAI_API_KEY=sk-test\n",
+    )
+    .unwrap();
+    ws.add_profile(profile(
+        "pro_1",
+        "default",
+        "openai-default",
+        &["get_current_time"],
+    ));
+    ws.harness(PROBE_CONTAINER_HARNESS);
+    ws.build("probe-api", "api");
+
+    let out = ws.run(ws.run_cmd("probe-api"));
+    assert_eq!(out.code, 0, "{out:?}");
+    let env = ws.artifact("probe-api").join("harness.env");
+    assert!(fs::read_to_string(&env)
+        .unwrap()
+        .contains("BAE_SERVER_URL=http://192.168.64.3:8181\n"));
+    assert!(ws
+        .calls()
+        .iter()
+        .any(|c| c.ends_with("argv=inspect bae-max")));
+    let launch = ws
+        .calls()
+        .into_iter()
+        .find(|c| c.contains("argv=run -d "))
+        .unwrap();
+    assert!(!launch.contains("--add-host"));
+
+    // Upgrades must also repair old resolved.json records under --no-ready.
+    let path = ws.artifact("probe-api").join("resolved.json");
+    let mut saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    saved["server_url"] = json!("http://host.docker.internal:18080");
+    fs::write(path, saved.to_string()).unwrap();
+    fs::write(
+        ws.state().join("inspect.json"),
+        "[{\"networks\":[{\"network\":\"default\",\"address\":\"192.168.64.9/24\"}]}]\n",
+    )
+    .unwrap();
+    let out = ws.run(ws.run_cmd("probe-api").arg("--no-ready"));
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(fs::read_to_string(&env)
+        .unwrap()
+        .contains("BAE_SERVER_URL=http://192.168.64.9:8181\n"));
+
+    // An explicit URL works even if inspect fails; automatic discovery must
+    // fail before stopping an existing harness container.
+    fs::write(ws.state().join("fail_inspect"), "").unwrap();
+    fs::write(ws.state().join("calls.log"), "").unwrap();
+    let out = ws.run(ws.run_cmd("probe-api").arg("--no-ready"));
+    assert_eq!(out.code, 1, "{out:?}");
+    assert!(out.stderr.contains("--server-url"), "{out:?}");
+    assert!(!ws.calls().iter().any(|c| c.contains("argv=stop ")));
+    for extra in [vec![], vec!["--no-ready"]] {
+        let out = ws.run(
+            ws.run_cmd("probe-api")
+                .args(extra)
+                .args(["--server-url", "http://192.168.65.2:8080"]),
+        );
+        assert_eq!(out.code, 0, "{out:?}");
+        assert!(fs::read_to_string(&env)
+            .unwrap()
+            .contains("BAE_SERVER_URL=http://192.168.65.2:8080\n"));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -7,10 +7,10 @@ command = "/usr/local/bin/reference-assistant"
 
 [agents.request_schema]
 type = "object"
-required = ["AGENT_PROMPT"]
-[agents.request_schema.properties."AGENT_PROMPT"]
+required = ["prompt"]
+[agents.request_schema.properties."prompt"]
 type = "string"
 
 [[agents.env_template]]
-field = "AGENT_PROMPT"
+field = "prompt"
 env = "AGENT_PROMPT"

@@ -43,7 +43,7 @@ pub fn ready(opts: ReadyOptions) -> Result<(), CliError> {
         FixMode::Report
     };
 
-    match evaluate(&opts.dir, &manifest, prior.as_ref(), mode, None)? {
+    match evaluate(&opts.dir, &manifest, prior.as_ref(), mode, None, None)? {
         Outcome::Ready(resolved) => {
             write_resolved(&opts.dir, &opts.id, &resolved)?;
             println!(
