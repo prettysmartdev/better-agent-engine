@@ -218,8 +218,13 @@ fn to_provider_tool(t: &Value) -> Value {
 }
 
 /// A live connection to one MCP server.
+///
+/// `Stdio` is boxed to keep the two variants close in size: `StdioConn` owns a
+/// `BufReader<ChildStdout>` (and its read buffer), which makes it several times
+/// larger than `HttpConn`, so an unboxed enum would pay the stdio size on every
+/// HTTP connection too — the `clippy::large_enum_variant` lint this trips.
 enum Conn {
-    Stdio(StdioConn),
+    Stdio(Box<StdioConn>),
     Http(HttpConn),
 }
 
@@ -228,7 +233,7 @@ impl Conn {
     /// caller's next step.
     async fn open(cfg: &McpServerConfig) -> Result<Conn, McpError> {
         match cfg.transport {
-            McpTransport::Stdio => Ok(Conn::Stdio(StdioConn::spawn(cfg).await?)),
+            McpTransport::Stdio => Ok(Conn::Stdio(Box::new(StdioConn::spawn(cfg).await?))),
             McpTransport::Http | McpTransport::Sse => Ok(Conn::Http(HttpConn::open(cfg)?)),
         }
     }
