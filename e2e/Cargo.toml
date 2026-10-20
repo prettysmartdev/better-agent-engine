@@ -37,13 +37,13 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # OTel client-side SDK bring-up: the test installs a real tracer provider and
 # W3C propagator on the client side, so the `traceparent` the SDK emits is the
 # shipped one rather than a header the test hand-wrote.
-opentelemetry = { version = "0.32", features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-webpki-roots"] }
+opentelemetry = { version = "0.33", features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-webpki-roots"] }
 # The in-test OTLP/gRPC collector both sides export to. `opentelemetry-proto`
 # supplies the generated TraceService server, `tonic` the gRPC transport, and
 # `tokio-stream` adapts a bound TcpListener into the incoming stream tonic
 # serves on (so the receiver can take an ephemeral port).
-opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "gen-tonic-messages", "trace"] }
+opentelemetry-proto = { version = "0.33", features = ["gen-tonic", "gen-tonic-messages", "trace"] }
 tonic = { version = "0.14", features = ["transport"] }
 tokio-stream = { version = "0.1", features = ["net"] }

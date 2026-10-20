@@ -39,7 +39,7 @@ tokio = { version = "1", default-features = false, features = ["process", "io-ut
 # code (`opentelemetry_sdk` is a dev-dependency only, for tests) — with no
 # OTel SDK installed by the app, every call here is the crate's built-in
 # no-op implementation: zero cost, zero `traceparent` header.
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 
 [dev-dependencies]
 # Async runtime for the examples and the async unit tests. Not needed by the
@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # An in-process OTel SDK + in-memory span exporter, so this crate's own tests
 # can install a real `TracerProvider`/propagator and assert on the spans
 # `telemetry` produces, without ever depending on the SDK at runtime.
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 
 # The reference-assistant example lives in a subdirectory so it can grow extra
 # files without polluting the examples/ root; declare it explicitly since Cargo
